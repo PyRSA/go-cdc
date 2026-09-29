@@ -1,0 +1,238 @@
+name: Go CDC E2E Integration Testing
+
+on:
+  # Any-branch push + any PR + manual.
+  # Load tier (mysql-mysql-e2e) and scale profile (mysql-scale-e2e) are selected in-job.
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      scale_profile:
+        description: "Scale profile"
+        type: choice
+        options: [normal, heavy]
+        default: heavy
+
+jobs:
+  # Fast gate: fmt + lint + unit tests + build before expensive MySQL matrix.
+  go-check:
+    name: Build + lint + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Check gofmt
+        run: make fmt-check
+
+      - name: golangci-lint
+        run: make lint
+
+      - name: Unit tests
+        run: make test
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Scale unit tests
+        working-directory: test/integration
+        run: |
+          python3 -m pip install -r harness/requirements.txt
+          python3 -m pytest -q scale/test_profiles.py scale/test_schemas.py
+
+      - name: Build go-cdc binary
+        run: make build
+
+  mysql-mysql-e2e:
+    name: MySQL ${{ matrix.mysql }} → MySQL (func + types + load)
+    needs: go-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mysql: "5.7"
+            image: mysql:5.7.42
+            tag: "57"
+            peak_seconds: "45"
+            peak_workers: "4"
+          - mysql: "8.0"
+            image: mysql:8.0.36
+            tag: "80"
+            peak_seconds: "90"
+            peak_workers: "4"
+
+    defaults:
+      run:
+        working-directory: test/integration
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install client tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y mysql-client
+          python3 -m pip install -r harness/requirements.txt
+
+      - name: Start MySQL ${{ matrix.mysql }} (docker compose)
+        env:
+          MYSQL_IMAGE: ${{ matrix.image }}
+          MYSQL_TAG: ${{ matrix.tag }}
+          COMPOSE_PROJECT_NAME: gocdc-it-${{ matrix.tag }}
+        run: bash scripts/mysql-up.sh
+
+      - name: Determine load profile
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]] ||
+             [[ "${{ github.ref }}" == "refs/heads/main" ]] ||
+             [[ "${{ github.ref }}" == "refs/heads/master" ]] ||
+             [[ "${{ github.ref }}" == refs/heads/release-* ]]; then
+            echo "LOAD_PROFILE=full" >> "$GITHUB_ENV"
+            echo "LOAD_ROWS_PER_TABLE=100000" >> "$GITHUB_ENV"
+          else
+            echo "LOAD_PROFILE=normal" >> "$GITHUB_ENV"
+            echo "LOAD_ROWS_PER_TABLE=30000" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run integration harness
+        env:
+          MYSQL_HOST: 127.0.0.1
+          MYSQL_PORT: 13306
+          MYSQL_IMAGE: ${{ matrix.image }}
+          MYSQL_TAG: ${{ matrix.tag }}
+          COMPOSE_PROJECT_NAME: gocdc-it-${{ matrix.tag }}
+          LOAD_PEAK_SECONDS: ${{ matrix.peak_seconds }}
+          LOAD_PEAK_WORKERS: ${{ matrix.peak_workers }}
+          LOAD_LARGE_ROWS: "50"
+          LOAD_LARGE_FIELD_BYTES: "2097152"
+        run: bash scripts/run-e2e.sh
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-cdc-it-report-mysql-${{ matrix.mysql }}
+          path: |
+            docs/test/reports/mysql-mysql-*.md
+            test/integration/workdir/ckpts*/**/*.ckpt
+            test/integration/workdir/*.log
+          if-no-files-found: warn
+
+      - name: Tear down
+        if: always()
+        env:
+          MYSQL_IMAGE: ${{ matrix.image }}
+          MYSQL_TAG: ${{ matrix.tag }}
+          COMPOSE_PROJECT_NAME: gocdc-it-${{ matrix.tag }}
+        run: bash scripts/mysql-down.sh
+
+  mysql-scale-e2e:
+    name: MySQL ${{ matrix.mysql }} scale (normal/heavy)
+    needs: go-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mysql: "8.0"
+            image: mysql:8.0.36
+            tag: "80"
+
+    defaults:
+      run:
+        working-directory: test/integration
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install client tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y mysql-client
+          python3 -m pip install -r harness/requirements.txt
+
+      - name: Start MySQL ${{ matrix.mysql }} (docker compose)
+        env:
+          MYSQL_IMAGE: ${{ matrix.image }}
+          MYSQL_TAG: ${{ matrix.tag }}
+          # Isolate from mysql-mysql-e2e (default host port 13306).
+          MYSQL_HOST_PORT: "13307"
+          MYSQL_PORT: "13307"
+          COMPOSE_PROJECT_NAME: gocdc-scale-${{ matrix.tag }}
+        run: bash scripts/mysql-up.sh
+
+      - name: Determine scale profile
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "SCALE_PROFILE=${{ inputs.scale_profile }}" >> "$GITHUB_ENV"
+          elif [[ "${{ github.event_name }}" == "pull_request" ]] ||
+               [[ "${{ github.ref }}" == "refs/heads/main" ]] ||
+               [[ "${{ github.ref }}" == "refs/heads/master" ]] ||
+               [[ "${{ github.ref }}" == refs/heads/release-* ]]; then
+            echo "SCALE_PROFILE=heavy" >> "$GITHUB_ENV"
+          else
+            echo "SCALE_PROFILE=normal" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run scale harness
+        env:
+          MYSQL_HOST: 127.0.0.1
+          MYSQL_PORT: "13307"
+          MYSQL_HOST_PORT: "13307"
+          MYSQL_IMAGE: ${{ matrix.image }}
+          MYSQL_TAG: ${{ matrix.tag }}
+          COMPOSE_PROJECT_NAME: gocdc-scale-${{ matrix.tag }}
+        run: bash scale/run-scale.sh
+
+      - name: Upload scale test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-cdc-scale-report-mysql-${{ matrix.mysql }}
+          path: |
+            docs/test/reports/mysql-mysql-scale-*.md
+            test/integration/workdir/*.log
+          if-no-files-found: warn
+
+      - name: Tear down
+        if: always()
+        env:
+          MYSQL_IMAGE: ${{ matrix.image }}
+          MYSQL_TAG: ${{ matrix.tag }}
+          MYSQL_HOST_PORT: "13307"
+          MYSQL_PORT: "13307"
+          COMPOSE_PROJECT_NAME: gocdc-scale-${{ matrix.tag }}
+        run: bash scripts/mysql-down.sh

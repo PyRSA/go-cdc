@@ -1,5 +1,6 @@
 test/integration/workdir/
 **/__pycache__/
+**/.pytest_cache/
 *.pyc
 *.log
 coverage.out

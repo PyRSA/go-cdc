@@ -1,0 +1,33 @@
+# MySQL for go-cdc integration tests.
+# One instance hosts source + sink databases (suite-scoped).
+# Override image for version matrix, e.g.:
+#   MYSQL_IMAGE=mysql:5.7.42 MYSQL_TAG=57 bash scripts/mysql-up.sh
+services:
+  mysql:
+    image: ${MYSQL_IMAGE:-mysql:8.0.36}
+    # No fixed container_name: COMPOSE_PROJECT_NAME isolates e2e vs scale (and version tags).
+    ports:
+      - "${MYSQL_HOST_PORT:-13306}:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      TZ: Asia/Shanghai
+    command:
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --max-allowed-packet=67108864
+    volumes:
+      - ./mysql/conf.d:/etc/mysql/conf.d:ro
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpass"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
