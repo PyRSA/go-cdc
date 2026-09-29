@@ -1,0 +1,8 @@
+test/integration/workdir/
+**/__pycache__/
+*.pyc
+*.log
+coverage.out
+checkpoints/
+.idea/
+/bin/

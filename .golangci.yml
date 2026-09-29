@@ -1,0 +1,57 @@
+# golangci-lint config (https://golangci-lint.run/)
+# Local / CI: make lint   (auto-installs if missing)
+# Format:     make fmt    (golangci-lint run --fix)
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - misspell
+    - nakedret
+    - nolintlint
+    - staticcheck
+    - unconvert
+    - unused
+    - whitespace
+    - revive
+  settings:
+    govet:
+      disable:
+        - fieldalignment
+        - lostcancel
+        - shadow
+      enable-all: true
+    nolintlint:
+      require-specific: true
+      allow-unused: false
+    revive:
+      enable-default-rules: true
+      rules:
+        - name: unused-parameter
+          disabled: true
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - _legacy$
+      - third_party$
+      - builtin$
+      - examples$
+
+formatters:
+  enable:
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - _legacy$

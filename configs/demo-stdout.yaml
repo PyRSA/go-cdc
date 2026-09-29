@@ -1,0 +1,25 @@
+# Quick start: MySQL → stdout
+# Edit hostname / username / password / tables, then:
+#   ./bin/go-cdc configs/demo-stdout.yaml
+
+source:
+  type: mysql
+  hostname: 127.0.0.1
+  port: 3306
+  username: root
+  password: secret
+  tables: demo_db\..*
+  server-id: 5401
+  server-time-zone: Asia/Shanghai
+  scan.startup.mode: initial
+
+sink:
+  type: stdout
+
+pipeline:
+  name: demo-stdout
+
+checkpoint:
+  storage: file
+  interval: 10s
+  file-path: ./checkpoints

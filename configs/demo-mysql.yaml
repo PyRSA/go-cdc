@@ -1,0 +1,34 @@
+# Quick start: MySQL → MySQL
+# Edit source / sink / route, then:
+#   ./bin/go-cdc configs/demo-mysql.yaml
+
+source:
+  type: mysql
+  hostname: 127.0.0.1
+  port: 3306
+  username: root
+  password: secret
+  tables: demo_db\.orders
+  server-id: 5402
+  server-time-zone: Asia/Shanghai
+  scan.startup.mode: initial
+
+sink:
+  type: mysql
+  hostname: 127.0.0.1
+  port: 3306
+  username: root
+  password: secret
+  auto-create-table: true
+
+route:
+  - source-table: demo_db\.orders
+    sink-table: demo_sink.orders
+
+pipeline:
+  name: demo-mysql
+
+checkpoint:
+  storage: file
+  interval: 10s
+  file-path: ./checkpoints
