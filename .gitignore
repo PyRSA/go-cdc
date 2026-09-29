@@ -5,4 +5,8 @@ test/integration/workdir/
 coverage.out
 checkpoints/
 .idea/
+.cursor/
+.vscode/
+.claude/
+.superpowers/
 /bin/
