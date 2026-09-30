@@ -63,7 +63,7 @@ jobs:
           - mysql: "5.7"
             image: mysql:5.7.42
             tag: "57"
-            peak_seconds: "45"
+            peak_seconds: "90"
             peak_workers: "4"
           - mysql: "8.0"
             image: mysql:8.0.36
@@ -151,7 +151,7 @@ jobs:
     name: MySQL ${{ matrix.mysql }} scale (normal/heavy)
     needs: go-check
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:

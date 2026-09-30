@@ -20,6 +20,7 @@ from pathlib import Path
 import pymysql
 
 from . import config as cfg
+from .logutil import log
 
 SRC = cfg.conn_kwargs(cfg.SRC_USER, cfg.SRC_PASSWORD, cfg.TYPES_SRC_DB)
 SNK = cfg.conn_kwargs(cfg.SINK_USER, cfg.SINK_PASSWORD, cfg.TYPES_SNK_DB)
@@ -227,7 +228,7 @@ def record(tp: TPResult, override: bool | None = None, compare_md: str | None = 
         tp.passed = ok_all if override is None else override
         tp.compare_md = "\n".join(blocks)
     results.append(tp)
-    print(f"[{tp.id}] {'PASS' if tp.passed else 'FAIL'} {tp.title}", flush=True)
+    log(f"[{tp.id}] {'PASS' if tp.passed else 'FAIL'} {tp.title}", flush=True)
 
 
 def start_job():
@@ -585,8 +586,8 @@ def main() -> int:
     stop_job()
     report = write_report()
     failed = [r for r in results if not r.passed]
-    print("REPORT", report)
-    print("PASS", sum(1 for r in results if r.passed), "FAIL", len(failed))
+    log("REPORT", report)
+    log("PASS", sum(1 for r in results if r.passed), "FAIL", len(failed))
     return 0 if not failed else 1
 
 

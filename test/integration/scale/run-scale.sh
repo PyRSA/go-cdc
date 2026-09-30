@@ -6,6 +6,8 @@ ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 IT="${ROOT}/test/integration"
 WORKDIR="${IT}/workdir"
 mkdir -p "${WORKDIR}" "${ROOT}/docs/test/reports"
+# shellcheck source=test/integration/scripts/_log.sh
+source "${IT}/scripts/_log.sh"
 
 export MYSQL_HOST="${MYSQL_HOST:-127.0.0.1}"
 export MYSQL_PORT="${MYSQL_PORT:-13306}"
@@ -21,10 +23,26 @@ if [ -n "${CDC_CLI:-}" ]; then
   export GO_CDC="${CDC_CLI}"
 fi
 
-echo "==> build go-cdc"
+# Drop compose MySQL on script exit — local only.
+# In CI (CI/GITHUB_ACTIONS), do NOT clean here: Tear down must run only after
+# later steps (e.g. Upload artifacts) finish. Workflow Tear down is last + if: always().
+if [ -z "${CI:-}" ] && [ -z "${GITHUB_ACTIONS:-}" ]; then
+  cleanup_mysql() {
+    local status=$?
+    if [ "${KEEP_IT_MYSQL:-}" = "1" ]; then
+      exit "${status}"
+    fi
+    log "==> remove integration MySQL data volume"
+    bash "${IT}/scripts/mysql-down.sh" || true
+    exit "${status}"
+  }
+  trap cleanup_mysql EXIT
+fi
+
+log "==> build go-cdc"
 (cd "${ROOT}" && go build -o "${GO_CDC}" ./cmd/go-cdc)
 
-echo "==> install harness deps"
+log "==> install harness deps"
 PYTHON_BIN="${PYTHON_BIN:-}"
 if [ -z "${PYTHON_BIN}" ]; then
   for c in python3.11 python3.10 python3.9 python3; do
@@ -34,14 +52,14 @@ if [ -z "${PYTHON_BIN}" ]; then
     fi
   done
 fi
-echo "    using ${PYTHON_BIN}"
+log "    using ${PYTHON_BIN}"
 "${PYTHON_BIN}" -m pip install -q -r "${IT}/harness/requirements.txt"
 
-echo "==> wait mysql"
+log "==> wait mysql"
 bash "${IT}/scripts/wait-for-mysql.sh"
 
-echo "==> run scale harness (profile=${PROFILE})"
+log "==> run scale harness (profile=${PROFILE})"
 cd "${IT}"
 "${PYTHON_BIN}" -m scale.scale_it "${PROFILE}"
 
-echo "==> done"
+log "==> done"

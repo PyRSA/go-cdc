@@ -4,6 +4,8 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "${ROOT}"
+# shellcheck source=test/integration/scripts/_log.sh
+source "${ROOT}/scripts/_log.sh"
 
 export MYSQL_IMAGE="${MYSQL_IMAGE:-mysql:8.0.36}"
 export MYSQL_TAG="${MYSQL_TAG:-80}"
@@ -15,18 +17,18 @@ export MYSQL_HOST_PORT="${MYSQL_HOST_PORT:-${MYSQL_PORT}}"
 if [ -z "${DOCKER_HOST:-}" ] && [ ! -S /var/run/docker.sock ]; then
   if [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock" ]; then
     export DOCKER_HOST="unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
-    echo "using rootless DOCKER_HOST=${DOCKER_HOST}"
+    log "using rootless DOCKER_HOST=${DOCKER_HOST}"
   fi
 fi
 
 if ! docker info >/dev/null 2>&1; then
-  echo "docker daemon is not available." >&2
-  echo "  - rootful: start dockerd / ensure /var/run/docker.sock" >&2
-  echo "  - rootless: start dockerd-rootless.sh and export DOCKER_HOST=unix://\$XDG_RUNTIME_DIR/docker.sock" >&2
+  log "docker daemon is not available." >&2
+  log "  - rootful: start dockerd / ensure /var/run/docker.sock" >&2
+  log "  - rootless: start dockerd-rootless.sh and export DOCKER_HOST=unix://\$XDG_RUNTIME_DIR/docker.sock" >&2
   exit 1
 fi
 
-echo "==> MySQL image ${MYSQL_IMAGE} (tag=${MYSQL_TAG}, project=${COMPOSE_PROJECT_NAME})"
+log "==> MySQL image ${MYSQL_IMAGE} (tag=${MYSQL_TAG}, project=${COMPOSE_PROJECT_NAME})"
 # Recreate volume so init scripts re-run when switching versions.
 docker compose down -v --remove-orphans >/dev/null 2>&1 || true
 docker compose pull mysql 2>/dev/null || true
@@ -35,4 +37,4 @@ docker compose up -d --wait 2>/dev/null || docker compose up -d
 export WAIT_MYSQL_USER="${WAIT_MYSQL_USER:-root}"
 export WAIT_MYSQL_PASSWORD="${WAIT_MYSQL_PASSWORD:-rootpass}"
 bash "${ROOT}/scripts/wait-for-mysql.sh"
-echo "integration MySQL ready at ${MYSQL_HOST}:${MYSQL_PORT} (${MYSQL_IMAGE})"
+log "integration MySQL ready at ${MYSQL_HOST}:${MYSQL_PORT} (${MYSQL_IMAGE})"

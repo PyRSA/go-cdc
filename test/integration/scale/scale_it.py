@@ -9,7 +9,7 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from datetime import datetime
 from pathlib import Path
 
@@ -27,12 +27,18 @@ from harness.config import (
     SRC_USER,
     WORKDIR,
 )
-from scale.profiles import Profile, TableSpec, load_profile
+from scale.profiles import Profile, TableSpec, hotspot_tables, load_profile
 from scale.schemas import checksum_sql, create_table_sql, insert_batch
+from harness.logutil import log
 
 ROOT_USER = os.environ.get("ROOT_USER", "root")
 ROOT_PASSWORD = os.environ.get("ROOT_PASSWORD", "rootpass")
 CDC_SERVER_ID_SCALE = os.environ.get("CDC_SERVER_ID_SCALE", "5616")
+
+# Heavy-only hotspot burst / peak knobs (env-overridable).
+SCALE_BURST_ROWS_PER_HOT = int(os.environ.get("SCALE_BURST_ROWS_PER_HOT", "50000"))
+SCALE_PEAK_SECONDS = int(os.environ.get("SCALE_PEAK_SECONDS", "45"))
+SCALE_PEAK_BATCH = int(os.environ.get("SCALE_PEAK_BATCH", "200"))
 
 # Re-export for callers / future tasks.
 __all__ = [
@@ -227,7 +233,7 @@ def ensure_binary() -> Path:
     if bin_path.is_file():
         return bin_path
     bin_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"==> building go-cdc -> {bin_path}", flush=True)
+    log(f"==> building go-cdc -> {bin_path}", flush=True)
     subprocess.check_call(
         ["go", "build", "-o", str(bin_path), "./cmd/go-cdc"],
         cwd=str(ROOT),
@@ -383,7 +389,7 @@ def wait_snapshot(
                     break
             if done:
                 elapsed = time.time() - t0
-                print(f"TIMING  wait [cdc_snapshot] done in {elapsed:.1f}s", flush=True)
+                log(f"TIMING  wait [cdc_snapshot] done in {elapsed:.1f}s", flush=True)
                 return elapsed
         except Exception as exc:  # noqa: BLE001
             last_err = exc
@@ -497,7 +503,7 @@ def mutate_all(profile: Profile) -> float:
                 fut.result()
             except Exception as exc:  # noqa: BLE001
                 msg = f"ERROR scale mutate {spec.src_db}.{spec.name}: {exc}"
-                print(msg, file=sys.stderr, flush=True)
+                log(msg, file=sys.stderr, flush=True)
                 errors.append(msg)
     if errors:
         raise RuntimeError(f"mutate_all failed ({len(errors)} tables):\n" + "\n".join(errors))
@@ -582,13 +588,218 @@ def wait_catchup(
             last_failures = verify_update_markers(profile, "catchup")
         if not last_failures:
             elapsed = time.time() - t0
-            print(f"TIMING  wait [cdc_catchup] done in {elapsed:.1f}s", flush=True)
+            log(f"TIMING  wait [cdc_catchup] done in {elapsed:.1f}s", flush=True)
             return elapsed
         time.sleep(15.0)
     sample = "\n".join(last_failures[:5])
     raise TimeoutError(
         f"timeout waiting for scale catch-up after {time.time() - t0:.1f}s "
         f"({len(last_failures)} mismatches):\n{sample}"
+    )
+
+
+def _table_key(spec: TableSpec) -> str:
+    return f"{spec.src_db}.{spec.name}"
+
+
+def _max_id(spec: TableSpec) -> int:
+    conn = _user_conn(SRC_USER, SRC_PASSWORD, spec.src_db)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COALESCE(MAX(`id`), 0) AS m FROM `{spec.src_db}`.`{spec.name}`")
+            row = cur.fetchone()
+            return int(row["m"]) if row else 0
+    finally:
+        conn.close()
+
+
+def _burst_one_table(spec: TableSpec, n_rows: int) -> int:
+    """Insert n_rows after MAX(id); return new high-water id."""
+    if n_rows <= 0:
+        return _max_id(spec)
+    start = _max_id(spec) + 1
+    end = start + n_rows - 1
+    conn = _user_conn(SRC_USER, SRC_PASSWORD, spec.src_db)
+    try:
+        insert_batch(
+            conn,
+            spec.src_db,
+            spec.name,
+            spec.template,
+            start,
+            end,
+            spec.db_index,
+            spec.ordinal,
+        )
+    finally:
+        conn.close()
+    return end
+
+
+def _assert_cdc_alive(proc: subprocess.Popen | None, phase: str) -> None:
+    """Fail immediately if go-cdc exited during hotspot burst / peak / catch-up."""
+    if proc is not None and proc.poll() is not None:
+        raise RuntimeError(f"go-cdc exited during hotspot {phase}: {proc.returncode}")
+
+
+def burst_hotspots(
+    profile: Profile,
+    hotspots: list[TableSpec],
+    proc: subprocess.Popen | None = None,
+) -> tuple[float, dict[str, int]]:
+    """Fixed-row burst into hotspot tables; return (elapsed, next_id_by_key)."""
+    n_rows = SCALE_BURST_ROWS_PER_HOT
+    log(
+        f"==> hotspot burst rows_per_hot={n_rows} tables={len(hotspots)} "
+        f"workers={profile.workers}",
+        flush=True,
+    )
+    for h in hotspots:
+        log(f"    hotspot {h.src_db}.{h.name} (ordinal={h.ordinal} template={h.template})", flush=True)
+    t0 = time.time()
+    next_ids: dict[str, int] = {}
+    errors: list[str] = []
+    _assert_cdc_alive(proc, "burst")
+    with ThreadPoolExecutor(max_workers=profile.workers) as pool:
+        futs = {pool.submit(_burst_one_table, h, n_rows): h for h in hotspots}
+        pending = set(futs)
+        while pending:
+            _assert_cdc_alive(proc, "burst")
+            done, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+            for fut in done:
+                h = futs[fut]
+                try:
+                    high = fut.result()
+                    next_ids[_table_key(h)] = high + 1
+                    log(f"    burst done {h.src_db}.{h.name} high_id={high}", flush=True)
+                except Exception as exc:  # noqa: BLE001
+                    msg = f"ERROR burst {h.src_db}.{h.name}: {exc}"
+                    log(msg, file=sys.stderr, flush=True)
+                    errors.append(msg)
+    if errors:
+        raise RuntimeError(f"burst_hotspots failed:\n" + "\n".join(errors))
+    return time.time() - t0, next_ids
+
+
+def _peak_writer(
+    worker_id: int,
+    hotspots: list[TableSpec],
+    next_ids: dict[str, int],
+    lock: threading.Lock,
+    stop_at: float,
+    batch: int,
+) -> int:
+    """Time-based inserts into hotspot set; returns rows written by this worker."""
+    written = 0
+    rr = worker_id
+    conns: dict[str, object] = {}
+    try:
+        while time.time() < stop_at:
+            spec = hotspots[rr % len(hotspots)]
+            rr += 1
+            key = _table_key(spec)
+            with lock:
+                start = next_ids[key]
+                next_ids[key] = start + batch
+            end = start + batch - 1
+            conn = conns.get(spec.src_db)
+            if conn is None:
+                conn = _user_conn(SRC_USER, SRC_PASSWORD, spec.src_db)
+                conns[spec.src_db] = conn
+            insert_batch(
+                conn,
+                spec.src_db,
+                spec.name,
+                spec.template,
+                start,
+                end,
+                spec.db_index,
+                spec.ordinal,
+            )
+            written += batch
+    finally:
+        for c in conns.values():
+            c.close()  # type: ignore[union-attr]
+    return written
+
+
+def peak_write_hotspots(
+    profile: Profile,
+    hotspots: list[TableSpec],
+    next_ids: dict[str, int],
+    proc: subprocess.Popen | None = None,
+) -> tuple[float, int]:
+    """Time-based peak into hotspots; return (elapsed, total_rows_written)."""
+    peak_workers = int(os.environ.get("SCALE_PEAK_WORKERS", str(profile.workers)))
+    peak_workers = max(1, peak_workers)
+    seconds = SCALE_PEAK_SECONDS
+    batch = SCALE_PEAK_BATCH
+    log(
+        f"==> hotspot peak seconds={seconds} workers={peak_workers} batch={batch}",
+        flush=True,
+    )
+    stop_at = time.time() + seconds
+    lock = threading.Lock()
+    t0 = time.time()
+    _assert_cdc_alive(proc, "peak")
+    totals: list[int] = []
+    with ThreadPoolExecutor(max_workers=peak_workers) as pool:
+        futs = [
+            pool.submit(_peak_writer, i, hotspots, next_ids, lock, stop_at, batch)
+            for i in range(peak_workers)
+        ]
+        pending = set(futs)
+        while pending:
+            _assert_cdc_alive(proc, "peak")
+            done, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+            for fut in done:
+                totals.append(fut.result())
+    elapsed = max(time.time() - t0, 0.001)
+    rows = sum(totals)
+    log(
+        f"TIMING peak_write {elapsed:.1f}s ({rows} rows ≈ {rows / elapsed:.0f} rps)",
+        flush=True,
+    )
+    return elapsed, rows
+
+
+def wait_hotspot_convergence(
+    hotspots: list[TableSpec],
+    timeout: float = 3600,
+    interval: float = 15.0,
+    proc: subprocess.Popen | None = None,
+) -> float:
+    """Poll until each hotspot src/sink COUNT converges within 1%."""
+    t0 = time.time()
+    deadline = t0 + timeout
+    last_log = 0.0
+    while time.time() < deadline:
+        _assert_cdc_alive(proc, "catch-up")
+        ok = True
+        lines: list[str] = []
+        for h in hotspots:
+            src_n = _count_rows(SRC_USER, SRC_PASSWORD, h.src_db, h.name)
+            snk_n = _count_rows(SINK_USER, SINK_PASSWORD, h.snk_db, h.sink_name)
+            delta = abs(src_n - snk_n) / max(src_n, 1)
+            lines.append(
+                f"{h.src_db}.{h.name} src={src_n} snk={snk_n} delta={delta:.2%}"
+            )
+            if delta > 0.01:
+                ok = False
+        now = time.time()
+        if now - last_log >= interval or ok:
+            log(
+                f"    hotspot catch-up {now - t0:.0f}s: " + " | ".join(lines),
+                flush=True,
+            )
+            last_log = now
+        if ok:
+            elapsed = time.time() - t0
+            log(f"TIMING peak_catchup {elapsed:.1f}s", flush=True)
+            return elapsed
+        time.sleep(interval)
+    raise TimeoutError(
+        f"timeout waiting for hotspot count convergence after {time.time() - t0:.1f}s"
     )
 
 
@@ -601,6 +812,7 @@ def write_report(
     timings: dict[str, float],
     failures: list[str],
     path: Path | None = None,
+    extra: dict[str, object] | None = None,
 ) -> Path:
     """Write Markdown scale report; return path written."""
     out = path if path is not None else _report_path(profile)
@@ -631,6 +843,22 @@ def write_report(
         lines.append(f"| {g} | {group_counts.get(g, 0)} |")
     lines.append("")
 
+    if extra and extra.get("hotspots"):
+        lines.append("## Hotspot burst / peak\n")
+        lines.append(
+            f"- Burst rows/hot table: `{SCALE_BURST_ROWS_PER_HOT}`"
+        )
+        lines.append(f"- Peak seconds: `{SCALE_PEAK_SECONDS}`")
+        peak_workers = int(os.environ.get("SCALE_PEAK_WORKERS", str(profile.workers)))
+        lines.append(f"- Peak workers: `{peak_workers}`")
+        lines.append(f"- Peak batch: `{SCALE_PEAK_BATCH}`")
+        if "peak_rows" in extra:
+            lines.append(f"- Peak rows written (measured): `{extra['peak_rows']}`")
+        lines.append("- Hotspot tables:")
+        for name in extra["hotspots"]:  # type: ignore[union-attr]
+            lines.append(f"  - `{name}`")
+        lines.append("")
+
     if timings:
         lines.extend(
             [
@@ -651,10 +879,13 @@ def write_report(
         lines.append("")
     else:
         lines.append("## Summary\n")
-        lines.append(
+        summary = (
             f"All {len(profile.tables)} source/sink pairs matched "
-            "(COUNT + SUM(id) + name_crc) after snapshot and post-mutation catch-up.\n"
+            "(COUNT + SUM(id) + name_crc) after snapshot and post-mutation catch-up."
         )
+        if extra and extra.get("hotspots"):
+            summary += " Heavy hotspot burst + peak count convergence also passed."
+        lines.append(summary + "\n")
 
     lines.append("## Tables\n")
     lines.append("| ordinal | src | sink | template | rows | event_group |")
@@ -703,11 +934,11 @@ def _verify_idle_unchanged(
 
 
 def _print_plan(profile: Profile) -> None:
-    print(f"profile={profile.name}")
-    print(f"tables={len(profile.tables)}")
-    print(f"total_rows={profile.total_rows}")
-    print(f"workers={profile.workers}")
-    print(f"sum_table_rows={sum(t.rows for t in profile.tables)}")
+    log(f"profile={profile.name}")
+    log(f"tables={len(profile.tables)}")
+    log(f"total_rows={profile.total_rows}")
+    log(f"workers={profile.workers}")
+    log(f"sum_table_rows={sum(t.rows for t in profile.tables)}")
 
 
 def _clear_checkpoint(profile: Profile) -> None:
@@ -719,7 +950,7 @@ def _clear_checkpoint(profile: Profile) -> None:
 
 def run_profile(profile: Profile, until: str) -> int:
     """Run scale phases through ``until`` (seed|snapshot|mutate|all)."""
-    print(
+    log(
         f"==> scale profile={profile.name} tables={len(profile.tables)} "
         f"total_rows={profile.total_rows} workers={profile.workers} until={until}",
         flush=True,
@@ -731,34 +962,34 @@ def run_profile(profile: Profile, until: str) -> int:
     ensure_databases(profile)
     ensure_tables(profile)
 
-    print("==> seed baseline", flush=True)
+    log("==> seed baseline", flush=True)
     seed_s = seed_all(profile)
     timings["seed_baseline"] = seed_s
-    print(f"TIMING seed_baseline {seed_s:.1f}s", flush=True)
+    log(f"TIMING seed_baseline {seed_s:.1f}s", flush=True)
     if until == "seed":
         return 0
 
     yaml_path = _yaml_path(profile)
     _clear_checkpoint(profile)
     render_pipeline_yaml(profile, yaml_path)
-    print(f"==> rendered {yaml_path}", flush=True)
+    log(f"==> rendered {yaml_path}", flush=True)
 
-    print("==> start go-cdc (snapshot)", flush=True)
+    log("==> start go-cdc (snapshot)", flush=True)
     proc = start_job(yaml_path)
     try:
         snap_s = wait_snapshot(profile, timeout=1800, proc=proc)
         timings["cdc_snapshot"] = snap_s
-        print(f"TIMING cdc_snapshot {snap_s:.1f}s", flush=True)
+        log(f"TIMING cdc_snapshot {snap_s:.1f}s", flush=True)
 
         snap_failures = verify_pair(profile, "snapshot")
         if snap_failures:
             all_failures.extend(snap_failures)
             for msg in snap_failures:
-                print(f"FAIL {msg}", file=sys.stderr, flush=True)
+                log(f"FAIL {msg}", file=sys.stderr, flush=True)
             write_report(profile, timings, all_failures, report_path)
-            print(f"REPORT {report_path}", flush=True)
+            log(f"REPORT {report_path}", flush=True)
             return 1
-        print(
+        log(
             f"==> snapshot verify ok ({len(profile.tables)} tables)",
             flush=True,
         )
@@ -767,44 +998,71 @@ def run_profile(profile: Profile, until: str) -> int:
 
         idle_before = _idle_checksums(profile)
 
-        print("==> concurrent mutations", flush=True)
+        log("==> concurrent mutations", flush=True)
         mut_s = mutate_all(profile)
         timings["mutate"] = mut_s
-        print(f"TIMING mutate {mut_s:.1f}s", flush=True)
+        log(f"TIMING mutate {mut_s:.1f}s", flush=True)
 
         idle_failures = _verify_idle_unchanged(profile, idle_before)
         if idle_failures:
             all_failures.extend(idle_failures)
             for msg in idle_failures:
-                print(f"FAIL {msg}", file=sys.stderr, flush=True)
+                log(f"FAIL {msg}", file=sys.stderr, flush=True)
 
         if until == "mutate":
             # Still wait catch-up so CDC drains before stop; report final state.
             pass
 
-        print("==> wait catch-up", flush=True)
+        log("==> wait catch-up", flush=True)
         catch_s = wait_catchup(profile, timeout=1800, proc=proc)
         timings["cdc_catchup"] = catch_s
-        print(f"TIMING cdc_catchup {catch_s:.1f}s", flush=True)
+        log(f"TIMING cdc_catchup {catch_s:.1f}s", flush=True)
+
+        hotspot_extra: dict[str, object] = {}
+        if profile.name == "heavy" and until == "all":
+            hotspots = hotspot_tables(profile)
+            burst_s, next_ids = burst_hotspots(profile, hotspots, proc=proc)
+            timings["burst"] = burst_s
+            log(f"TIMING burst {burst_s:.1f}s", flush=True)
+
+            peak_s, peak_rows = peak_write_hotspots(
+                profile, hotspots, next_ids, proc=proc
+            )
+            timings["peak_write"] = peak_s
+            hotspot_extra["peak_rows"] = peak_rows
+            hotspot_extra["hotspots"] = [
+                f"{h.src_db}.{h.name}" for h in hotspots
+            ]
+
+            catch_peak_s = wait_hotspot_convergence(
+                hotspots, timeout=3600, interval=15.0, proc=proc
+            )
+            timings["peak_catchup"] = catch_peak_s
 
         final_failures = verify_pair(profile, "final")
         final_failures.extend(verify_update_markers(profile, "final"))
         all_failures.extend(final_failures)
         if final_failures:
             for msg in final_failures:
-                print(f"FAIL {msg}", file=sys.stderr, flush=True)
+                log(f"FAIL {msg}", file=sys.stderr, flush=True)
         else:
-            print(
+            log(
                 f"==> final verify ok ({len(profile.tables)} tables)",
                 flush=True,
             )
 
-        write_report(profile, timings, all_failures, report_path)
-        print(f"REPORT {report_path}", flush=True)
+        write_report(
+            profile,
+            timings,
+            all_failures,
+            report_path,
+            extra=hotspot_extra or None,
+        )
+        log(f"REPORT {report_path}", flush=True)
         if all_failures:
-            print("SUMMARY FAIL", flush=True)
+            log("SUMMARY FAIL", flush=True)
             return 1
-        print("SUMMARY PASS", flush=True)
+        log("SUMMARY PASS", flush=True)
         return 0
     except Exception:
         # Best-effort report on hard failures when we have timings.
@@ -816,7 +1074,7 @@ def run_profile(profile: Profile, until: str) -> int:
                     all_failures + ["aborted: see logs / exception"],
                     report_path,
                 )
-                print(f"REPORT {report_path}", flush=True)
+                log(f"REPORT {report_path}", flush=True)
         except Exception:  # noqa: BLE001
             pass
         raise

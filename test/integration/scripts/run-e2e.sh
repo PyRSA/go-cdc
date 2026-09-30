@@ -5,6 +5,8 @@ ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 IT="${ROOT}/test/integration"
 WORKDIR="${IT}/workdir"
 mkdir -p "${WORKDIR}" "${ROOT}/docs/test"
+# shellcheck source=test/integration/scripts/_log.sh
+source "${IT}/scripts/_log.sh"
 
 export MYSQL_HOST="${MYSQL_HOST:-127.0.0.1}"
 export MYSQL_PORT="${MYSQL_PORT:-13306}"
@@ -42,15 +44,31 @@ export LOAD_PEAK_WORKERS="${LOAD_PEAK_WORKERS:-4}"
 export LOAD_PEAK_BATCH="${LOAD_PEAK_BATCH:-200}"
 export LOAD_PARALLELISM="${LOAD_PARALLELISM:-${LOAD_PEAK_WORKERS}}"
 
-echo "==> load knobs"
-echo "    LOAD_PROFILE=${LOAD_PROFILE}"
-echo "    LOAD_ROWS_PER_TABLE=${LOAD_ROWS_PER_TABLE}"
-echo "    LOAD_LARGE_ROWS=${LOAD_LARGE_ROWS}"
-echo "    LOAD_LARGE_FIELD_BYTES=${LOAD_LARGE_FIELD_BYTES}"
-echo "    LOAD_PEAK_SECONDS=${LOAD_PEAK_SECONDS}"
-echo "    LOAD_PEAK_WORKERS=${LOAD_PEAK_WORKERS}"
-echo "    LOAD_PEAK_BATCH=${LOAD_PEAK_BATCH}"
-echo "    LOAD_PARALLELISM=${LOAD_PARALLELISM}"
+# Drop compose MySQL on script exit — local only.
+# In CI (CI/GITHUB_ACTIONS), do NOT clean here: Tear down must run only after
+# later steps (e.g. Upload artifacts) finish. Workflow Tear down is last + if: always().
+if [ -z "${CI:-}" ] && [ -z "${GITHUB_ACTIONS:-}" ]; then
+  cleanup_mysql() {
+    local status=$?
+    if [ "${KEEP_IT_MYSQL:-}" = "1" ]; then
+      exit "${status}"
+    fi
+    log "==> remove integration MySQL data volume"
+    bash "${IT}/scripts/mysql-down.sh" || true
+    exit "${status}"
+  }
+  trap cleanup_mysql EXIT
+fi
+
+log "==> load knobs"
+log "    LOAD_PROFILE=${LOAD_PROFILE}"
+log "    LOAD_ROWS_PER_TABLE=${LOAD_ROWS_PER_TABLE}"
+log "    LOAD_LARGE_ROWS=${LOAD_LARGE_ROWS}"
+log "    LOAD_LARGE_FIELD_BYTES=${LOAD_LARGE_FIELD_BYTES}"
+log "    LOAD_PEAK_SECONDS=${LOAD_PEAK_SECONDS}"
+log "    LOAD_PEAK_WORKERS=${LOAD_PEAK_WORKERS}"
+log "    LOAD_PEAK_BATCH=${LOAD_PEAK_BATCH}"
+log "    LOAD_PARALLELISM=${LOAD_PARALLELISM}"
 
 # mysql client without -pPASSWORD on argv (use MYSQL_PWD for the child only).
 mysql_as() {
@@ -59,10 +77,10 @@ mysql_as() {
   MYSQL_PWD="${pass}" mysql -h"${MYSQL_HOST}" -P"${MYSQL_PORT}" -u"${user}" --protocol=TCP "$@"
 }
 
-echo "==> build go-cdc"
+log "==> build go-cdc"
 (cd "${ROOT}" && go build -o "${GO_CDC}" ./cmd/go-cdc)
 
-echo "==> install harness deps"
+log "==> install harness deps"
 PYTHON_BIN="${PYTHON_BIN:-}"
 if [ -z "${PYTHON_BIN}" ]; then
   for c in python3.11 python3.10 python3.9 python3; do
@@ -72,17 +90,17 @@ if [ -z "${PYTHON_BIN}" ]; then
     fi
   done
 fi
-echo "    using ${PYTHON_BIN}"
+log "    using ${PYTHON_BIN}"
 "${PYTHON_BIN}" -m pip install -q -r "${IT}/harness/requirements.txt"
 
-echo "==> wait mysql"
+log "==> wait mysql"
 bash "${IT}/scripts/wait-for-mysql.sh"
 
-echo "==> seed functional + types"
+log "==> seed functional + types"
 mysql_as "${SRC_USER}" "${SRC_PASSWORD}" < "${IT}/fixtures/seed.sql"
 mysql_as "${SRC_USER}" "${SRC_PASSWORD}" < "${IT}/fixtures/seed_types.sql"
 
-echo "==> clean sink tables"
+log "==> clean sink tables"
 mysql_as "${SINK_USER}" "${SINK_PASSWORD}" -e "
 DROP TABLE IF EXISTS
   ${FUNC_SNK_DB}.tp01_rows_out, ${FUNC_SNK_DB}.tp02_keys_out,
@@ -94,14 +112,14 @@ DROP TABLE IF EXISTS
 "
 rm -rf "${CHECKPOINT_DIR}" "${CHECKPOINT_STDOUT_DIR}" "${CHECKPOINT_TYPES_DIR}" "${CHECKPOINT_LOAD_DIR}"
 
-echo "==> run functional harness (TP-01..TP-13)"
+log "==> run functional harness (TP-01..TP-13)"
 cd "${IT}"
 "${PYTHON_BIN}" -m harness.run_it
 
-echo "==> run types/timezone harness (TP-D01..)"
+log "==> run types/timezone harness (TP-D01..)"
 "${PYTHON_BIN}" -m harness.types_it
 
-echo "==> run load/peak harness (TP-L01..)"
+log "==> run load/peak harness (TP-L01..)"
 "${PYTHON_BIN}" -m harness.load_it
 
-echo "==> done"
+log "==> done"

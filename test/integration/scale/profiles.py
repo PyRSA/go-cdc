@@ -125,3 +125,16 @@ def load_profile(
     workers = workers_override if workers_override is not None else defaults["workers"]
     tables = _build_tables(defaults["db_tables"], total_rows)
     return Profile(name=name, workers=workers, total_rows=total_rows, tables=tables)
+
+
+def hotspot_tables(profile: Profile) -> list[TableSpec]:
+    """One hotspot per source DB: the table with minimum ordinal in that DB.
+
+    Selection is by ordinal only (no schema-template filter).
+    """
+    best: dict[int, TableSpec] = {}
+    for t in profile.tables:
+        cur = best.get(t.db_index)
+        if cur is None or t.ordinal < cur.ordinal:
+            best[t.db_index] = t
+    return [best[i] for i in sorted(best)]

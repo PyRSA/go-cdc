@@ -16,6 +16,7 @@ from pathlib import Path
 import pymysql
 
 from . import config as cfg
+from .logutil import log
 
 SRC = cfg.conn_kwargs(cfg.SRC_USER, cfg.SRC_PASSWORD, cfg.FUNC_SRC_DB)
 SNK = cfg.conn_kwargs(cfg.SINK_USER, cfg.SINK_PASSWORD, cfg.FUNC_SNK_DB)
@@ -186,7 +187,7 @@ def record(tp: TPResult, override: bool | None = None, compare_md: str | None = 
     tp.passed = ok if override is None else override
     tp.compare_md = compare_md if compare_md is not None else cmp_md
     results.append(tp)
-    print(f"[{tp.id}] {'PASS' if tp.passed else 'FAIL'} {tp.title}", flush=True)
+    log(f"[{tp.id}] {'PASS' if tp.passed else 'FAIL'} {tp.title}", flush=True)
 
 
 def set_tables_pattern(pattern: str):
@@ -778,8 +779,8 @@ def main() -> int:
 
     report_path = write_report()
     failed = [r for r in results if not r.passed]
-    print("REPORT", report_path)
-    print("PASS", sum(1 for r in results if r.passed), "FAIL", len(failed))
+    log("REPORT", report_path)
+    log("PASS", sum(1 for r in results if r.passed), "FAIL", len(failed))
     return 0 if not failed else 1
 
 

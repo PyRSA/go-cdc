@@ -22,6 +22,7 @@ from pathlib import Path
 import pymysql
 
 from . import config as cfg
+from .logutil import log
 
 SRC = cfg.conn_kwargs(cfg.SRC_USER, cfg.SRC_PASSWORD, cfg.LOAD_SRC_DB)
 SNK = cfg.conn_kwargs(cfg.SINK_USER, cfg.SINK_PASSWORD, cfg.LOAD_SNK_DB)
@@ -140,7 +141,7 @@ def wait_until(predicate, timeout=300, interval=15.0, desc="condition") -> float
         try:
             if predicate():
                 elapsed = time.time() - t0
-                print(f"TIMING  wait [{desc}] done in {elapsed:.1f}s", flush=True)
+                log(f"TIMING  wait [{desc}] done in {elapsed:.1f}s", flush=True)
                 return elapsed
         except Exception as exc:  # noqa: BLE001
             last_err = exc
@@ -165,18 +166,18 @@ def wait_peak_catchup(timeout: float = 1800, interval: float = 15.0, log_every: 
             raise RuntimeError(f"go-cdc exited during peak catch-up: {proc.returncode}")
         if _count_ok("tpl01_t1") and _count_ok(TYPED_TABLE):
             elapsed = time.time() - t0
-            print(f"TIMING  wait [cdc_peak catch-up] done in {elapsed:.1f}s", flush=True)
+            log(f"TIMING  wait [cdc_peak catch-up] done in {elapsed:.1f}s", flush=True)
             return elapsed
         now = time.time()
         if now - last_log >= log_every:
-            print(
+            log(
                 f"    peak catch-up {now - t0:.0f}s: "
                 f"{_lag_line('tpl01_t1')} | {_lag_line(TYPED_TABLE)}",
                 flush=True,
             )
             last_log = now
         time.sleep(interval)
-    print(
+    log(
         f"    peak catch-up TIMEOUT: {_lag_line('tpl01_t1')} | {_lag_line(TYPED_TABLE)}",
         flush=True,
     )
@@ -218,7 +219,7 @@ def record(tp: TPResult, override: bool | None = None, compare_md: str | None = 
     if compare_md:
         tp.compare_md = compare_md
     results.append(tp)
-    print(f"{'PASS' if tp.passed else 'FAIL'} {tp.id} {tp.title}")
+    log(f"{'PASS' if tp.passed else 'FAIL'} {tp.id} {tp.title}")
 
 
 def ensure_schema():
@@ -383,7 +384,7 @@ def seed_baseline():
                     (i, _image_blob(i), _long_text(i), f"note-{i}"),
                 )
                 if i % 10 == 0:
-                    print(f"    large seeded {i}/{LARGE_ROWS}", flush=True)
+                    log(f"    large seeded {i}/{LARGE_ROWS}", flush=True)
         finally:
             db.close()
 
@@ -398,7 +399,7 @@ def seed_baseline():
     # Parallelize across tables; seed concurrency = workers * 2, hard cap 16.
     seed_cap = 16
     workers = max(1, min(WORKERS * 2, seed_cap, len(tasks)))
-    print(
+    log(
         f"    seed workers={workers} "
         f"(LOAD_PEAK_WORKERS={WORKERS} × 2, cap={seed_cap}, one conn/table)",
         flush=True,
@@ -411,7 +412,7 @@ def seed_baseline():
                 fut.result()
             except Exception as exc:  # noqa: BLE001
                 raise RuntimeError(f"{SRC_DB}.{name}: seed failed: {exc}") from exc
-            print(f"    seed done {name}", flush=True)
+            log(f"    seed done {name}", flush=True)
 
 
 def peak_writer(worker_id: int, stop_at: float, counter: list[int], lock: threading.Lock) -> int:
@@ -518,9 +519,9 @@ def main() -> int:
     t0 = time.time()
     ensure_schema()
     timings["schema_setup"] = time.time() - t0
-    print(f"TIMING  schema_setup {timings['schema_setup']:.1f}s", flush=True)
+    log(f"TIMING  schema_setup {timings['schema_setup']:.1f}s", flush=True)
 
-    print(
+    log(
         f"==> seed baseline {ROWS} rows x {len(BIZ_TABLES)+1} tables + "
         f"{LARGE_ROWS} large rows ({LARGE_BYTES}B)",
         flush=True,
@@ -528,14 +529,14 @@ def main() -> int:
     t0 = time.time()
     seed_baseline()
     timings["seed_baseline"] = time.time() - t0
-    print(f"TIMING  seed_baseline {timings['seed_baseline']:.1f}s", flush=True)
+    log(f"TIMING  seed_baseline {timings['seed_baseline']:.1f}s", flush=True)
 
     cfg.render_template(
         "pipeline.load.yaml.tpl",
         YAML,
         extra={"LOAD_PARALLELISM": cfg.LOAD_PARALLELISM},
     )
-    print("==> start go-cdc (snapshot + incremental)", flush=True)
+    log("==> start go-cdc (snapshot + incremental)", flush=True)
     t0 = time.time()
     start_job()
     timings["cdc_start"] = time.time() - t0
@@ -552,7 +553,7 @@ def main() -> int:
         return table_exists(SNK, SINK_DB, out_l) and count_rows(SNK, SINK_DB, out_l) >= LARGE_ROWS
 
     timings["cdc_snapshot"] = wait_until(snap_done, timeout=1800, desc="cdc_snapshot catch-up")
-    print(f"TIMING  cdc_snapshot {timings['cdc_snapshot']:.1f}s", flush=True)
+    log(f"TIMING  cdc_snapshot {timings['cdc_snapshot']:.1f}s", flush=True)
     cmp1 = (
         "| Table | Expected rows | Source rows | Sink rows | Delta | Verdict |\n"
         "| --- | --- | --- | --- | --- | --- |\n"
@@ -701,7 +702,7 @@ def main() -> int:
     counter = [0]
     lock = threading.Lock()
     stop_at = time.time() + PEAK_SEC
-    print(f"==> peak writers {WORKERS}x{PEAK_SEC}s", flush=True)
+    log(f"==> peak writers {WORKERS}x{PEAK_SEC}s", flush=True)
     peak_t0 = time.time()
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         futs = [pool.submit(peak_writer, i, stop_at, counter, lock) for i in range(WORKERS)]
@@ -710,14 +711,14 @@ def main() -> int:
     timings["peak_write"] = peak_elapsed
     peak_rows = sum(written_each)
     peak_rps = peak_rows / peak_elapsed
-    print(
+    log(
         f"TIMING  peak_write {peak_elapsed:.1f}s "
         f"({peak_rows} rows ≈ {peak_rps:.0f} rps)",
         flush=True,
     )
 
     timings["cdc_peak_catchup"] = wait_peak_catchup(timeout=1800)
-    print(f"TIMING  cdc_peak_catchup {timings['cdc_peak_catchup']:.1f}s", flush=True)
+    log(f"TIMING  cdc_peak_catchup {timings['cdc_peak_catchup']:.1f}s", flush=True)
     time.sleep(3)
     src_n = count_rows(SRC, SRC_DB, "tpl01_t1")
     snk_n = count_rows(SNK, SINK_DB, "tpl01_t1_out")
@@ -758,13 +759,13 @@ def main() -> int:
     )
 
     timings["suite_total"] = time.time() - suite_t0
-    print("TIMING  summary:", flush=True)
+    log("TIMING  summary:", flush=True)
     for name, sec in timings.items():
-        print(f"  {name:20s} {sec:8.1f}s", flush=True)
+        log(f"  {name:20s} {sec:8.1f}s", flush=True)
     report = write_report(timings)
     failed = [r for r in results if not r.passed]
-    print("REPORT", report, flush=True)
-    print("PASS", sum(1 for r in results if r.passed), "FAIL", len(failed), flush=True)
+    log("REPORT", report, flush=True)
+    log("PASS", sum(1 for r in results if r.passed), "FAIL", len(failed), flush=True)
     return 0 if not failed else 1
 
 

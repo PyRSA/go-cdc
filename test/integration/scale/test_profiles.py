@@ -55,3 +55,38 @@ def test_template_rotation_and_event_groups():
     assert p.tables[3].template == "large"
     groups = {t.event_group for t in p.tables}
     assert groups == {"insert", "update", "delete", "insert_update", "idle"}
+
+
+def test_hotspot_tables_one_per_db_min_ordinal():
+    from scale.profiles import hotspot_tables
+
+    heavy = load_profile("heavy")
+    hot = hotspot_tables(heavy)
+    assert len(hot) == 10
+    assert [t.db_index for t in hot] == list(range(1, 11))
+    by_db: dict[int, list] = {}
+    for t in heavy.tables:
+        by_db.setdefault(t.db_index, []).append(t)
+    for h in hot:
+        expected = min(by_db[h.db_index], key=lambda s: s.ordinal)
+        assert h.ordinal == expected.ordinal
+        assert h.name == expected.name
+
+    normal = load_profile("normal")
+    hot_n = hotspot_tables(normal)
+    assert len(hot_n) == 5
+    assert [t.db_index for t in hot_n] == list(range(1, 6))
+
+
+def test_assert_cdc_alive_raises_when_exited():
+    from scale.scale_it import _assert_cdc_alive
+
+    class _Dead:
+        returncode = 7
+
+        def poll(self):
+            return self.returncode
+
+    with pytest.raises(RuntimeError, match=r"go-cdc exited during hotspot burst: 7"):
+        _assert_cdc_alive(_Dead(), "burst")  # type: ignore[arg-type]
+    _assert_cdc_alive(None, "peak")  # no-op when no proc

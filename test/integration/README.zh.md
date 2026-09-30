@@ -37,8 +37,9 @@ English: [README.md](./README.md)
 bash test/integration/scripts/mysql-up.sh
 bash test/integration/scripts/run-e2e.sh
 ls docs/test/reports/
-bash test/integration/scripts/mysql-down.sh
 ```
+
+`run-e2e.sh` / `run-scale.sh` **仅在本地**退出时删 compose MySQL（`KEEP_IT_MYSQL=1` 可保留）。**CI 不在 harness 退出时清理**，只由 workflow **最后一步 Tear down**（`if: always()`，在上传报告之后）执行 `mysql-down`，避免报告/产物未上传就先清掉环境。
 
 ## 规模套件
 
@@ -59,7 +60,7 @@ make integration-scale-heavy
 | `LOAD_ROWS_PER_TABLE` | `50000`（本地默认）；CI：`30000` normal / `100000` full | 普通表行数（t1–t4 + typed） |
 | `LOAD_LARGE_ROWS` | `50` | 大字段表 `tpl01_large` 行数 |
 | `LOAD_LARGE_FIELD_BYTES` | `2097152`（2MiB，限制在 1–5MiB） | 单字段大小：图片 `LONGBLOB` + `LONGTEXT` |
-| `LOAD_PEAK_SECONDS` | `90`（本地）；CI：MySQL 5.7 为 `45` / 8.0 为 `90` | 峰值写入时长 |
+| `LOAD_PEAK_SECONDS` | `90`（本地与 CI MySQL 5.7 / 8.0 相同） | 峰值写入时长 |
 | `LOAD_PEAK_WORKERS` | `4`（本地与 CI 两版本相同） | 峰值写并发；**造数**用 `workers × 2`（上限 16，且不超过表数） |
 | `LOAD_PARALLELISM` | 默认同 `LOAD_PEAK_WORKERS` | 负载套件 CDC `pipeline.parallelism` |
 | `LOAD_PEAK_BATCH` | `200` | 每批 INSERT 行数 |
@@ -77,6 +78,6 @@ make integration-scale-heavy
 | `mysql-mysql-e2e` | MySQL **5.7** + **8.0** | 功能 + 类型 + 负载 |
 | `mysql-scale-e2e` | 仅 MySQL **8.0** | scale `normal` / `heavy`（独立 compose 项目，宿主机端口 `13307`） |
 
-**负载分档**（`LOAD_ROWS_PER_TABLE`）：PR / `main` / `master` / `release-*` → **100000**（`LOAD_PROFILE=full`）；其他分支 push → **30000**（`normal`）。峰值：5.7 → 45s×4；8.0 → 90s×4。
+**负载分档**（`LOAD_ROWS_PER_TABLE`）：PR / `main` / `master` / `release-*` → **100000**（`LOAD_PROFILE=full`）；其他分支 push → **30000**（`normal`）。峰值：5.7 / 8.0 均为 **90s×4**。
 
-**Scale 分档**：PR / `main` / `master` / `release-*` → **heavy**（10 库 / 50 表 / ~30 万行 / w=8）；其他分支 push → **normal**（5 库 / 20 表 / ~5 万行 / w=4）；`workflow_dispatch` 可选 `normal`/`heavy`（默认 heavy）。
+**Scale 分档**：PR / `main` / `master` / `release-*` → **heavy**（10 库 / 50 表 / ~30 万行 / w=8，含热点 burst+peak）；其他分支 push → **normal**（5 库 / 20 表 / ~5 万行 / w=4）；`workflow_dispatch` 可选 `normal`/`heavy`（默认 heavy）。`mysql-scale-e2e` job 超时 **120 分钟**。

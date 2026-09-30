@@ -52,8 +52,9 @@ test/integration/
 bash test/integration/scripts/mysql-up.sh
 bash test/integration/scripts/run-e2e.sh
 ls docs/test/reports/
-bash test/integration/scripts/mysql-down.sh
 ```
+
+`run-e2e.sh` / `run-scale.sh` remove compose MySQL on exit **only when run locally** (`KEEP_IT_MYSQL=1` to keep it). In CI they do **not** tear down on harness exit — cleanup is solely the workflow **Tear down** step, which is last (`if: always()`), after report upload, so artifacts are never blocked by early `mysql-down`.
 
 ## Scale suite
 
@@ -74,7 +75,7 @@ Scale DBs (`db_tp_scale_src_NN` / `db_tp_scale_snk_NN`) are created at runtime b
 | `LOAD_ROWS_PER_TABLE` | `50000` (local default); CI: `30000` normal / `100000` full | Rows per normal table (t1–t4 + typed) |
 | `LOAD_LARGE_ROWS` | `50` | Rows in mega-field table `tpl01_large` |
 | `LOAD_LARGE_FIELD_BYTES` | `2097152` (2MiB, clamped 1–5MiB) | Per-field size: image `LONGBLOB` + `LONGTEXT` |
-| `LOAD_PEAK_SECONDS` | `90` (local); CI: `45` on MySQL 5.7 / `90` on 8.0 | Peak write duration |
+| `LOAD_PEAK_SECONDS` | `90` (local + CI MySQL 5.7 / 8.0) | Peak write duration |
 | `LOAD_PEAK_WORKERS` | `4` (local + CI both versions) | Peak writers; **seed** uses `workers × 2` (capped at 16 and by table count) |
 | `LOAD_PARALLELISM` | same as `LOAD_PEAK_WORKERS` | CDC `pipeline.parallelism` for the load suite |
 | `LOAD_PEAK_BATCH` | `200` | Rows per INSERT batch |
@@ -98,13 +99,14 @@ Jobs:
 
 - PR / push `main` / `master` / `release-*` → **`100000`** (`LOAD_PROFILE=full`)
 - other branch push → **`30000`** (`LOAD_PROFILE=normal`)
-- Peak: 5.7 → `LOAD_PEAK_SECONDS=45`; 8.0 → `90`; workers `4`
+- Peak: both 5.7 and 8.0 → `LOAD_PEAK_SECONDS=90`, workers `4`
 
 **Scale profile**:
 
-- PR / push `main` / `master` / `release-*` → **`heavy`** (10 DB / 50 tables / ~300k rows / workers 8)
+- PR / push `main` / `master` / `release-*` → **`heavy`** (10 DB / 50 tables / ~300k rows / workers 8) including hotspot burst + peak
 - other branch push → **`normal`** (5 DB / 20 tables / ~50k rows / workers 4)
 - `workflow_dispatch` → choose `normal` or `heavy` (default `heavy`)
+- `mysql-scale-e2e` job timeout: **120 minutes**
 
 Artifacts: `go-cdc-it-report-mysql-{5.7\|8.0}` and `go-cdc-scale-report-mysql-8.0` (Markdown under `docs/test/reports/`).
 
