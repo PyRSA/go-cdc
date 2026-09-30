@@ -85,7 +85,9 @@ Load cases: TP-L01 multi-table snapshot (t1–t4 + typed + large), TP-L02 peak (
 
 ## GitHub Actions
 
-[`.github/workflows/integration.yml`](../../.github/workflows/integration.yml) (**Go CDC CI**): any-branch `push`, any `pull_request`, and `workflow_dispatch`.
+[`.github/workflows/integration.yml`](../../.github/workflows/integration.yml) (workflow display name **`CI`**): `push` / `pull_request` when CDC source, modules, or `test/integration/**` change (or this workflow); plus `workflow_dispatch`. Any `*.md` and demo `configs/**` are excluded. Check names look like `CI / Integration / … (push)`.
+
+Repo hygiene: [`repo-checks.yml`](../../.github/workflows/repo-checks.yml) → `CI / Repo / File size`, `CI / Repo / License` on every push/PR.
 
 Jobs:
 

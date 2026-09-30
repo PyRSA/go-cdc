@@ -70,7 +70,9 @@ make integration-scale-heavy
 
 ## GitHub Actions
 
-[`.github/workflows/integration.yml`](../../.github/workflows/integration.yml)（**Go CDC CI**）。任意分支 `push`、任意 `pull_request`、`workflow_dispatch`。
+[`.github/workflows/integration.yml`](../../.github/workflows/integration.yml)（界面名 **`CI`**）。仅在 CDC 源码、模块、`test/integration/**`（或本 workflow）变更时的 `push` / `pull_request`，以及 `workflow_dispatch`。任意 `*.md` 与样例 `configs/**` 不触发。检查项形如 `CI / Integration / … (push)`。
+
+仓库卫生：[`repo-checks.yml`](../../.github/workflows/repo-checks.yml) → 每次 push/PR 的 `CI / Repo / File size`、`CI / Repo / License`。
 
 | Job | 矩阵 | 内容 |
 | --- | --- | --- |

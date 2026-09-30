@@ -1,7 +1,7 @@
 # Formal releases: push tag release-vX.Y.Z (e.g. release-v0.1.0) →
 # build Linux binaries → GitHub Release assets.
 # Nightly / edge rolling builds are out of scope for this workflow.
-name: Publish Releases
+name: CI
 
 on:
   push:
@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   release:
-    name: Build + GitHub Release
+    name: Release / Publish
     runs-on: ubuntu-latest
     timeout-minutes: 20
 

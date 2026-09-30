@@ -1,5 +1,5 @@
-# Repo hygiene checks in one workflow, two jobs.
-name: Repo Checks
+# Repo hygiene checks (file size + MIT license declarations).
+name: CI
 
 on:
   pull_request:
@@ -10,8 +10,7 @@ permissions:
 
 jobs:
   check-file-size:
-    name: Changed files ≤ 1 MiB
-    if: github.event_name == 'pull_request'
+    name: Repo / File size
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -22,11 +21,46 @@ jobs:
 
       - name: Check changed file sizes
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
           MAX_BYTES: "1048576"
         run: |
           set -euo pipefail
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            BASE_SHA="${PR_BASE}"
+            HEAD_SHA="${PR_HEAD}"
+            RANGE="${BASE_SHA}...${HEAD_SHA}"
+          else
+            BASE_SHA="${PUSH_BEFORE}"
+            HEAD_SHA="${PUSH_AFTER:-${GITHUB_SHA}}"
+            # New branch / force-push with no parent: fall back to commit tree.
+            if [[ -z "${BASE_SHA}" || "${BASE_SHA}" =~ ^0+$ ]]; then
+              RANGE="${HEAD_SHA}"
+              echo "No usable before SHA; checking all files in ${HEAD_SHA}."
+              failed=0
+              while IFS= read -r -d '' file; do
+                [[ -z "${file}" ]] && continue
+                if [[ ! -f "${file}" ]] || [[ -L "${file}" ]]; then
+                  continue
+                fi
+                size="$(wc -c < "${file}")"
+                if (( size > MAX_BYTES )); then
+                  echo "Error: ${file} is larger than 1 MiB (${size} bytes)."
+                  failed=1
+                fi
+              done < <(git ls-tree -z -r --name-only "${HEAD_SHA}")
+              if (( failed )); then
+                exit 1
+              fi
+              echo "OK: no file in ${HEAD_SHA} exceeds ${MAX_BYTES} bytes."
+              exit 0
+            fi
+            RANGE="${BASE_SHA}..${HEAD_SHA}"
+          fi
+          echo "Checking file sizes in range ${RANGE}"
           failed=0
           while IFS= read -r -d '' file; do
             [[ -z "${file}" ]] && continue
@@ -38,14 +72,14 @@ jobs:
               echo "Error: ${file} is larger than 1 MiB (${size} bytes)."
               failed=1
             fi
-          done < <(git diff --no-renames --name-only -z "${BASE_SHA}...${HEAD_SHA}")
+          done < <(git diff --no-renames --name-only -z ${RANGE})
           if (( failed )); then
             exit 1
           fi
           echo "OK: no changed file exceeds ${MAX_BYTES} bytes."
 
   check-license-decls:
-    name: Non-MIT declarations
+    name: Repo / License
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

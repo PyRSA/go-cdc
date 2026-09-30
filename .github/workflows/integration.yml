@@ -1,9 +1,8 @@
-name: Go CDC E2E Integration Testing
+name: CI
 
 on:
-  # Heavy IT only when CDC source / module / IT harness (or this workflow) changes.
-  # Any *.md and demo configs/** changes are excluded.
-  # LICENSE, repo-checks, release.yml, etc. do not trigger this workflow.
+  # Any-branch push + any PR + manual.
+  # Load tier (mysql-mysql-e2e) and scale profile (mysql-scale-e2e) are selected in-job.
   push:
     paths:
       - "**/*.go"
@@ -35,7 +34,7 @@ on:
 jobs:
   # Fast gate: fmt + lint + unit tests + build before expensive MySQL matrix.
   go-check:
-    name: Build + lint + test
+    name: Integration / Build + lint + test
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -73,7 +72,7 @@ jobs:
         run: make build
 
   mysql-mysql-e2e:
-    name: MySQL ${{ matrix.mysql }} → MySQL (func + types + load)
+    name: Integration / MySQL ${{ matrix.mysql }} (func + types + load)
     needs: go-check
     runs-on: ubuntu-latest
     timeout-minutes: 75
@@ -198,7 +197,7 @@ jobs:
         run: bash scripts/mysql-down.sh
 
   mysql-scale-e2e:
-    name: MySQL ${{ matrix.mysql }} scale (normal/heavy)
+    name: Integration / MySQL ${{ matrix.mysql }} scale
     needs: go-check
     runs-on: ubuntu-latest
     timeout-minutes: 120
