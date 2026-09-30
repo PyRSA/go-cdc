@@ -1,10 +1,29 @@
 name: Go CDC E2E Integration Testing
 
 on:
-  # Any-branch push + any PR + manual.
-  # Load tier (mysql-mysql-e2e) and scale profile (mysql-scale-e2e) are selected in-job.
+  # Heavy IT only when CDC source / module / IT harness (or this workflow) changes.
+  # Any *.md and demo configs/** changes are excluded.
+  # LICENSE, repo-checks, release.yml, etc. do not trigger this workflow.
   push:
+    paths:
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - "Makefile"
+      - ".golangci.yml"
+      - "test/integration/**"
+      - ".github/workflows/integration.yml"
+      - "!**/*.md"
   pull_request:
+    paths:
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - "Makefile"
+      - ".golangci.yml"
+      - "test/integration/**"
+      - ".github/workflows/integration.yml"
+      - "!**/*.md"
   workflow_dispatch:
     inputs:
       scale_profile:

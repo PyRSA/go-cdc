@@ -20,7 +20,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Declaration-shaped patterns; keep product-name mentions out of these.
 FORBIDDEN: list[re.Pattern[str]] = [
-    re.compile(r"(?i)SPDX-License-Identifier:\s*(?!MIT\b)\S+"),
+    # Any SPDX line that is not exactly MIT (rejects "MIT OR Apache-2.0", etc.).
+    re.compile(r"(?i)SPDX-License-Identifier:\s*(?!MIT\s*$)(\S.*)"),
     re.compile(r"(?i)Licensed under the Apache License"),
     re.compile(r"(?i)Apache License,?\s+Version\s+\d"),
     re.compile(r"(?i)Licensed to the Apache Software Foundation"),
@@ -58,7 +59,7 @@ SKIP_SUFFIXES = {
     ".sum",
 }
 
-SKIP_NAMES = {"go.sum"}
+SKIP_NAMES = {"go.sum", "check-license-decls.py"}
 
 
 def tracked_files() -> list[Path]:

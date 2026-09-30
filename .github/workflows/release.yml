@@ -1,4 +1,5 @@
-# Formal releases: push a SemVer tag (e.g. v0.1.0) → build binaries → GitHub Release assets.
+# Formal releases: push tag release-vX.Y.Z (e.g. release-v0.1.0) →
+# build Linux binaries → GitHub Release assets.
 # Nightly / edge rolling builds are out of scope for this workflow.
 name: Publish Releases
 
