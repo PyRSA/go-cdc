@@ -19,6 +19,8 @@ jobs:
     name: Build + lint + test
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -56,6 +58,10 @@ jobs:
     needs: go-check
     runs-on: ubuntu-latest
     timeout-minutes: 75
+    # Artifact delete needs actions:write; upload only on main/master/release-*.
+    permissions:
+      contents: read
+      actions: write
     strategy:
       fail-fast: false
       matrix:
@@ -128,8 +134,33 @@ jobs:
           LOAD_LARGE_FIELD_BYTES: "2097152"
         run: bash scripts/run-e2e.sh
 
+      - name: Prune prior IT report artifact
+        if: >
+          always() &&
+          github.event_name != 'pull_request' &&
+          (github.ref == 'refs/heads/main' ||
+           github.ref == 'refs/heads/master' ||
+           startsWith(github.ref, 'refs/heads/release-'))
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_NAME: go-cdc-it-report-mysql-${{ matrix.mysql }}
+        run: |
+          set -euo pipefail
+          ids="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/artifacts" \
+            --jq '.artifacts[] | select(.name == env.ARTIFACT_NAME and .expired == false) | .id')"
+          for id in ${ids}; do
+            echo "Deleting prior artifact id=${id} name=${ARTIFACT_NAME}"
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}"
+          done
+
       - name: Upload test report
-        if: always()
+        if: >
+          always() &&
+          github.event_name != 'pull_request' &&
+          (github.ref == 'refs/heads/main' ||
+           github.ref == 'refs/heads/master' ||
+           startsWith(github.ref, 'refs/heads/release-'))
         uses: actions/upload-artifact@v4
         with:
           name: go-cdc-it-report-mysql-${{ matrix.mysql }}
@@ -152,6 +183,9 @@ jobs:
     needs: go-check
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: write
     strategy:
       fail-fast: false
       matrix:
@@ -217,8 +251,33 @@ jobs:
           COMPOSE_PROJECT_NAME: gocdc-scale-${{ matrix.tag }}
         run: bash scale/run-scale.sh
 
+      - name: Prune prior scale report artifact
+        if: >
+          always() &&
+          github.event_name != 'pull_request' &&
+          (github.ref == 'refs/heads/main' ||
+           github.ref == 'refs/heads/master' ||
+           startsWith(github.ref, 'refs/heads/release-'))
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_NAME: go-cdc-scale-report-mysql-${{ matrix.mysql }}
+        run: |
+          set -euo pipefail
+          ids="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/artifacts" \
+            --jq '.artifacts[] | select(.name == env.ARTIFACT_NAME and .expired == false) | .id')"
+          for id in ${ids}; do
+            echo "Deleting prior artifact id=${id} name=${ARTIFACT_NAME}"
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}"
+          done
+
       - name: Upload scale test report
-        if: always()
+        if: >
+          always() &&
+          github.event_name != 'pull_request' &&
+          (github.ref == 'refs/heads/main' ||
+           github.ref == 'refs/heads/master' ||
+           startsWith(github.ref, 'refs/heads/release-'))
         uses: actions/upload-artifact@v4
         with:
           name: go-cdc-scale-report-mysql-${{ matrix.mysql }}

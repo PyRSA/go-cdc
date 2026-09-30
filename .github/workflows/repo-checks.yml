@@ -1,0 +1,61 @@
+# Repo hygiene checks in one workflow, two jobs.
+name: Repo Checks
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  check-file-size:
+    name: Changed files ≤ 1 MiB
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check changed file sizes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MAX_BYTES: "1048576"
+        run: |
+          set -euo pipefail
+          failed=0
+          while IFS= read -r -d '' file; do
+            [[ -z "${file}" ]] && continue
+            if [[ ! -f "${file}" ]] || [[ -L "${file}" ]]; then
+              continue
+            fi
+            size="$(wc -c < "${file}")"
+            if (( size > MAX_BYTES )); then
+              echo "Error: ${file} is larger than 1 MiB (${size} bytes)."
+              failed=1
+            fi
+          done < <(git diff --no-renames --name-only -z "${BASE_SHA}...${HEAD_SHA}")
+          if (( failed )); then
+            exit 1
+          fi
+          echo "OK: no changed file exceeds ${MAX_BYTES} bytes."
+
+  check-license-decls:
+    name: Non-MIT declarations
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Scan tracked files
+        run: python3 test/check-license-decls.py

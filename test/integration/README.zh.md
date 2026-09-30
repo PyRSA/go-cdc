@@ -81,3 +81,5 @@ make integration-scale-heavy
 **负载分档**（`LOAD_ROWS_PER_TABLE`）：PR / `main` / `master` / `release-*` → **100000**（`LOAD_PROFILE=full`）；其他分支 push → **30000**（`normal`）。峰值：5.7 / 8.0 均为 **90s×4**。
 
 **Scale 分档**：PR / `main` / `master` / `release-*` → **heavy**（10 库 / 50 表 / ~30 万行 / w=8，含热点 burst+peak）；其他分支 push → **normal**（5 库 / 20 表 / ~5 万行 / w=4）；`workflow_dispatch` 可选 `normal`/`heavy`（默认 heavy）。`mysql-scale-e2e` job 超时 **120 分钟**。
+
+**Artifact**：仅在 push 到 `main` / `master` / `release-*` 时上传（PR 与其它分支不上传）；同名旧 artifact 会先删再传，只留最新一份；其余仍按仓库默认约 90 天过期。

@@ -108,7 +108,8 @@ Jobs:
 - `workflow_dispatch` → choose `normal` or `heavy` (default `heavy`)
 - `mysql-scale-e2e` job timeout: **120 minutes**
 
-Artifacts: `go-cdc-it-report-mysql-{5.7\|8.0}` and `go-cdc-scale-report-mysql-8.0` (Markdown under `docs/test/reports/`).
+Artifacts: `go-cdc-it-report-mysql-{5.7|8.0}` and `go-cdc-scale-report-mysql-8.0` (Markdown under `docs/test/reports/`).
+CI uploads **only** on push to `main` / `master` / `release-*` (not PRs or other branches). Before each upload it deletes prior artifacts with the same name so only the latest set remains; GitHub still expires leftovers after the repo default (~90 days).
 
 ```bash
 MYSQL_IMAGE=mysql:5.7.42 MYSQL_TAG=57 bash test/integration/scripts/mysql-up.sh
