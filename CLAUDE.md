@@ -15,6 +15,7 @@ YAML-driven MySQL CDC. Binary: `go-cdc`.
 | `docs/connectors/mysql-source.md` | MySQL source options |
 | `docs/connectors/mysql-sink.md` | MySQL sink options |
 | `docs/connectors/stdout-sink.md` | Stdout sink (`type` only) + JSON format |
+| `docs/performance/mysql-to-mysql-e2e.md` | MySQL→MySQL CI scale/load performance detail; README has summary |
 
 Demos: `configs/demo-stdout.yaml`, `configs/demo-mysql.yaml`  
 Internal design: `docs/architecture.md`

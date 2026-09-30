@@ -105,6 +105,51 @@ make test        # go test -race
 
 3. MySQL → MySQL 请使用 [`configs/demo-mysql.yaml`](configs/demo-mysql.yaml)。
 
+## 性能
+
+go-cdc 在 GitHub Actions 中跑自动化 MySQL 集成与规模测试，覆盖全量快照、
+增量 CDC、多库同步、热点表压力，以及持续写入积压下的追平行为。
+
+下表为同日 `master` CI（2026-09-30）。**源端写入**与 **CDC apply** 是不同指标。
+
+### 负载测试（Load）
+
+| 指标 | MySQL 5.7.42 | MySQL 8.0.36 |
+| --- | --- | --- |
+| **测试类型** | **Load**（func + types + load） | **Load**（func + types + load） |
+| 快照 | 约 50 万行 / 168.5s | 约 50 万行 / 228.7s |
+| 峰值源端写入 | 305 万行 / 90s（约 3.4 万行/s） | 224 万行 / 90s（约 2.5 万行/s） |
+| 受压表 | 2（`tpl01_t1` + typed） | 2（`tpl01_t1` + typed） |
+| CDC 合计 apply | 约 2.9K 行/s（两表合计） | 约 1.5K 行/s（两表合计） |
+| CDC 追平 | 2023s（约 34 min）内 lag ≤1% | 2983.5s（约 50 min）内 lag ≤1% |
+| 结果 | **PASS** | **PASS** |
+
+追平曲线（5.7 vs 8.0）：   
+![Load peak catch-up lag % vs time (MySQL 5.7 vs 8.0)](docs/performance/load-peak-catchup-lag.svg)。
+
+### 规模测试（Scale heavy）
+
+仅 MySQL **8.0.36**（CI 无 5.7 scale 矩阵）：10 个源库、50 张表，含并发热点负载。
+
+| 指标 | 结果 |
+| --- | --- |
+| **测试类型** | **Scale**（heavy） |
+| 库 / 表 | 10 库 / 50 表 |
+| 快照 | 30 万行 / 104.1s |
+| 热点 burst | 50 万行 / 15.7s |
+| 峰值源端写入 | 135.6 万行 / 45s（约 3 万行/s） |
+| 热点表 | 10 |
+| CDC 合计 apply | 约 3.1K 行/s（10 张热点表合计） |
+| CDC 追平 | 577s 内 lag ≤1% |
+| 最终校验 | COUNT + SUM(id) + CRC 通过 |
+| 结果 | **PASS** |
+
+上述结果来自 GitHub Actions 共享 runner，不能当作厂商级 benchmark；实际表现
+取决于 CI 环境、MySQL 配置、负载与测试参数。
+
+完整工况、方法与 CI 明细见
+[性能压测：MySQL → MySQL（E2E）](docs/performance/mysql-to-mysql-e2e.md)。
+
 ## 如何贡献
 
 1. Fork 仓库并创建功能分支。
