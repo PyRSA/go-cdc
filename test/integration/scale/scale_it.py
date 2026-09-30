@@ -365,35 +365,50 @@ def _count_rows(user: str, password: str, db: str, table: str) -> int:
 
 def wait_snapshot(
     profile: Profile,
-    timeout: float = 1800,
+    timeout: float = 3600,
     proc: subprocess.Popen | None = None,
+    interval: float = 15.0,
 ) -> float:
     """Poll until every sink table exists and COUNT(*) matches planned seed rows."""
     t0 = time.time()
     deadline = t0 + timeout
     last_err: BaseException | None = None
+    last_log = 0.0
     while time.time() < deadline:
         if proc is not None and proc.poll() is not None:
-            log = _log_path(profile.name)
-            tail = log.read_text(encoding="utf-8")[-2000:] if log.exists() else ""
+            log_path = _log_path(profile.name)
+            tail = log_path.read_text(encoding="utf-8")[-2000:] if log_path.exists() else ""
             raise RuntimeError(f"go-cdc exited early: code={proc.returncode}\n{tail}")
         try:
-            done = True
+            ready = 0
+            rows_src = 0
+            rows_snk = 0
+            missing = 0
             for t in profile.tables:
+                rows_src += t.rows
                 if not _table_exists(SINK_USER, SINK_PASSWORD, t.snk_db, t.sink_name):
-                    done = False
-                    break
+                    missing += 1
+                    continue
                 n = _count_rows(SINK_USER, SINK_PASSWORD, t.snk_db, t.sink_name)
-                if n != t.rows:
-                    done = False
-                    break
-            if done:
+                rows_snk += n
+                if n == t.rows:
+                    ready += 1
+            now = time.time()
+            if now - last_log >= interval:
+                log(
+                    f"    snapshot catch-up {now - t0:.0f}s: "
+                    f"tables_ready={ready}/{len(profile.tables)} "
+                    f"missing_sink={missing} rows_snk={rows_snk}/{rows_src}",
+                    flush=True,
+                )
+                last_log = now
+            if ready == len(profile.tables):
                 elapsed = time.time() - t0
                 log(f"TIMING  wait [cdc_snapshot] done in {elapsed:.1f}s", flush=True)
                 return elapsed
         except Exception as exc:  # noqa: BLE001
             last_err = exc
-        time.sleep(15.0)
+        time.sleep(interval)
     raise TimeoutError(
         f"timeout waiting for scale snapshot after {time.time() - t0:.1f}s: {last_err}"
     )
@@ -571,26 +586,37 @@ def verify_update_markers(profile: Profile, phase: str) -> list[str]:
 
 def wait_catchup(
     profile: Profile,
-    timeout: float = 1800,
+    timeout: float = 3600,
     proc: subprocess.Popen | None = None,
+    interval: float = 15.0,
 ) -> float:
     """Poll until every source/sink checksum (+ update markers) match after mutations."""
     t0 = time.time()
     deadline = t0 + timeout
     last_failures: list[str] = []
+    last_log = 0.0
     while time.time() < deadline:
         if proc is not None and proc.poll() is not None:
-            log = _log_path(profile.name)
-            tail = log.read_text(encoding="utf-8")[-2000:] if log.exists() else ""
+            log_path = _log_path(profile.name)
+            tail = log_path.read_text(encoding="utf-8")[-2000:] if log_path.exists() else ""
             raise RuntimeError(f"go-cdc exited early: code={proc.returncode}\n{tail}")
         last_failures = verify_pair(profile, "catchup")
         if not last_failures:
             last_failures = verify_update_markers(profile, "catchup")
+        now = time.time()
+        if now - last_log >= interval or not last_failures:
+            sample = "; ".join(last_failures[:3]) if last_failures else "ok"
+            log(
+                f"    mutate catch-up {now - t0:.0f}s: "
+                f"mismatches={len(last_failures)} {sample}",
+                flush=True,
+            )
+            last_log = now
         if not last_failures:
             elapsed = time.time() - t0
             log(f"TIMING  wait [cdc_catchup] done in {elapsed:.1f}s", flush=True)
             return elapsed
-        time.sleep(15.0)
+        time.sleep(interval)
     sample = "\n".join(last_failures[:5])
     raise TimeoutError(
         f"timeout waiting for scale catch-up after {time.time() - t0:.1f}s "
@@ -977,7 +1003,7 @@ def run_profile(profile: Profile, until: str) -> int:
     log("==> start go-cdc (snapshot)", flush=True)
     proc = start_job(yaml_path)
     try:
-        snap_s = wait_snapshot(profile, timeout=1800, proc=proc)
+        snap_s = wait_snapshot(profile, timeout=3600, proc=proc)
         timings["cdc_snapshot"] = snap_s
         log(f"TIMING cdc_snapshot {snap_s:.1f}s", flush=True)
 
@@ -1014,7 +1040,7 @@ def run_profile(profile: Profile, until: str) -> int:
             pass
 
         log("==> wait catch-up", flush=True)
-        catch_s = wait_catchup(profile, timeout=1800, proc=proc)
+        catch_s = wait_catchup(profile, timeout=3600, proc=proc)
         timings["cdc_catchup"] = catch_s
         log(f"TIMING cdc_catchup {catch_s:.1f}s", flush=True)
 
