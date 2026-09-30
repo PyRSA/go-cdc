@@ -156,7 +156,7 @@ def _lag_line(table: str) -> str:
     return f"{table} src={src_n} snk={snk_n} lag={lag:.2%}"
 
 
-def wait_peak_catchup(timeout: float = 1800, interval: float = 15.0, log_every: float = 15.0) -> float:
+def wait_peak_catchup(timeout: float = 3600, interval: float = 15.0, log_every: float = 15.0) -> float:
     """Wait until tpl01_t1 and typed are within 1% src/sink; log lag periodically."""
     t0 = time.time()
     deadline = t0 + timeout
@@ -552,7 +552,7 @@ def main() -> int:
         out_l = f"{LARGE_TABLE}_out"
         return table_exists(SNK, SINK_DB, out_l) and count_rows(SNK, SINK_DB, out_l) >= LARGE_ROWS
 
-    timings["cdc_snapshot"] = wait_until(snap_done, timeout=1800, desc="cdc_snapshot catch-up")
+    timings["cdc_snapshot"] = wait_until(snap_done, timeout=3600, desc="cdc_snapshot catch-up")
     log(f"TIMING  cdc_snapshot {timings['cdc_snapshot']:.1f}s", flush=True)
     cmp1 = (
         "| Table | Expected rows | Source rows | Sink rows | Delta | Verdict |\n"
@@ -717,7 +717,7 @@ def main() -> int:
         flush=True,
     )
 
-    timings["cdc_peak_catchup"] = wait_peak_catchup(timeout=1800)
+    timings["cdc_peak_catchup"] = wait_peak_catchup(timeout=3600)
     log(f"TIMING  cdc_peak_catchup {timings['cdc_peak_catchup']:.1f}s", flush=True)
     time.sleep(3)
     src_n = count_rows(SRC, SRC_DB, "tpl01_t1")

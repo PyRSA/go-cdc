@@ -1,16 +1,22 @@
 # Repo hygiene checks (file size + MIT license declarations).
-name: CI
+name: CI / Repo Checks
 
 on:
   pull_request:
   push:
+
+# Per-workflow group (both this and integration.yml display as "CI").
+# Newer commit on same branch/PR cancels older repo-checks only.
+concurrency:
+  group: repo-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
   check-file-size:
-    name: Repo / File size
+    name: File size
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -79,7 +85,7 @@ jobs:
           echo "OK: no changed file exceeds ${MAX_BYTES} bytes."
 
   check-license-decls:
-    name: Repo / License
+    name: License
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

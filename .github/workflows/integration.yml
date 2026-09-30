@@ -1,8 +1,8 @@
-name: CI
+name: CI / Integration
 
 on:
-  # Any-branch push + any PR + manual.
-  # Load tier (mysql-mysql-e2e) and scale profile (mysql-scale-e2e) are selected in-job.
+  # Heavy IT only when CDC source / module / IT harness (or this workflow) changes.
+  # Any *.md and demo configs/** are excluded.
   push:
     paths:
       - "**/*.go"
@@ -31,10 +31,16 @@ on:
         options: [normal, heavy]
         default: heavy
 
+# Per-workflow group: a newer commit on the same branch/PR cancels older runs
+# of THIS workflow only. Same commit's repo-checks / release runs are untouched.
+concurrency:
+  group: integration-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # Fast gate: fmt + lint + unit tests + build before expensive MySQL matrix.
   go-check:
-    name: Integration / Build + lint + test
+    name: Build + lint + test
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -72,7 +78,7 @@ jobs:
         run: make build
 
   mysql-mysql-e2e:
-    name: Integration / MySQL ${{ matrix.mysql }} (func + types + load)
+    name: MySQL ${{ matrix.mysql }} (func + types + load)
     needs: go-check
     runs-on: ubuntu-latest
     timeout-minutes: 75
@@ -197,7 +203,7 @@ jobs:
         run: bash scripts/mysql-down.sh
 
   mysql-scale-e2e:
-    name: Integration / MySQL ${{ matrix.mysql }} scale
+    name: MySQL ${{ matrix.mysql }} scale
     needs: go-check
     runs-on: ubuntu-latest
     timeout-minutes: 120
