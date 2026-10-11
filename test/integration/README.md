@@ -26,7 +26,7 @@ Static notes: [`docs/test/TYPES.md`](../../docs/test/TYPES.md) (not a run report
 |------|---------|----------|
 | Source / sink users | Anonymous fixed tokens | `u_a7k9m2x4` / `u_b3j6c8y1` |
 | Databases | `db_tp_{suite}_{src\|snk}` | `db_tp_func_src`, `db_tp_load_snk` |
-| Functional tables | `tpNN_*` | `tp01_rows`, `tp07_fail`, `tp09_add` |
+| Functional tables | `tpNN_*` | `tp01_rows`, `tp07_fail`, `tp10_add` |
 | Types tables | `tpdNN_*` | `tpd01_types` |
 | Load tables | `tplNN_*` | `tpl01_t1`, `tpl01_typed`, `tpl01_large` |
 | Sink tables | source name + `_out` | `tp01_rows_out` |

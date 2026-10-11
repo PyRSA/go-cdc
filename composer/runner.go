@@ -3,7 +3,6 @@ package composer
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/PyRSA/go-cdc/common/event"
@@ -17,9 +16,14 @@ import (
 	"github.com/PyRSA/go-cdc/runtime/transform"
 )
 
+// SpillFiles removes per-table spill artifacts after a durable checkpoint save.
+type SpillFiles interface {
+	Remove(id string) error
+}
+
 // Run reads capture messages, writes them through one sink, and replaces the
 // checkpoint file on the configured interval and on shutdown.
-func Run(ctx context.Context, pipe *definition.Pipeline, msgs <-chan source.Message, sk sink.Sink, store checkpoint.Store, state checkpoint.State) error {
+func Run(ctx context.Context, pipe *definition.Pipeline, msgs <-chan source.Message, sk sink.Sink, store checkpoint.Store, state checkpoint.State, spill SpillFiles) error {
 	state.Normalize()
 	rules, err := transform.Compile(pipe.Transforms)
 	if err != nil {
@@ -87,10 +91,10 @@ func Run(ctx context.Context, pipe *definition.Pipeline, msgs <-chan source.Mess
 					return err
 				}
 			}
-			if err := applyMessage(pipe, rules, routes, sk, &state, &batch, msg); err != nil {
+			if err := applyMessage(pipe, rules, routes, sk, &state, &batch, msg, save, spill); err != nil {
 				return err
 			}
-			if msg.Split != nil || msg.Position != nil || msg.Watermark != nil || msg.Captured != "" || (pipe.Sink.WriteBatchSize > 0 && len(batch) >= pipe.Sink.WriteBatchSize) {
+			if msg.Split != nil || msg.Position != nil || msg.Watermark != nil || msg.Captured != "" || msg.SnapshotTable != "" || (pipe.Sink.WriteBatchSize > 0 && len(batch) >= pipe.Sink.WriteBatchSize) {
 				if err := flush(); err != nil {
 					return err
 				}
@@ -99,9 +103,14 @@ func Run(ctx context.Context, pipe *definition.Pipeline, msgs <-chan source.Mess
 	}
 }
 
-func applyMessage(pipe *definition.Pipeline, rules *transform.Set, routes *route.Set, sk sink.Sink, state *checkpoint.State, batch *[]event.Event, msg source.Message) error {
+func applyMessage(pipe *definition.Pipeline, rules *transform.Set, routes *route.Set, sk sink.Sink, state *checkpoint.State, batch *[]event.Event, msg source.Message, save func() error, spill SpillFiles) error {
 	if msg.Watermark != nil && state.LowWatermark == nil {
 		state.LowWatermark = &checkpoint.Position{File: msg.Watermark.File, Pos: msg.Watermark.Pos, GTID: msg.Watermark.GTID}
+	}
+	if msg.SnapshotTable != "" && msg.SnapshotMark != nil {
+		state.AddSnapshot(msg.SnapshotTable, checkpoint.Position{
+			File: msg.SnapshotMark.File, Pos: msg.SnapshotMark.Pos, GTID: msg.SnapshotMark.GTID,
+		})
 	}
 	if msg.Schema != nil {
 		if err := applyCatalog(pipe, rules, routes, sk, state, *msg.Schema); err != nil {
@@ -122,9 +131,28 @@ func applyMessage(pipe *definition.Pipeline, rules *transform.Set, routes *route
 	}
 	if msg.Captured != "" {
 		state.AddCaptured(msg.Captured)
+		state.ClearSnapshot(msg.Captured)
+		if save != nil {
+			if err := save(); err != nil {
+				return err
+			}
+		}
+		if spill != nil {
+			_ = spill.Remove(msg.Captured)
+		}
 	}
 	if msg.Position != nil {
 		state.AckedOffset = &checkpoint.Position{File: msg.Position.File, Pos: msg.Position.Pos, GTID: msg.Position.GTID}
+	}
+	if msg.CheckpointBarrier {
+		if save != nil {
+			if err := save(); err != nil {
+				return err
+			}
+		}
+		if msg.BarrierDone != nil {
+			close(msg.BarrierDone)
+		}
 	}
 	return nil
 }
@@ -182,7 +210,9 @@ func applyDDL(pipe *definition.Pipeline, rules *transform.Set, routes *route.Set
 				continue
 			}
 			if len(copy.Columns) == 0 {
-				return fmt.Errorf("mysql: CREATE %s has no column metadata", copy.SourceID())
+				// Schema message path already AddCaptured above; empty CREATE without
+				// a prior catalog apply must not pretend the sink table exists.
+				continue
 			}
 			table := schema.Table{Database: copy.Database, Table: copy.Table, Columns: columnsOf(copy), PrimaryKeys: copy.Keys}
 			_ = sk.CreateTable(table)

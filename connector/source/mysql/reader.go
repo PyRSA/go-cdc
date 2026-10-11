@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 type DB interface {
 	MasterStatus(ctx context.Context) (checkpoint.Position, error)
 	ListTables(ctx context.Context) ([]schema.Table, error)
+	DescribeTable(ctx context.Context, database, table string) (schema.Table, error)
 	SplitKeys(ctx context.Context, database, table, key string, low *string, limit int) ([]string, error)
 	ReadChunk(ctx context.Context, database, table string, columns []string, key, low string, high *string) ([]map[string]any, error)
 	EarliestBinlog(ctx context.Context) (checkpoint.Position, error)
@@ -35,6 +37,7 @@ type Commit struct {
 // Stream reads binlog events from a position. RunFrom is used only here.
 type Stream interface {
 	ReadFrom(ctx context.Context, pos checkpoint.Position) (<-chan Commit, error)
+	LimitTables(ids []string)
 	Close() error
 }
 
@@ -45,6 +48,9 @@ type Capture struct {
 	State       checkpoint.State
 	DB          DB
 	Stream      Stream
+	Spill       *Spill
+	// Warn logs skip-snapshot and similar notices. Optional.
+	Warn func(string, ...any)
 	// Project returns the snapshot SELECT list. Nil keeps every column.
 	Project func(database, table string, columns []string) ([]string, error)
 	// SkipSnapshot reports a table whose sink targets are already excluded.
@@ -109,6 +115,9 @@ func (c *Capture) Close() error {
 func (c *Capture) run(ctx context.Context, out chan<- source.Message) error {
 	switch c.Config.StartupMode {
 	case definition.StartupSnapshot, definition.StartupInitial, "":
+		if (c.Config.StartupMode == definition.StartupInitial || c.Config.StartupMode == "") && c.State.AckedOffset != nil {
+			return c.resumeWithOptionalSnapshot(ctx, out)
+		}
 		low, err := c.snapshotPhase(ctx, out)
 		if err != nil {
 			return err
@@ -119,14 +128,57 @@ func (c *Capture) run(ctx context.Context, out chan<- source.Message) error {
 		if c.State.AckedOffset != nil {
 			low = *c.State.AckedOffset
 		}
-		return c.binlogFrom(ctx, out, low)
+		return c.binlogFrom(ctx, out, low, nil)
 	default:
 		pos, err := c.resolvePosition(ctx)
 		if err != nil {
 			return err
 		}
-		return c.binlogFrom(ctx, out, pos)
+		if err := c.limitBinlogTables(ctx); err != nil {
+			return err
+		}
+		return c.binlogFrom(ctx, out, pos, nil)
 	}
+}
+
+// limitBinlogTables applies LimitTables for non-initial modes when the binlog
+// newly-added flag is false, so runtime CREATE does not enter capture.
+func (c *Capture) limitBinlogTables(ctx context.Context) error {
+	if c.Stream == nil || c.Config.BinlogNewlyAddedTable {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	var ids []string
+	add := func(id string) {
+		if id == "" {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	for _, id := range c.State.CapturedTables {
+		add(id)
+	}
+	for id := range c.State.SnapshotTables {
+		add(id)
+	}
+	if len(ids) == 0 && c.DB != nil {
+		tables, err := c.DB.ListTables(ctx)
+		if err != nil {
+			return err
+		}
+		for _, table := range tables {
+			if c.Config.Tables != nil && !c.Config.Tables.Match(table.Database, table.Table) {
+				continue
+			}
+			add(table.Database + "." + table.Table)
+		}
+	}
+	c.Stream.LimitTables(ids)
+	return nil
 }
 
 func (c *Capture) resolvePosition(ctx context.Context) (checkpoint.Position, error) {
@@ -215,6 +267,10 @@ func (c *Capture) snapshotPhase(ctx context.Context, out chan<- source.Message) 
 		}
 		todo = append(todo, table)
 	}
+	var known []string
+	for _, id := range c.State.CapturedTables {
+		known = append(known, id)
+	}
 	for _, table := range todo {
 		if err := ctx.Err(); err != nil {
 			return checkpoint.Position{}, err
@@ -223,13 +279,15 @@ func (c *Capture) snapshotPhase(ctx context.Context, out chan<- source.Message) 
 			return checkpoint.Position{}, err
 		}
 		id := table.Database + "." + table.Table
+		known = append(known, id)
 		if err := c.send(ctx, out, source.Message{Captured: id}); err != nil {
 			return checkpoint.Position{}, err
 		}
 	}
-	if err := c.DB.Close(); err != nil {
-		return checkpoint.Position{}, err
+	if c.Stream != nil && !c.Config.BinlogNewlyAddedTable {
+		c.Stream.LimitTables(known)
 	}
+	// Keep JDBC open for binlog-path DescribeTable (CREATE refresh). Closed in Capture.Close.
 	return *low, nil
 }
 
@@ -352,7 +410,11 @@ func (c *Capture) emitRows(ctx context.Context, out chan<- source.Message, table
 	return nil
 }
 
-func (c *Capture) binlogFrom(ctx context.Context, out chan<- source.Message, pos checkpoint.Position) error {
+// binlogFrom reads one binlog stream. When route is non-nil, true means spill the
+// table until Drain closes it; false means emit. Missing keys are dropped unless
+// BinlogNewlyAddedTable is set — then the table is admitted as live (runtime CREATE
+// path). route nil means emit all handler-accepted events.
+func (c *Capture) binlogFrom(ctx context.Context, out chan<- source.Message, pos checkpoint.Position, route map[string]bool) error {
 	if pos.File == "" && pos.GTID == "" {
 		return fmt.Errorf("source.scan.startup.mode: binlog position is empty")
 	}
@@ -363,6 +425,7 @@ func (c *Capture) binlogFrom(ctx context.Context, out chan<- source.Message, pos
 	if err != nil {
 		return err
 	}
+	pending := map[string][]event.Event{}
 	for {
 		select {
 		case <-ctx.Done():
@@ -374,21 +437,100 @@ func (c *Capture) binlogFrom(ctx context.Context, out chan<- source.Message, pos
 			if commit.Err != nil {
 				return commit.Err
 			}
-			msg := source.Message{Schema: commit.Schema}
+			var schemaMsg *schema.Table
+			if commit.Schema != nil {
+				schemaMsg = commit.Schema
+				if c.DB != nil {
+					if described, err := c.DB.DescribeTable(ctx, commit.Schema.Database, commit.Schema.Table); err == nil {
+						schemaMsg = cloneTable(described)
+					}
+				}
+			}
 			if commit.Event != nil {
 				if !c.Config.SchemaChange && commit.Event.Op == event.OpDDL {
 					continue
 				}
 				copied := *commit.Event
-				msg.Event = &copied
+				id := copied.SourceDatabase + "." + copied.SourceTable
+				if copied.SourceDatabase == "" {
+					id = copied.Database + "." + copied.Table
+				}
+				emit := func(withSchema bool) error {
+					msg := source.Message{Event: &copied}
+					if withSchema {
+						msg.Schema = schemaMsg
+					}
+					return c.send(ctx, out, msg)
+				}
+				if route == nil {
+					if err := emit(true); err != nil {
+						return err
+					}
+					schemaMsg = nil
+				} else if spill, known := route[id]; !known {
+					// Only CREATE admits a new table when C=true. Plain DML on a
+					// config-diff table stays dropped (A=false + C=true).
+					if c.Config.BinlogNewlyAddedTable && isRuntimeCreateDDL(copied) {
+						route[id] = false
+						if err := emit(true); err != nil {
+							return err
+						}
+						schemaMsg = nil
+					}
+				} else if spill {
+					if schemaMsg != nil {
+						// Keep sink auto-create ahead of Drain; DDL Event stays in spill.
+						if err := c.send(ctx, out, source.Message{Schema: schemaMsg}); err != nil {
+							return err
+						}
+						schemaMsg = nil
+					}
+					pending[id] = append(pending[id], copied)
+				} else {
+					if err := emit(true); err != nil {
+						return err
+					}
+					schemaMsg = nil
+				}
+			}
+			if schemaMsg != nil {
+				if err := c.send(ctx, out, source.Message{Schema: schemaMsg}); err != nil {
+					return err
+				}
 			}
 			if commit.Position != nil {
-				msg.Position = toSourcePos(*commit.Position)
-			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case out <- msg:
+				xid := *commit.Position
+				for id, items := range pending {
+					if len(items) == 0 {
+						continue
+					}
+					if c.Spill == nil {
+						return fmt.Errorf("source.mysql: spill required for %s", id)
+					}
+					last, has, err := c.Spill.LastPosition(id)
+					if err != nil {
+						return err
+					}
+					if xidAlreadySpilled(last, has, xid) {
+						continue
+					}
+					if err := c.Spill.AppendBatch(id, xid, items); err != nil {
+						if errors.Is(err, ErrSpillClosed) {
+							for i := range items {
+								item := items[i]
+								if err := c.send(ctx, out, source.Message{Event: &item}); err != nil {
+									return err
+								}
+							}
+							continue
+						}
+						return err
+					}
+				}
+				pending = map[string][]event.Event{}
+				if err := c.send(ctx, out, source.Message{Position: toSourcePos(xid)}); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -396,6 +538,13 @@ func (c *Capture) binlogFrom(ctx context.Context, out chan<- source.Message, pos
 
 func toSourcePos(pos checkpoint.Position) *source.Position {
 	return &source.Position{File: pos.File, Pos: pos.Pos, GTID: pos.GTID}
+}
+
+func isRuntimeCreateDDL(item event.Event) bool {
+	if item.Op != event.OpDDL || item.DDL == "" {
+		return false
+	}
+	return schema.Classify(item.DDL).Action == schema.ActionCreate
 }
 
 func chunkColumn(table schema.Table, configured string) (string, error) {
@@ -438,6 +587,12 @@ func isPrimaryKey(table schema.Table, name string) bool {
 func cloneTable(table schema.Table) *schema.Table {
 	table.Columns = append([]schema.Column(nil), table.Columns...)
 	table.PrimaryKeys = append([]string(nil), table.PrimaryKeys...)
+	indexes := make([]schema.Index, len(table.Indexes))
+	for i, index := range table.Indexes {
+		indexes[i] = index
+		indexes[i].Columns = append([]string(nil), index.Columns...)
+	}
+	table.Indexes = indexes
 	return &table
 }
 

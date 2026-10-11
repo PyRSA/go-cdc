@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/PyRSA/go-cdc/composer"
@@ -84,12 +85,28 @@ func run(args []string) int {
 		logger.Error("compile transform", "err", err)
 		return 1
 	}
+	spillDir := filepath.Join(filepath.Dir(pipe.Checkpoint.FilePath), "spill")
+	if err := os.MkdirAll(spillDir, 0o755); err != nil {
+		logger.Error("create spill dir", "err", err)
+		return 1
+	}
+	spill := mysqlsrc.OpenSpill(spillDir)
+	for _, id := range state.CapturedTables {
+		if state.HasSnapshot(id) {
+			continue
+		}
+		_ = spill.Remove(id)
+	}
 	capture := &mysqlsrc.Capture{
 		Config:      pipe.Source,
 		Parallelism: pipe.Runtime.Parallelism,
 		State:       state,
 		DB:          db,
 		Stream:      stream,
+		Spill:       spill,
+		Warn: func(msg string, args ...any) {
+			logger.Warn(msg, args...)
+		},
 		Project: func(database, table string, columns []string) ([]string, error) {
 			if err := rules.Validate(database, table, columns); err != nil {
 				return nil, err
@@ -107,7 +124,7 @@ func run(args []string) int {
 		logger.Error("start capture", "err", err)
 		return 1
 	}
-	if err := composer.Run(ctx, pipe, msgs, sk, store, state); err != nil && !errors.Is(err, context.Canceled) {
+	if err := composer.Run(ctx, pipe, msgs, sk, store, state, spill); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("pipeline failed", "err", err)
 		return 1
 	}

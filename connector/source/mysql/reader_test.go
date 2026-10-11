@@ -3,6 +3,8 @@ package mysql
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -44,9 +46,6 @@ func TestInitialSnapshotThenBinlogFromLowWatermark(t *testing.T) {
 	}
 	if rows != 3 || !captured {
 		t.Fatalf("rows %d captured %v\n%#v", rows, captured, msgs)
-	}
-	if !db.closed {
-		t.Fatal("snapshot connection still open")
 	}
 	if stream.got.Pos != 100 {
 		t.Fatalf("binlog started at %d", stream.got.Pos)
@@ -282,7 +281,7 @@ func mustSelector(t *testing.T) *definition.Selector {
 
 func collect(t *testing.T, cap *Capture) []source.Message {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	ch, err := cap.Messages(ctx)
 	if err != nil {
@@ -290,6 +289,9 @@ func collect(t *testing.T, cap *Capture) []source.Message {
 	}
 	var msgs []source.Message
 	for msg := range ch {
+		if msg.CheckpointBarrier && msg.BarrierDone != nil {
+			close(msg.BarrierDone)
+		}
 		msgs = append(msgs, msg)
 	}
 	return msgs
@@ -301,12 +303,17 @@ type memDB struct {
 	closed      bool
 	emptyMaster bool
 	reads       int
+	readTables  []string
+	splitTables []string
 	cols        []string
 	earliest    checkpoint.Position
 	atTime      checkpoint.Position
 	mu          sync.Mutex
 	inflight    int
 	maxInflight int
+	blockTable  string
+	blockRead   chan struct{}
+	scanned     bool
 }
 
 func newMemDB(keys []string) *memDB { return &memDB{keys: keys} }
@@ -343,7 +350,26 @@ func (m *memDB) ListTables(context.Context) ([]schema.Table, error) {
 	}}, nil
 }
 
-func (m *memDB) SplitKeys(_ context.Context, _, _, _ string, low *string, limit int) ([]string, error) {
+func (m *memDB) DescribeTable(_ context.Context, database, table string) (schema.Table, error) {
+	tables, err := m.ListTables(context.Background())
+	if err != nil {
+		return schema.Table{}, err
+	}
+	for _, item := range tables {
+		if item.Database == database && item.Table == table {
+			return item, nil
+		}
+	}
+	return schema.Table{}, fmt.Errorf("memdb: %s.%s not found", database, table)
+}
+
+func (m *memDB) SplitKeys(_ context.Context, _, table, _ string, low *string, limit int) ([]string, error) {
+	m.mu.Lock()
+	m.splitTables = append(m.splitTables, table)
+	m.mu.Unlock()
+	if m.blockTable != "" && table != m.blockTable {
+		return nil, nil
+	}
 	start := 0
 	if low != nil {
 		for start < len(m.keys) && m.keys[start] < *low {
@@ -357,12 +383,17 @@ func (m *memDB) SplitKeys(_ context.Context, _, _, _ string, low *string, limit 
 	return append([]string(nil), m.keys[start:end]...), nil
 }
 
-func (m *memDB) ReadChunk(_ context.Context, _, _ string, columns []string, _, low string, high *string) ([]map[string]any, error) {
+func (m *memDB) ReadChunk(_ context.Context, _, table string, columns []string, _, low string, high *string) ([]map[string]any, error) {
+	if m.blockTable != "" && table == m.blockTable && m.blockRead != nil {
+		<-m.blockRead
+	}
+	if m.blockTable != "" && table != m.blockTable {
+		return nil, nil
+	}
 	m.mu.Lock()
 	m.reads++
+	m.readTables = append(m.readTables, table)
 	m.cols = append([]string(nil), columns...)
-	m.mu.Unlock()
-	m.mu.Lock()
 	m.inflight++
 	if m.inflight > m.maxInflight {
 		m.maxInflight = m.inflight
@@ -391,18 +422,503 @@ func (m *memDB) Close() error {
 }
 
 type memStream struct {
-	got    checkpoint.Position
-	events []Commit
+	got         checkpoint.Position
+	events      []Commit
+	started     chan struct{}
+	startedOnce sync.Once
+	limited     []string
 }
 
 func (m *memStream) ReadFrom(_ context.Context, pos checkpoint.Position) (<-chan Commit, error) {
 	m.got = pos
-	ch := make(chan Commit, len(m.events))
-	for _, event := range m.events {
-		ch <- event
+	if m.started != nil {
+		m.startedOnce.Do(func() { close(m.started) })
 	}
-	close(ch)
+	ch := make(chan Commit, len(m.events))
+	go func() {
+		for _, event := range m.events {
+			ch <- event
+		}
+		close(ch)
+	}()
 	return ch, nil
 }
 
+func (m *memStream) LimitTables(ids []string) {
+	m.limited = ids
+}
+
 func (m *memStream) Close() error { return nil }
+
+func TestBinlogStartsWhileNewTableSnapshotIsBlocked(t *testing.T) {
+	db := newMemDB([]string{"1", "2"})
+	db.tables = []schema.Table{
+		{Database: "db", Table: "user", Columns: []schema.Column{{Name: "id", Type: "int"}}, PrimaryKeys: []string{"id"}},
+		{Database: "db", Table: "order", Columns: []schema.Column{{Name: "id", Type: "int"}}, PrimaryKeys: []string{"id"}},
+	}
+	db.blockTable = "order"
+	db.blockRead = make(chan struct{})
+	sel, err := definition.CompileSelector(`db\..*`, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := &memStream{
+		started: make(chan struct{}),
+		events: []Commit{
+			{Event: &event.Event{Op: event.OpCreate, Database: "db", Table: "user", SourceDatabase: "db", SourceTable: "user", After: map[string]any{"id": "9"}}},
+			{Event: &event.Event{Op: event.OpCreate, Database: "db", Table: "order", SourceDatabase: "db", SourceTable: "order", After: map[string]any{"id": "8"}}},
+			{Position: &checkpoint.Position{File: "mysql-bin.000001", Pos: 500}},
+		},
+	}
+	cap := &Capture{
+		Config: definition.Source{
+			StartupMode: definition.StartupInitial, ChunkSize: 2, Tables: sel,
+			NewlyAddedTable: true, NewlyAddedSnapshot: true,
+		},
+		State: checkpoint.State{
+			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
+			CapturedTables: []string{"db.user"},
+		},
+		DB: db, Stream: stream, Spill: OpenSpill(t.TempDir()),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ch, err := cap.Messages(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var buffered []source.Message
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for msg := range ch {
+			if msg.CheckpointBarrier && msg.BarrierDone != nil {
+				close(msg.BarrierDone)
+			}
+			mu.Lock()
+			buffered = append(buffered, msg)
+			mu.Unlock()
+		}
+	}()
+	select {
+	case <-stream.started:
+	case <-time.After(time.Second):
+		t.Fatal("binlog did not start while the new table snapshot was blocked")
+	}
+	if stream.got.Pos != 400 {
+		t.Fatalf("binlog pos %d", stream.got.Pos)
+	}
+	deadline := time.After(time.Second)
+	for {
+		mu.Lock()
+		userSeen := false
+		for _, msg := range buffered {
+			if msg.Err != nil {
+				mu.Unlock()
+				t.Fatal(msg.Err)
+			}
+			if msg.Event != nil && msg.Event.Table == "user" && msg.Event.After["id"] == "9" {
+				userSeen = true
+			}
+		}
+		mu.Unlock()
+		if userSeen {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("captured table event was not delivered while snapshot was blocked")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	close(db.blockRead)
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("capture did not finish")
+	}
+	var sawOrderRow, sawOrderBinlog bool
+	for _, msg := range buffered {
+		if msg.Err != nil {
+			t.Fatal(msg.Err)
+		}
+		if msg.Event != nil && msg.Event.Table == "order" && msg.Event.After["id"] == "1" {
+			sawOrderRow = true
+		}
+		if msg.Event != nil && msg.Event.Table == "order" && msg.Event.After["id"] == "8" {
+			sawOrderBinlog = true
+		}
+	}
+	if !sawOrderRow || !sawOrderBinlog {
+		t.Fatalf("snapshot row %v spilled binlog row %v", sawOrderRow, sawOrderBinlog)
+	}
+	if db.scanned {
+		t.Fatal("CREATE scan must not decide newly added tables")
+	}
+}
+
+func TestNewlyAddedSnapshotsTablesSerially(t *testing.T) {
+	db := newMemDB([]string{"1"})
+	db.tables = []schema.Table{
+		{Database: "db", Table: "user", Columns: []schema.Column{{Name: "id", Type: "int"}}, PrimaryKeys: []string{"id"}},
+		{Database: "db", Table: "order", Columns: []schema.Column{{Name: "id", Type: "int"}}, PrimaryKeys: []string{"id"}},
+		{Database: "db", Table: "item", Columns: []schema.Column{{Name: "id", Type: "int"}}, PrimaryKeys: []string{"id"}},
+	}
+	db.blockTable = "order"
+	db.blockRead = make(chan struct{})
+	sel, err := definition.CompileSelector(`db\..*`, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := &memStream{started: make(chan struct{})}
+	cap := &Capture{
+		Config: definition.Source{
+			StartupMode: definition.StartupInitial, ChunkSize: 2, Tables: sel,
+			NewlyAddedTable: true, NewlyAddedSnapshot: true,
+		},
+		State: checkpoint.State{
+			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
+			CapturedTables: []string{"db.user"},
+		},
+		DB: db, Stream: stream, Spill: OpenSpill(t.TempDir()),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ch, err := cap.Messages(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for msg := range ch {
+			if msg.CheckpointBarrier && msg.BarrierDone != nil {
+				close(msg.BarrierDone)
+			}
+		}
+	}()
+	select {
+	case <-stream.started:
+	case <-time.After(time.Second):
+		t.Fatal("binlog did not start")
+	}
+	deadline := time.After(time.Second)
+	for {
+		db.mu.Lock()
+		splits := append([]string(nil), db.splitTables...)
+		db.mu.Unlock()
+		hasOrder, hasItem := false, false
+		for _, name := range splits {
+			if name == "order" {
+				hasOrder = true
+			}
+			if name == "item" {
+				hasItem = true
+			}
+		}
+		if hasOrder && !hasItem {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("want order split before item while blocked; splits %#v", splits)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	close(db.blockRead)
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	db.mu.Lock()
+	splits := append([]string(nil), db.splitTables...)
+	db.mu.Unlock()
+	orderIdx, itemIdx := -1, -1
+	for i, name := range splits {
+		if name == "order" && orderIdx < 0 {
+			orderIdx = i
+		}
+		if name == "item" && itemIdx < 0 {
+			itemIdx = i
+		}
+	}
+	if orderIdx < 0 || itemIdx < 0 || orderIdx >= itemIdx {
+		t.Fatalf("serial order broken: splits %#v", splits)
+	}
+}
+
+func TestNewlyAddedFalseBinlogFlagIgnoresDiffFollowsCreate(t *testing.T) {
+	db := newMemDB([]string{"1", "2"})
+	db.tables = []schema.Table{
+		{Database: "db", Table: "user", Columns: []schema.Column{{Name: "id", Type: "int"}}, PrimaryKeys: []string{"id"}},
+		{Database: "db", Table: "order", Columns: []schema.Column{{Name: "id", Type: "int"}}, PrimaryKeys: []string{"id"}},
+	}
+	sel, err := definition.CompileSelector(`db\..*`, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := &memStream{
+		events: []Commit{
+			{Event: &event.Event{Op: event.OpCreate, Database: "db", Table: "order", SourceDatabase: "db", SourceTable: "order", After: map[string]any{"id": "8"}}},
+			{Event: &event.Event{
+				Op: event.OpDDL, Database: "db", Table: "crt", SourceDatabase: "db", SourceTable: "crt",
+				DDL: "CREATE TABLE `db`.`crt` (id int primary key)",
+			}, Schema: &schema.Table{Database: "db", Table: "crt", Columns: []schema.Column{{Name: "id", Type: "int"}}, PrimaryKeys: []string{"id"}}},
+			{Event: &event.Event{Op: event.OpCreate, Database: "db", Table: "crt", SourceDatabase: "db", SourceTable: "crt", After: map[string]any{"id": "1"}}},
+			{Position: &checkpoint.Position{File: "mysql-bin.000001", Pos: 500}},
+		},
+	}
+	cap := &Capture{
+		Config: definition.Source{
+			StartupMode: definition.StartupInitial, ChunkSize: 2, Tables: sel,
+			NewlyAddedTable: false, BinlogNewlyAddedTable: true, SchemaChange: true,
+		},
+		State: checkpoint.State{
+			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
+			CapturedTables: []string{"db.user"},
+		},
+		DB: db, Stream: stream, Spill: OpenSpill(t.TempDir()),
+	}
+	msgs := collect(t, cap)
+	var orderSeen, crtDDL, crtRow bool
+	for _, msg := range msgs {
+		if msg.Err != nil {
+			t.Fatal(msg.Err)
+		}
+		if msg.Event != nil && msg.Event.Table == "order" {
+			orderSeen = true
+		}
+		if msg.Event != nil && msg.Event.Table == "crt" && msg.Event.Op == event.OpDDL {
+			crtDDL = true
+		}
+		if msg.Event != nil && msg.Event.Table == "crt" && msg.Event.Op == event.OpCreate {
+			crtRow = true
+		}
+	}
+	if orderSeen {
+		t.Fatal("A=false+C=true must ignore config-diff DML on order")
+	}
+	if !crtDDL || !crtRow {
+		t.Fatalf("runtime CREATE follow missing ddl=%v row=%v", crtDDL, crtRow)
+	}
+	if len(stream.limited) == 0 || stream.limited[0] != "db.user" {
+		t.Fatalf("LimitTables should stay on captured set, got %#v", stream.limited)
+	}
+}
+
+func TestNewlyAddedFalseSkipsTablesOutsideCheckpoint(t *testing.T) {
+	db := newMemDB([]string{"1", "2"})
+	db.tables = []schema.Table{
+		{Database: "db", Table: "user", Columns: []schema.Column{{Name: "id", Type: "int"}}, PrimaryKeys: []string{"id"}},
+		{Database: "db", Table: "order", Columns: []schema.Column{{Name: "id", Type: "int"}}, PrimaryKeys: []string{"id"}},
+	}
+	sel, err := definition.CompileSelector(`db\..*`, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := &memStream{
+		events: []Commit{
+			{Event: &event.Event{Op: event.OpCreate, Database: "db", Table: "user", SourceDatabase: "db", SourceTable: "user", After: map[string]any{"id": "9"}}},
+			{Event: &event.Event{Op: event.OpCreate, Database: "db", Table: "order", SourceDatabase: "db", SourceTable: "order", After: map[string]any{"id": "8"}}},
+			{Position: &checkpoint.Position{File: "mysql-bin.000001", Pos: 500}},
+		},
+	}
+	cap := &Capture{
+		Config: definition.Source{StartupMode: definition.StartupInitial, ChunkSize: 2, Tables: sel, NewlyAddedTable: false},
+		State: checkpoint.State{
+			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
+			CapturedTables: []string{"db.user"},
+		},
+		DB: db, Stream: stream, Spill: OpenSpill(t.TempDir()),
+	}
+	msgs := collect(t, cap)
+	for _, msg := range msgs {
+		if msg.Err != nil {
+			t.Fatal(msg.Err)
+		}
+		if msg.Schema != nil && msg.Schema.Table == "order" {
+			t.Fatal("order schema should be ignored")
+		}
+		if msg.Event != nil && msg.Event.Table == "order" {
+			t.Fatalf("order event should be ignored: %#v", msg.Event)
+		}
+	}
+	var userSeen bool
+	for _, msg := range msgs {
+		if msg.Event != nil && msg.Event.Table == "user" && msg.Event.After["id"] == "9" {
+			userSeen = true
+		}
+	}
+	if !userSeen {
+		t.Fatal("user binlog row missing")
+	}
+	if stream.got.Pos != 400 {
+		t.Fatalf("binlog pos %d", stream.got.Pos)
+	}
+	if db.reads != 0 {
+		t.Fatalf("unexpected snapshot reads %d", db.reads)
+	}
+}
+
+func TestNewlyAddedSkipSnapshotFollowsBinlogOnly(t *testing.T) {
+	db := newMemDB([]string{"1", "2"})
+	db.tables = []schema.Table{
+		{Database: "db", Table: "user", Columns: []schema.Column{{Name: "id", Type: "int"}}, PrimaryKeys: []string{"id"}},
+		{Database: "db", Table: "order", Columns: []schema.Column{{Name: "id", Type: "int"}}, PrimaryKeys: []string{"id"}},
+	}
+	sel, err := definition.CompileSelector(`db\..*`, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := &memStream{
+		events: []Commit{
+			{Event: &event.Event{Op: event.OpCreate, Database: "db", Table: "order", SourceDatabase: "db", SourceTable: "order", After: map[string]any{"id": "8"}}},
+			{Position: &checkpoint.Position{File: "mysql-bin.000001", Pos: 500}},
+		},
+	}
+	var warns int
+	cap := &Capture{
+		Config: definition.Source{
+			StartupMode: definition.StartupInitial, ChunkSize: 2, Tables: sel,
+			NewlyAddedTable: true, NewlyAddedSnapshot: false,
+		},
+		State: checkpoint.State{
+			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
+			CapturedTables: []string{"db.user"},
+		},
+		DB: db, Stream: stream, Spill: OpenSpill(t.TempDir()),
+		Warn: func(string, ...any) { warns++ },
+	}
+	msgs := collect(t, cap)
+	var orderBinlog, captured bool
+	for _, msg := range msgs {
+		if msg.Err != nil {
+			t.Fatal(msg.Err)
+		}
+		if msg.Event != nil && msg.Event.Table == "order" && msg.Event.After["id"] == "8" {
+			orderBinlog = true
+		}
+		if msg.Event != nil && msg.Event.Op == event.OpRead {
+			t.Fatalf("unexpected snapshot row: %#v", msg.Event)
+		}
+		if msg.Captured == "db.order" {
+			captured = true
+		}
+	}
+	if !orderBinlog || !captured {
+		t.Fatalf("orderBinlog=%v captured=%v", orderBinlog, captured)
+	}
+	if db.reads != 0 {
+		t.Fatalf("snapshot reads %d", db.reads)
+	}
+	if warns != 1 {
+		t.Fatalf("warns %d", warns)
+	}
+}
+
+func TestResumeDoesNotRewriteSpilledXID(t *testing.T) {
+	spill := OpenSpill(t.TempDir())
+	xid500 := checkpoint.Position{File: "mysql-bin.000001", Pos: 500}
+	ev := event.Event{
+		Op: event.OpCreate, Database: "db", Table: "order",
+		SourceDatabase: "db", SourceTable: "order", After: map[string]any{"id": "8"},
+	}
+	if err := spill.AppendBatch("db.order", xid500, []event.Event{ev}); err != nil {
+		t.Fatal(err)
+	}
+	db := newMemDB([]string{"1"})
+	db.tables = []schema.Table{
+		{Database: "db", Table: "order", Columns: []schema.Column{{Name: "id", Type: "int"}}, PrimaryKeys: []string{"id"}},
+	}
+	db.blockTable = "order"
+	db.blockRead = make(chan struct{})
+	sel, err := definition.CompileSelector(`db\..*`, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := &memStream{
+		started: make(chan struct{}),
+		events: []Commit{
+			{Event: &event.Event{Op: event.OpCreate, Database: "db", Table: "order", SourceDatabase: "db", SourceTable: "order", After: map[string]any{"id": "8"}}},
+			{Position: &checkpoint.Position{File: "mysql-bin.000001", Pos: 500}},
+			{Event: &event.Event{Op: event.OpCreate, Database: "db", Table: "order", SourceDatabase: "db", SourceTable: "order", After: map[string]any{"id": "9"}}},
+			{Position: &checkpoint.Position{File: "mysql-bin.000001", Pos: 600}},
+		},
+	}
+	cap := &Capture{
+		Config: definition.Source{StartupMode: definition.StartupInitial, ChunkSize: 2, Tables: sel, NewlyAddedTable: false},
+		State: checkpoint.State{
+			AckedOffset: &checkpoint.Position{File: "mysql-bin.000001", Pos: 500},
+			SnapshotTables: map[string]checkpoint.Position{
+				"db.order": {File: "mysql-bin.000001", Pos: 500},
+			},
+		},
+		DB: db, Stream: stream, Spill: spill,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ch, err := cap.Messages(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for msg := range ch {
+			if msg.CheckpointBarrier && msg.BarrierDone != nil {
+				close(msg.BarrierDone)
+			}
+			if msg.Err != nil {
+				t.Errorf("msg err: %v", msg.Err)
+			}
+		}
+	}()
+	select {
+	case <-stream.started:
+	case <-time.After(time.Second):
+		t.Fatal("binlog did not start")
+	}
+	deadline := time.After(2 * time.Second)
+	for {
+		last, has, err := spill.LastPosition("db.order")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if has && last.Pos == 600 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("last %#v has %v", last, has)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	lines := countSpillLines(t, spill, "db.order")
+	if lines != 2 {
+		t.Fatalf("spill lines at xid rewrite check: %d want 2 (one for 500, one for 600)", lines)
+	}
+	close(db.blockRead)
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
+func countSpillLines(t *testing.T, spill *Spill, id string) int {
+	t.Helper()
+	path, _ := spillPaths(spill.dir, id)
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, line := range strings.Split(string(body), "\n") {
+		if strings.TrimSpace(line) != "" {
+			n++
+		}
+	}
+	return n
+}

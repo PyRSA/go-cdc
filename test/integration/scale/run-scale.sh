@@ -18,7 +18,7 @@ export SINK_USER="${SINK_USER:-u_b3j6c8y1}"
 export SINK_PASSWORD="${SINK_PASSWORD:-P_z2h5t9k4m7}"
 export ROOT_USER="${ROOT_USER:-root}"
 export ROOT_PASSWORD="${ROOT_PASSWORD:-rootpass}"
-export GO_CDC="${GO_CDC:-${WORKDIR}/go-cdc}"
+export GO_CDC="${GO_CDC:-workdir/go-cdc}"
 if [ -n "${CDC_CLI:-}" ]; then
   export GO_CDC="${CDC_CLI}"
 fi

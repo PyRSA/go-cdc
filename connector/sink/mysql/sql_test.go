@@ -60,3 +60,44 @@ func TestCreateTableStartsAutoIncrementAtOne(t *testing.T) {
 		t.Fatal(sql)
 	}
 }
+
+func TestCreateTableSQLIncludesCommentCharsetDefaultIndex(t *testing.T) {
+	sql, err := CreateTableSQL(schema.Table{
+		Database: "sink", Table: "users",
+		Comment: "users table", Charset: "utf8mb4", Collation: "utf8mb4_bin",
+		Columns: []schema.Column{
+			{Name: "id", Type: "bigint", AutoIncrement: true, Comment: "pk"},
+			{
+				Name: "name", Type: "varchar(64)", Nullable: true, Default: "n/a",
+				Comment: "display", Charset: "utf8mb4", Collation: "utf8mb4_general_ci",
+			},
+		},
+		PrimaryKeys: []string{"id"},
+		Indexes: []schema.Index{
+			{Name: "uk_name", Unique: true, Columns: []string{"name"}},
+			{Name: "idx_name", Columns: []string{"name"}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	need := []string{
+		"COMMENT 'pk'",
+		"COMMENT 'display'",
+		"DEFAULT 'n/a'",
+		"`name` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NULL DEFAULT 'n/a' COMMENT 'display'",
+		"UNIQUE KEY `uk_name` (`name`)",
+		"KEY `idx_name` (`name`)",
+		"DEFAULT CHARSET=utf8mb4",
+		"COLLATE=utf8mb4_bin",
+		"COMMENT='users table'",
+	}
+	for _, part := range need {
+		if !strings.Contains(sql, part) {
+			t.Fatalf("missing %q in %s", part, sql)
+		}
+	}
+	if strings.Contains(sql, "FOREIGN KEY") || strings.Contains(sql, "ENGINE=") {
+		t.Fatal(sql)
+	}
+}

@@ -37,6 +37,9 @@ func TestParseSample(t *testing.T) {
 	if pipe.Source.JDBCProperties["useSSL"] != "false" {
 		t.Fatalf("jdbc %#v", pipe.Source.JDBCProperties)
 	}
+	if pipe.Source.NewlyAddedTable || !pipe.Source.NewlyAddedSnapshot || pipe.Source.BinlogNewlyAddedTable {
+		t.Fatalf("newly-added defaults %#v", pipe.Source)
+	}
 	if pipe.Runtime.Parallelism != 4 || pipe.Checkpoint.Storage != "file" {
 		t.Fatalf("runtime %#v ckpt %#v", pipe.Runtime, pipe.Checkpoint)
 	}
@@ -52,6 +55,30 @@ func TestParseSample(t *testing.T) {
 	}
 	if !exact.Match("db_tp_func_src", "tp01_rows") || exact.Match("db_tp_func_src", "tp01_rows_out") {
 		t.Fatal("table pattern must match the whole database.table name")
+	}
+}
+
+func TestParseNewlyAddedFlags(t *testing.T) {
+	body := `
+source:
+  hostname: 127.0.0.1
+  username: root
+  password: secret
+  tables: db\..*
+  scan.newly-added-table.enabled: true
+  scan.newly-added-table.snapshot.enabled: false
+  scan.binlog.newly-added-table.enabled: true
+sink:
+  type: stdout
+pipeline:
+  name: demo
+`
+	pipe, err := Parse([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pipe.Source.NewlyAddedTable || pipe.Source.NewlyAddedSnapshot || !pipe.Source.BinlogNewlyAddedTable {
+		t.Fatalf("%#v", pipe.Source)
 	}
 }
 
@@ -76,7 +103,6 @@ pipeline:
 		{"schema_only", "scan.startup.mode: schema_only\n", "source.scan.startup.mode"},
 		{"debezium", "debezium.snapshot.mode: initial\n", "source.debezium.snapshot.mode"},
 		{"timeout", "connect.timeout: 100ms\n", "source.connect.timeout"},
-		{"newly-added", "scan.newly-added-table.enabled: true\n", "source.scan.newly-added-table.enabled"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

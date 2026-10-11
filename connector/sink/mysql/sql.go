@@ -4,6 +4,7 @@ package mysql
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/PyRSA/go-cdc/common/event"
@@ -53,15 +54,30 @@ func CreateTableSQL(table schema.Table) (string, error) {
 	}
 	var cols []string
 	for _, column := range table.Columns {
-		nullSQL := "NULL"
-		if !column.Nullable {
-			nullSQL = "NOT NULL"
+		// MySQL requires CHARACTER SET / COLLATE immediately after the type,
+		// before NULL / NOT NULL / DEFAULT / AUTO_INCREMENT / COMMENT.
+		parts := []string{schema.Quote(column.Name), column.Type}
+		if column.Charset != "" {
+			parts = append(parts, "CHARACTER SET", column.Charset)
 		}
-		extra := ""
+		if column.Collation != "" {
+			parts = append(parts, "COLLATE", column.Collation)
+		}
+		if column.Nullable {
+			parts = append(parts, "NULL")
+		} else {
+			parts = append(parts, "NOT NULL")
+		}
 		if column.AutoIncrement {
-			extra = " AUTO_INCREMENT"
+			parts = append(parts, "AUTO_INCREMENT")
 		}
-		cols = append(cols, fmt.Sprintf("%s %s %s%s", schema.Quote(column.Name), column.Type, nullSQL, extra))
+		if column.Default != "" {
+			parts = append(parts, "DEFAULT", formatDefault(column.Default))
+		}
+		if column.Comment != "" {
+			parts = append(parts, "COMMENT", quoteString(column.Comment))
+		}
+		cols = append(cols, strings.Join(parts, " "))
 	}
 	if len(table.PrimaryKeys) > 0 {
 		quoted := make([]string, len(table.PrimaryKeys))
@@ -70,7 +86,62 @@ func CreateTableSQL(table schema.Table) (string, error) {
 		}
 		cols = append(cols, "PRIMARY KEY ("+strings.Join(quoted, ", ")+")")
 	}
-	return "CREATE TABLE " + schema.Qualified(table.Database, table.Table) + " (" + strings.Join(cols, ", ") + ")", nil
+	for _, index := range table.Indexes {
+		if index.Name == "" || len(index.Columns) == 0 {
+			continue
+		}
+		quoted := make([]string, len(index.Columns))
+		for i, name := range index.Columns {
+			quoted[i] = schema.Quote(name)
+		}
+		kind := "KEY"
+		if index.Unique {
+			kind = "UNIQUE KEY"
+		}
+		cols = append(cols, fmt.Sprintf("%s %s (%s)", kind, schema.Quote(index.Name), strings.Join(quoted, ", ")))
+	}
+	sql := "CREATE TABLE " + schema.Qualified(table.Database, table.Table) + " (" + strings.Join(cols, ", ") + ")"
+	var opts []string
+	if table.Charset != "" {
+		opts = append(opts, "DEFAULT CHARSET="+table.Charset)
+	}
+	if table.Collation != "" {
+		opts = append(opts, "COLLATE="+table.Collation)
+	}
+	if table.Comment != "" {
+		opts = append(opts, "COMMENT="+quoteString(table.Comment))
+	}
+	if len(opts) > 0 {
+		sql += " " + strings.Join(opts, " ")
+	}
+	return sql, nil
+}
+
+func formatDefault(def string) string {
+	trim := strings.TrimSpace(def)
+	upper := strings.ToUpper(trim)
+	switch {
+	case upper == "NULL":
+		return "NULL"
+	case upper == "CURRENT_TIMESTAMP" || strings.HasPrefix(upper, "CURRENT_TIMESTAMP("):
+		return trim
+	case looksNumeric(trim):
+		return trim
+	default:
+		return quoteString(trim)
+	}
+}
+
+func looksNumeric(value string) bool {
+	if value == "" {
+		return false
+	}
+	_, err := strconv.ParseFloat(value, 64)
+	return err == nil
+}
+
+func quoteString(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func upsert(item event.Event, row map[string]any) Statement {

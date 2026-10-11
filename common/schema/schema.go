@@ -7,14 +7,29 @@ type Column struct {
 	Type          string
 	Nullable      bool
 	AutoIncrement bool
+	Default       string
+	Comment       string
+	Charset       string
+	Collation     string
+}
+
+// Index is a secondary or unique index (never the PRIMARY key).
+type Index struct {
+	Name    string
+	Unique  bool
+	Columns []string
 }
 
 // Table is a projected table definition used to create the sink table.
 type Table struct {
 	Database    string
 	Table       string
+	Comment     string
+	Charset     string
+	Collation   string
 	Columns     []Column
 	PrimaryKeys []string
+	Indexes     []Index
 }
 
 // Action is the kind of schema change a DDL statement performs.

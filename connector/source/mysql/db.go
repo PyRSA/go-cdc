@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
@@ -42,6 +43,9 @@ func OpenDB(cfg definition.Source) (*sqlDB, error) {
 		_ = db.Close()
 		return nil, jdbcErr(cfg, err)
 	}
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	db.SetConnMaxIdleTime(10 * time.Minute)
 	if err := applyTimeZone(ctx, db, cfg.TimeZone); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -238,15 +242,36 @@ func (d *sqlDB) MasterStatus(ctx context.Context) (checkpoint.Position, error) {
 }
 
 func (d *sqlDB) ListTables(ctx context.Context) ([]schema.Table, error) {
-	rows, err := d.db.QueryContext(ctx, `
+	return d.loadTables(ctx, "", "")
+}
+
+func (d *sqlDB) DescribeTable(ctx context.Context, database, table string) (schema.Table, error) {
+	tables, err := d.loadTables(ctx, database, table)
+	if err != nil {
+		return schema.Table{}, err
+	}
+	if len(tables) == 0 {
+		return schema.Table{}, fmt.Errorf("source.mysql: table %s.%s not found", database, table)
+	}
+	return tables[0], nil
+}
+
+func (d *sqlDB) loadTables(ctx context.Context, onlyDB, onlyTable string) ([]schema.Table, error) {
+	query := `
 SELECT c.table_schema, c.table_name, c.column_name, c.column_type, c.is_nullable, c.extra, c.ordinal_position,
-       k.ordinal_position
+       c.column_default, c.column_comment, c.character_set_name, c.collation_name, k.ordinal_position
 FROM information_schema.columns c
 LEFT JOIN information_schema.key_column_usage k
   ON k.table_schema = c.table_schema AND k.table_name = c.table_name
  AND k.column_name = c.column_name AND k.constraint_name = 'PRIMARY'
-WHERE c.table_schema NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')
-ORDER BY c.table_schema, c.table_name, c.ordinal_position`)
+WHERE c.table_schema NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')`
+	args := []any{}
+	if onlyDB != "" {
+		query += ` AND c.table_schema = ? AND c.table_name = ?`
+		args = append(args, onlyDB, onlyTable)
+	}
+	query += ` ORDER BY c.table_schema, c.table_name, c.ordinal_position`
+	rows, err := d.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -257,8 +282,10 @@ ORDER BY c.table_schema, c.table_name, c.ordinal_position`)
 	for rows.Next() {
 		var dbName, tableName, column, colType, nullable, extra string
 		var ordinal int
+		var colDefault, comment, charset, collation sql.NullString
 		var keyPos sql.NullInt64
-		if err := rows.Scan(&dbName, &tableName, &column, &colType, &nullable, &extra, &ordinal, &keyPos); err != nil {
+		if err := rows.Scan(&dbName, &tableName, &column, &colType, &nullable, &extra, &ordinal,
+			&colDefault, &comment, &charset, &collation, &keyPos); err != nil {
 			return nil, err
 		}
 		id := dbName + "." + tableName
@@ -272,16 +299,144 @@ ORDER BY c.table_schema, c.table_name, c.ordinal_position`)
 		tables[at].Columns = append(tables[at].Columns, schema.Column{
 			Name: column, Type: colType, Nullable: strings.EqualFold(nullable, "YES"),
 			AutoIncrement: strings.Contains(strings.ToUpper(extra), "AUTO_INCREMENT"),
+			Default:       nullString(colDefault),
+			Comment:       comment.String,
+			Charset:       charset.String,
+			Collation:     collation.String,
 		})
 		if keyPos.Valid {
 			keyParts[id] = append(keyParts[id], pkPart{pos: int(keyPos.Int64), name: column})
 		}
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	for i := range tables {
 		id := tables[i].Database + "." + tables[i].Table
 		tables[i].PrimaryKeys = primaryKeyNames(keyParts[id])
 	}
-	return tables, rows.Err()
+	if err := d.fillTableMeta(ctx, tables, onlyDB, onlyTable); err != nil {
+		return nil, err
+	}
+	if err := d.fillIndexes(ctx, tables, onlyDB, onlyTable); err != nil {
+		return nil, err
+	}
+	return tables, nil
+}
+
+func nullString(value sql.NullString) string {
+	if !value.Valid {
+		return ""
+	}
+	return value.String
+}
+
+func (d *sqlDB) fillTableMeta(ctx context.Context, tables []schema.Table, onlyDB, onlyTable string) error {
+	if len(tables) == 0 {
+		return nil
+	}
+	query := `
+SELECT t.table_schema, t.table_name, t.table_comment, t.table_collation, cc.character_set_name
+FROM information_schema.tables t
+LEFT JOIN information_schema.collation_character_set_applicability cc
+  ON cc.collation_name = t.table_collation
+WHERE t.table_schema NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')
+  AND t.table_type = 'BASE TABLE'`
+	args := []any{}
+	if onlyDB != "" {
+		query += ` AND t.table_schema = ? AND t.table_name = ?`
+		args = append(args, onlyDB, onlyTable)
+	}
+	rows, err := d.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	byID := map[string]*schema.Table{}
+	for i := range tables {
+		byID[tables[i].Database+"."+tables[i].Table] = &tables[i]
+	}
+	for rows.Next() {
+		var dbName, tableName, comment, collation string
+		var charset sql.NullString
+		if err := rows.Scan(&dbName, &tableName, &comment, &collation, &charset); err != nil {
+			return err
+		}
+		tab := byID[dbName+"."+tableName]
+		if tab == nil {
+			continue
+		}
+		tab.Comment = comment
+		tab.Collation = collation
+		tab.Charset = charset.String
+	}
+	return rows.Err()
+}
+
+func (d *sqlDB) fillIndexes(ctx context.Context, tables []schema.Table, onlyDB, onlyTable string) error {
+	if len(tables) == 0 {
+		return nil
+	}
+	query := `
+SELECT table_schema, table_name, index_name, non_unique, seq_in_index, column_name
+FROM information_schema.statistics
+WHERE table_schema NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')
+  AND index_name <> 'PRIMARY'`
+	args := []any{}
+	if onlyDB != "" {
+		query += ` AND table_schema = ? AND table_name = ?`
+		args = append(args, onlyDB, onlyTable)
+	}
+	query += ` ORDER BY table_schema, table_name, index_name, seq_in_index`
+	rows, err := d.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	byID := map[string]*schema.Table{}
+	for i := range tables {
+		byID[tables[i].Database+"."+tables[i].Table] = &tables[i]
+	}
+	type acc struct {
+		idx   schema.Index
+		order int
+	}
+	pending := map[string]map[string]*acc{}
+	for rows.Next() {
+		var dbName, tableName, indexName, column string
+		var nonUnique, seq int
+		if err := rows.Scan(&dbName, &tableName, &indexName, &nonUnique, &seq, &column); err != nil {
+			return err
+		}
+		id := dbName + "." + tableName
+		if byID[id] == nil {
+			continue
+		}
+		if pending[id] == nil {
+			pending[id] = map[string]*acc{}
+		}
+		item := pending[id][indexName]
+		if item == nil {
+			item = &acc{idx: schema.Index{Name: indexName, Unique: nonUnique == 0}, order: seq}
+			pending[id][indexName] = item
+		}
+		item.idx.Columns = append(item.idx.Columns, column)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for id, indexes := range pending {
+		tab := byID[id]
+		names := make([]string, 0, len(indexes))
+		for name := range indexes {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			tab.Indexes = append(tab.Indexes, indexes[name].idx)
+		}
+	}
+	return nil
 }
 
 type pkPart struct {

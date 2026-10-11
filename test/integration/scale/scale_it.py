@@ -26,6 +26,9 @@ from harness.config import (
     SRC_PASSWORD,
     SRC_USER,
     WORKDIR,
+    it_rel_path,
+    project_display_path,
+    sanitize_report_text,
 )
 from scale.profiles import Profile, TableSpec, hotspot_tables, load_profile
 from scale.schemas import checksum_sql, create_table_sql, insert_batch
@@ -294,7 +297,7 @@ def render_pipeline_yaml(profile: Profile, path: Path) -> None:
             "checkpoint:",
             "  storage: file",
             "  interval: 3s",
-            f"  file-path: {ckpt}",
+            f"  file-path: {it_rel_path(ckpt)}",
             "",
         ]
     )
@@ -923,7 +926,7 @@ def write_report(
         )
     lines.append("")
 
-    out.write_text("\n".join(lines), encoding="utf-8")
+    out.write_text(sanitize_report_text("\n".join(lines)), encoding="utf-8")
     return out
 
 
@@ -1013,7 +1016,7 @@ def run_profile(profile: Profile, until: str) -> int:
             for msg in snap_failures:
                 log(f"FAIL {msg}", file=sys.stderr, flush=True)
             write_report(profile, timings, all_failures, report_path)
-            log(f"REPORT {report_path}", flush=True)
+            log(f"REPORT {project_display_path(report_path)}", flush=True)
             return 1
         log(
             f"==> snapshot verify ok ({len(profile.tables)} tables)",
@@ -1084,7 +1087,7 @@ def run_profile(profile: Profile, until: str) -> int:
             report_path,
             extra=hotspot_extra or None,
         )
-        log(f"REPORT {report_path}", flush=True)
+        log(f"REPORT {project_display_path(report_path)}", flush=True)
         if all_failures:
             log("SUMMARY FAIL", flush=True)
             return 1
@@ -1100,7 +1103,7 @@ def run_profile(profile: Profile, until: str) -> int:
                     all_failures + ["aborted: see logs / exception"],
                     report_path,
                 )
-                log(f"REPORT {report_path}", flush=True)
+                log(f"REPORT {project_display_path(report_path)}", flush=True)
         except Exception:  # noqa: BLE001
             pass
         raise

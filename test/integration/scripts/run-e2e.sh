@@ -23,11 +23,12 @@ export LOAD_SRC_DB="${LOAD_SRC_DB:-db_tp_load_src}"
 export LOAD_SNK_DB="${LOAD_SNK_DB:-db_tp_load_snk}"
 export SRC_DB="${SRC_DB:-${FUNC_SRC_DB}}"
 export SINK_DB="${SINK_DB:-${FUNC_SNK_DB}}"
-export CHECKPOINT_DIR="${CHECKPOINT_DIR:-${WORKDIR}/ckpts}"
-export CHECKPOINT_STDOUT_DIR="${CHECKPOINT_STDOUT_DIR:-${WORKDIR}/ckpts-stdout}"
-export CHECKPOINT_TYPES_DIR="${CHECKPOINT_TYPES_DIR:-${WORKDIR}/ckpts-types}"
-export CHECKPOINT_LOAD_DIR="${CHECKPOINT_LOAD_DIR:-${WORKDIR}/ckpts-load}"
-export GO_CDC="${GO_CDC:-${WORKDIR}/go-cdc}"
+# Relative to test/integration (harness cwd) so rendered YAML has no absolute home paths.
+export CHECKPOINT_DIR="${CHECKPOINT_DIR:-workdir/ckpts}"
+export CHECKPOINT_STDOUT_DIR="${CHECKPOINT_STDOUT_DIR:-workdir/ckpts-stdout}"
+export CHECKPOINT_TYPES_DIR="${CHECKPOINT_TYPES_DIR:-workdir/ckpts-types}"
+export CHECKPOINT_LOAD_DIR="${CHECKPOINT_LOAD_DIR:-workdir/ckpts-load}"
+export GO_CDC="${GO_CDC:-workdir/go-cdc}"
 # Back-compat: CDC_CLI still accepted if set.
 if [ -n "${CDC_CLI:-}" ]; then
   export GO_CDC="${CDC_CLI}"
@@ -104,7 +105,13 @@ log "==> clean sink tables"
 mysql_as "${SINK_USER}" "${SINK_PASSWORD}" -e "
 DROP TABLE IF EXISTS
   ${FUNC_SNK_DB}.tp01_rows_out, ${FUNC_SNK_DB}.tp02_keys_out,
-  ${FUNC_SNK_DB}.tp09_add_out, ${FUNC_SNK_DB}.tp10_ddl_out, ${FUNC_SNK_DB}.tp07_fail_out,
+  ${FUNC_SNK_DB}.tp10_add_out, ${FUNC_SNK_DB}.tp11_ddl_out, ${FUNC_SNK_DB}.tp07_fail_out,
+  ${FUNC_SNK_DB}.tp15_diff_out, ${FUNC_SNK_DB}.tp15_crt_out,
+  ${FUNC_SNK_DB}.tp16_diff_out, ${FUNC_SNK_DB}.tp16_crt_out,
+  ${FUNC_SNK_DB}.tp17_diff_out, ${FUNC_SNK_DB}.tp17_crt_out,
+  ${FUNC_SNK_DB}.tp18_diff_out, ${FUNC_SNK_DB}.tp18_crt_out,
+  ${FUNC_SNK_DB}.tp19_diff_out, ${FUNC_SNK_DB}.tp19_crt_out,
+  ${FUNC_SNK_DB}.tp20_diff_out, ${FUNC_SNK_DB}.tp20_crt_out,
   ${TYPES_SNK_DB}.tpd01_types_out,
   ${LOAD_SNK_DB}.tpl01_t1_out, ${LOAD_SNK_DB}.tpl01_t2_out,
   ${LOAD_SNK_DB}.tpl01_t3_out, ${LOAD_SNK_DB}.tpl01_t4_out,
