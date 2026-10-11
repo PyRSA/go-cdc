@@ -267,10 +267,7 @@ func (c *Capture) snapshotPhase(ctx context.Context, out chan<- source.Message) 
 		}
 		todo = append(todo, table)
 	}
-	var known []string
-	for _, id := range c.State.CapturedTables {
-		known = append(known, id)
-	}
+	known := append([]string(nil), c.State.CapturedTables...)
 	for _, table := range todo {
 		if err := ctx.Err(); err != nil {
 			return checkpoint.Position{}, err
