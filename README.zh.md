@@ -112,7 +112,7 @@ go-cdc 在 GitHub Actions 中跑自动化 MySQL 集成与规模测试，覆盖�
 
 下表为 **多轮 CI 平均**（load：每版本 2 次；scale heavy：2 次）。**源端写入**与
 **CDC apply** 是不同指标。曲线按追平进度归一化后平均，并压缩 lag 平台期采样。
-负载峰值 knobs 现为 **4×30s**；下方追平时长/曲线仍来自此前 **4×90s** 样本，待重采。
+负载峰值 knobs 现为 **4×60s**；下方追平时长/曲线仍来自此前 **4×90s** 样本，待重采。
 
 ### 负载测试（Load）
 
@@ -120,13 +120,13 @@ go-cdc 在 GitHub Actions 中跑自动化 MySQL 集成与规模测试，覆盖�
 | --- | --- | --- |
 | **测试类型** | **Load**（func + types + load） | **Load**（func + types + load） |
 | 快照 | 约 50 万行 / ~130s（平均） | 约 50 万行 / ~152s（平均） |
-| 峰值源端写入 | 30s（估单表 src ≈100 万） | 30s（估单表 src ≈83 万） |
+| 峰值源端写入 | 60s（估单表 src ≈150 万） | 60s（估单表 src ≈120 万） |
 | 受压表 | 2（`tpl01_t1` + typed） | 2（`tpl01_t1` + typed） |
 | CDC 合计 apply | 约 2.8K 行/s（两表合计，平均） | 约 1.9K 行/s（两表合计，平均） |
 | CDC 追平 | ~2035s（约 34 min）内 lag ≤1%\* | ~2280s（约 38 min）内 lag ≤1%\* |
 | 结果 | **PASS** | **PASS** |
 
-\*此前 4×90s CI 平均；4×30s 下墙钟时间粗估约 ⅓。
+\*此前 4×90s CI 平均；4×60s 下墙钟时间粗估约 ⅔。
 
 追平曲线（同一 load 套件，5.7 vs 8.0，平均；此前 4×90s）：   
 ![Load peak catch-up lag % vs time (MySQL 5.7 vs 8.0)](docs/performance/load-peak-catchup-lag.svg)

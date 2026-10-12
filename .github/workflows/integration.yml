@@ -139,12 +139,12 @@ jobs:
           - mysql: "5.7"
             image: mysql:5.7.42
             tag: "57"
-            peak_seconds: "30"
+            peak_seconds: "60"
             peak_workers: "4"
           - mysql: "8.0"
             image: mysql:8.0.36
             tag: "80"
-            peak_seconds: "30"
+            peak_seconds: "60"
             peak_workers: "4"
 
     defaults:

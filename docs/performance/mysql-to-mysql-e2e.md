@@ -18,7 +18,7 @@ files under `docs/performance/` using the same `mysql-to-<sink>-e2e.md` naming.
 | MySQL (load) | 5.7.42 and 8.0.36 via docker compose |
 | MySQL (scale) | 8.0.36 · `SCALE_PROFILE=heavy` only |
 | Profiles | `LOAD_PROFILE=full` (`LOAD_ROWS_PER_TABLE=100000`); heavy scale |
-| Peak knobs (load) | **Current CI:** 4 workers × 30s, batch 200 |
+| Peak knobs (load) | **Current CI:** 4 workers × 60s, batch 200 |
 | Scale knobs | 8 workers; hotspot burst 50k/table × 10; peak 45s |
 
 **How numbers and charts are built**
@@ -42,14 +42,14 @@ One source DB → one sink DB, six tables (`t1`–`t4`, `typed`, `large`):
 
 1. Seed **100k rows × 5** normal tables + **50 × 2 MiB** LONGBLOB/LONGTEXT rows.
 2. Snapshot catch-up (≤1% row lag).
-3. Peak: 4 concurrent writers × 30s INSERT into `tpl01_t1` + `tpl01_typed`.
+3. Peak: 4 concurrent writers × 60s INSERT into `tpl01_t1` + `tpl01_typed`.
 4. Peak catch-up until both tables are within **≤1%** lag (harness budget 3600s).
 
 Functional (TP-01..13) and types (TP-D01..D04) ran in the same job before load.
 
 > **Evidence note:** Load phase timings, apply rates, and the lag chart below are
 > **historical averages from prior CI with peak = 4×90s**. Current knobs are
-> **4×30s**; remeasure before treating those numbers as current CI baselines.
+> **4×60s**; remeasure before treating those numbers as current CI baselines.
 
 The load lag chart has **two lines** because CI runs the same load suite on
 **MySQL 5.7 and 8.0**.
@@ -104,7 +104,7 @@ Y-axis: **mean** `delta%` across 10 hotspot tables, then averaged across runs
 
 ## Load suite — MySQL 5.7 (average of 2 runs)
 
-> Historical sample: peak knobs were **4×90s** (not current 4×30s).
+> Historical sample: peak knobs were **4×90s** (not current 4×60s).
 
 **Result: PASS** (both runs; mean suite total **2269s**)
 
@@ -123,7 +123,7 @@ Start lag ~**94%**. Catch-up is near-linear on average to ≤1% in ~34 minutes
 
 ## Load suite — peak catch-up lag curve
 
-> Historical sample: peak knobs were **4×90s** (not current 4×30s).
+> Historical sample: peak knobs were **4×90s** (not current 4×60s).
 
 Both versions start near **~94%** lag after the 90s flood. Averaged curves stay
 close through mid catch-up; **5.7 finishes earlier on average** (~2035s) than
@@ -145,7 +145,7 @@ close through mid catch-up; **5.7 finishes earlier on average** (~2035s) than
 
 ## Load suite — MySQL 8.0 (average of 2 runs)
 
-> Historical sample: peak knobs were **4×90s** (not current 4×30s).
+> Historical sample: peak knobs were **4×90s** (not current 4×60s).
 
 **Result: PASS** (both runs; mean suite total **2534s**)
 
@@ -180,7 +180,7 @@ flood. Scale wall time is especially runner-sensitive.
 
 1. Under **prior 4×90s** multi-million-row load peaks, go-cdc drained to ≤1% with
    a near-linear averaged lag curve (~34 min on 5.7, ~38 min on 8.0 across those
-   historical samples). Current CI uses **4×30s**; expect smaller backlog /
+   historical samples). Current CI uses **4×60s**; expect smaller backlog /
    shorter catch-up until remeasured.
 2. Scale heavy on MySQL 8 reaches ≤1% catch-up and checksum PASS; individual
    runs may include mid-run apply stalls (visible when not averaged away).
