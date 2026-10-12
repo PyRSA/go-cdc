@@ -30,6 +30,7 @@ from harness.config import (
 from scale.profiles import Profile, TableSpec, hotspot_tables, load_profile
 from scale.schemas import checksum_sql, create_table_sql, insert_batch
 from harness.logutil import log
+from harness.sysstat import format_cpu_mem, format_disk, format_host_res
 
 ROOT_USER = os.environ.get("ROOT_USER", "root")
 ROOT_PASSWORD = os.environ.get("ROOT_PASSWORD", "rootpass")
@@ -799,6 +800,7 @@ def wait_hotspot_convergence(
     t0 = time.time()
     deadline = t0 + timeout
     last_log = 0.0
+    format_cpu_mem()  # baseline /proc/stat so the first periodic line has cpu=%
     while time.time() < deadline:
         _assert_cdc_alive(proc, "catch-up")
         ok = True
@@ -814,8 +816,11 @@ def wait_hotspot_convergence(
                 ok = False
         now = time.time()
         if now - last_log >= interval or ok:
+            cdc_pid = proc.pid if proc is not None else None
             log(
-                f"    hotspot catch-up {now - t0:.0f}s: " + " | ".join(lines),
+                f"    hotspot catch-up {now - t0:.0f}s: "
+                + " | ".join(lines)
+                + f" | {format_host_res(cdc_pid)}",
                 flush=True,
             )
             last_log = now
@@ -824,6 +829,11 @@ def wait_hotspot_convergence(
             log(f"TIMING peak_catchup {elapsed:.1f}s", flush=True)
             return elapsed
         time.sleep(interval)
+    cdc_pid = proc.pid if proc is not None else None
+    log(
+        f"    hotspot catch-up TIMEOUT: {format_host_res(cdc_pid)}",
+        flush=True,
+    )
     raise TimeoutError(
         f"timeout waiting for hotspot count convergence after {time.time() - t0:.1f}s"
     )
@@ -989,6 +999,7 @@ def run_profile(profile: Profile, until: str) -> int:
     ensure_tables(profile)
 
     log("==> seed baseline", flush=True)
+    log(f"    {format_disk(WORKDIR)}", flush=True)
     seed_s = seed_all(profile)
     timings["seed_baseline"] = seed_s
     log(f"TIMING seed_baseline {seed_s:.1f}s", flush=True)

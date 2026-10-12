@@ -70,7 +70,7 @@ ASSERT_TIME_ZONE = env("ASSERT_TIME_ZONE", "+08:00")
 # Normal tables (t1–t4 + typed): 50k rows/table by default.
 LOAD_PROFILE = env("LOAD_PROFILE", "")  # optional label: full | normal | …
 LOAD_ROWS_PER_TABLE = int(env("LOAD_ROWS_PER_TABLE", "50000"))
-LOAD_PEAK_SECONDS = int(env("LOAD_PEAK_SECONDS", "90"))
+LOAD_PEAK_SECONDS = int(env("LOAD_PEAK_SECONDS", "30"))
 LOAD_PEAK_WORKERS = int(env("LOAD_PEAK_WORKERS", "4"))
 LOAD_PEAK_BATCH = int(env("LOAD_PEAK_BATCH", "200"))
 # CDC pipeline.parallelism for load suite (defaults to peak workers).

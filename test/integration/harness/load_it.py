@@ -23,6 +23,7 @@ import pymysql
 
 from . import config as cfg
 from .logutil import log
+from .sysstat import format_cpu_mem, format_disk, format_host_res
 
 SRC = cfg.conn_kwargs(cfg.SRC_USER, cfg.SRC_PASSWORD, cfg.LOAD_SRC_DB)
 SNK = cfg.conn_kwargs(cfg.SINK_USER, cfg.SINK_PASSWORD, cfg.LOAD_SNK_DB)
@@ -161,6 +162,7 @@ def wait_peak_catchup(timeout: float = 3600, interval: float = 15.0, log_every: 
     t0 = time.time()
     deadline = t0 + timeout
     last_log = 0.0
+    format_cpu_mem()  # baseline /proc/stat so the first periodic line has cpu=%
     while time.time() < deadline:
         if proc is not None and proc.poll() is not None:
             raise RuntimeError(f"go-cdc exited during peak catch-up: {proc.returncode}")
@@ -170,15 +172,19 @@ def wait_peak_catchup(timeout: float = 3600, interval: float = 15.0, log_every: 
             return elapsed
         now = time.time()
         if now - last_log >= log_every:
+            cdc_pid = proc.pid if proc is not None else None
             log(
                 f"    peak catch-up {now - t0:.0f}s: "
-                f"{_lag_line('tpl01_t1')} | {_lag_line(TYPED_TABLE)}",
+                f"{_lag_line('tpl01_t1')} | {_lag_line(TYPED_TABLE)} | "
+                f"{format_host_res(cdc_pid)}",
                 flush=True,
             )
             last_log = now
         time.sleep(interval)
+    cdc_pid = proc.pid if proc is not None else None
     log(
-        f"    peak catch-up TIMEOUT: {_lag_line('tpl01_t1')} | {_lag_line(TYPED_TABLE)}",
+        f"    peak catch-up TIMEOUT: {_lag_line('tpl01_t1')} | {_lag_line(TYPED_TABLE)} | "
+        f"{format_host_res(cdc_pid)}",
         flush=True,
     )
     raise TimeoutError(
@@ -526,6 +532,7 @@ def main() -> int:
         f"{LARGE_ROWS} large rows ({LARGE_BYTES}B)",
         flush=True,
     )
+    log(f"    {format_disk(WORKDIR)}", flush=True)
     t0 = time.time()
     seed_baseline()
     timings["seed_baseline"] = time.time() - t0

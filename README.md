@@ -125,22 +125,25 @@ pressure.
 Results below are **averages across CI runs** (load: 2× each version; scale
 heavy: 2×). **Source write** and **CDC apply** are different metrics. Charts
 use run-normalized average lag curves and collapse flat plateau segments.
+Load peak knobs are now **4×30s**; catch-up timings/chart below are still from
+prior **4×90s** samples until remeasured.
 
 ### Load test
 
 
-| Metric              | MySQL 5.7.42                   | MySQL 8.0.36                   |
-| ------------------- | ------------------------------ | ------------------------------ |
-| **Test type**       | **Load** (func + types + load) | **Load** (func + types + load) |
-| Snapshot            | ~500K rows / ~130s (avg)       | ~500K rows / ~152s (avg)       |
-| Peak source write   | 90s (final src ≈2.87M/table)   | 90s (final src ≈2.30M/table)   |
-| Stressed tables     | 2 (`tpl01_t1` + typed)         | 2 (`tpl01_t1` + typed)         |
-| Aggregate CDC apply | ~2.8K rows/s (2 tables, avg)   | ~1.9K rows/s (2 tables, avg)   |
-| CDC catch-up        | ≤1% lag in ~2035s (~34 min)    | ≤1% lag in ~2280s (~38 min)    |
-| Result              | **PASS**                       | **PASS**                       |
+| Metric              | MySQL 5.7.42                     | MySQL 8.0.36                     |
+| ------------------- | -------------------------------- | -------------------------------- |
+| **Test type**       | **Load** (func + types + load)   | **Load** (func + types + load)   |
+| Snapshot            | ~500K rows / ~130s (avg)         | ~500K rows / ~152s (avg)         |
+| Peak source write   | 30s (est. final src ≈1.0M/table) | 30s (est. final src ≈0.83M/table) |
+| Stressed tables     | 2 (`tpl01_t1` + typed)           | 2 (`tpl01_t1` + typed)           |
+| Aggregate CDC apply | ~2.8K rows/s (2 tables, avg)     | ~1.9K rows/s (2 tables, avg)     |
+| CDC catch-up        | ≤1% lag in ~2035s (~34 min)*     | ≤1% lag in ~2280s (~38 min)*     |
+| Result              | **PASS**                         | **PASS**                         |
 
+\*Prior 4×90s CI average; expect roughly ~⅓ wall time under 4×30s.
 
-Lag-over-time chart (same load suite on 5.7 vs 8.0, averaged):  
+Lag-over-time chart (same load suite on 5.7 vs 8.0, averaged; prior 4×90s):  
 ![Load peak catch-up lag % vs time (MySQL 5.7 vs 8.0)](docs/performance/load-peak-catchup-lag.svg)
 
 ### Scale test (heavy)
