@@ -23,16 +23,17 @@ export LOAD_SRC_DB="${LOAD_SRC_DB:-db_tp_load_src}"
 export LOAD_SNK_DB="${LOAD_SNK_DB:-db_tp_load_snk}"
 export SRC_DB="${SRC_DB:-${FUNC_SRC_DB}}"
 export SINK_DB="${SINK_DB:-${FUNC_SNK_DB}}"
-# Relative to test/integration (harness cwd) so rendered YAML has no absolute home paths.
-export CHECKPOINT_DIR="${CHECKPOINT_DIR:-workdir/ckpts}"
-export CHECKPOINT_STDOUT_DIR="${CHECKPOINT_STDOUT_DIR:-workdir/ckpts-stdout}"
-export CHECKPOINT_TYPES_DIR="${CHECKPOINT_TYPES_DIR:-workdir/ckpts-types}"
-export CHECKPOINT_LOAD_DIR="${CHECKPOINT_LOAD_DIR:-workdir/ckpts-load}"
-export GO_CDC="${GO_CDC:-workdir/go-cdc}"
-# Back-compat: CDC_CLI still accepted if set.
+# Absolute under WORKDIR (layout-derived). YAML checkpoints use harness it_rel_path().
+export CHECKPOINT_DIR="${CHECKPOINT_DIR:-${WORKDIR}/ckpts}"
+export CHECKPOINT_STDOUT_DIR="${CHECKPOINT_STDOUT_DIR:-${WORKDIR}/ckpts-stdout}"
+export CHECKPOINT_TYPES_DIR="${CHECKPOINT_TYPES_DIR:-${WORKDIR}/ckpts-types}"
+export CHECKPOINT_LOAD_DIR="${CHECKPOINT_LOAD_DIR:-${WORKDIR}/ckpts-load}"
+export GO_CDC="${GO_CDC:-${WORKDIR}/go-cdc}"
 if [ -n "${CDC_CLI:-}" ]; then
   export GO_CDC="${CDC_CLI}"
 fi
+absolutize_go_cdc
+absolutize_checkpoint_dirs
 
 # Pin load knobs so ambient shell leftovers are visible and defaults are explicit.
 # CI may override via GITHUB_ENV / step env before this script runs.
@@ -82,15 +83,7 @@ log "==> build go-cdc"
 (cd "${ROOT}" && go build -o "${GO_CDC}" ./cmd/go-cdc)
 
 log "==> install harness deps"
-PYTHON_BIN="${PYTHON_BIN:-}"
-if [ -z "${PYTHON_BIN}" ]; then
-  for c in python3.11 python3.10 python3.9 python3; do
-    if command -v "$c" >/dev/null 2>&1; then
-      PYTHON_BIN="$c"
-      break
-    fi
-  done
-fi
+resolve_python_bin
 log "    using ${PYTHON_BIN}"
 "${PYTHON_BIN}" -m pip install -q -r "${IT}/harness/requirements.txt"
 

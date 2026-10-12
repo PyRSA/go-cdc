@@ -51,8 +51,9 @@ CDC_SERVER_ID_STDOUT = env("CDC_SERVER_ID_STDOUT", "5612")
 CDC_SERVER_ID_TYPES = env("CDC_SERVER_ID_TYPES", "5614")
 CDC_SERVER_ID_LOAD = env("CDC_SERVER_ID_LOAD", "5615")
 
+
 def it_rel_path(path: str | Path) -> str:
-    """Prefer paths relative to test/integration (no absolute home-dir leaks in YAML)."""
+    """Paths relative to test/integration for YAML/reports (absolute IT paths rewritten)."""
     p = Path(path)
     if not p.is_absolute():
         return str(p)
@@ -62,12 +63,23 @@ def it_rel_path(path: str | Path) -> str:
         return str(p)
 
 
-# Binary / checkpoints: relative to test/integration cwd so rendered YAML stays portable.
-BINARY = env("GO_CDC", env("CDC_CLI", "workdir/go-cdc"))
-CHECKPOINT_DIR = env("CHECKPOINT_DIR", "workdir/ckpts")
-CHECKPOINT_STDOUT_DIR = env("CHECKPOINT_STDOUT_DIR", "workdir/ckpts-stdout")
-CHECKPOINT_TYPES_DIR = env("CHECKPOINT_TYPES_DIR", "workdir/ckpts-types")
-CHECKPOINT_LOAD_DIR = env("CHECKPOINT_LOAD_DIR", "workdir/ckpts-load")
+def _abs_under_it(path: str) -> str:
+    """Make path absolute under IT_ROOT when relative (portable across machines)."""
+    p = Path(path)
+    return str(p if p.is_absolute() else IT_ROOT / p)
+
+
+# Runtime binary/checkpoints: absolute under WORKDIR (or IT_ROOT if override is relative).
+# YAML uses it_rel_path() so rendered file-path stays portable.
+BINARY = _abs_under_it(env("GO_CDC", env("CDC_CLI", str(WORKDIR / "go-cdc"))))
+CHECKPOINT_DIR = _abs_under_it(env("CHECKPOINT_DIR", str(WORKDIR / "ckpts")))
+CHECKPOINT_STDOUT_DIR = _abs_under_it(
+    env("CHECKPOINT_STDOUT_DIR", str(WORKDIR / "ckpts-stdout"))
+)
+CHECKPOINT_TYPES_DIR = _abs_under_it(
+    env("CHECKPOINT_TYPES_DIR", str(WORKDIR / "ckpts-types"))
+)
+CHECKPOINT_LOAD_DIR = _abs_under_it(env("CHECKPOINT_LOAD_DIR", str(WORKDIR / "ckpts-load")))
 
 PIPELINE_NAME = "tp_func_pipeline"
 PIPELINE_STDOUT_NAME = "tp_func_stdout"

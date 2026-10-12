@@ -18,10 +18,12 @@ export SINK_USER="${SINK_USER:-u_b3j6c8y1}"
 export SINK_PASSWORD="${SINK_PASSWORD:-P_z2h5t9k4m7}"
 export ROOT_USER="${ROOT_USER:-root}"
 export ROOT_PASSWORD="${ROOT_PASSWORD:-rootpass}"
-export GO_CDC="${GO_CDC:-workdir/go-cdc}"
+# Absolute under WORKDIR (layout-derived); CDC_CLI overrides when set.
+export GO_CDC="${GO_CDC:-${WORKDIR}/go-cdc}"
 if [ -n "${CDC_CLI:-}" ]; then
   export GO_CDC="${CDC_CLI}"
 fi
+absolutize_go_cdc
 
 # Drop compose MySQL on script exit — local only.
 # In CI (CI/GITHUB_ACTIONS), do NOT clean here: Tear down must run only after
@@ -43,15 +45,7 @@ log "==> build go-cdc"
 (cd "${ROOT}" && go build -o "${GO_CDC}" ./cmd/go-cdc)
 
 log "==> install harness deps"
-PYTHON_BIN="${PYTHON_BIN:-}"
-if [ -z "${PYTHON_BIN}" ]; then
-  for c in python3.11 python3.10 python3.9 python3; do
-    if command -v "$c" >/dev/null 2>&1; then
-      PYTHON_BIN="$c"
-      break
-    fi
-  done
-fi
+resolve_python_bin
 log "    using ${PYTHON_BIN}"
 "${PYTHON_BIN}" -m pip install -q -r "${IT}/harness/requirements.txt"
 

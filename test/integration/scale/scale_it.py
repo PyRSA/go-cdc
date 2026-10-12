@@ -43,7 +43,6 @@ SCALE_BURST_ROWS_PER_HOT = int(os.environ.get("SCALE_BURST_ROWS_PER_HOT", "50000
 SCALE_PEAK_SECONDS = int(os.environ.get("SCALE_PEAK_SECONDS", "45"))
 SCALE_PEAK_BATCH = int(os.environ.get("SCALE_PEAK_BATCH", "200"))
 
-# Re-export for callers / future tasks.
 __all__ = [
     "ROOT_USER",
     "ROOT_PASSWORD",
@@ -231,7 +230,7 @@ def _profile_name_from_yaml(yaml_path: Path) -> str:
 
 
 def ensure_binary() -> Path:
-    """Return go-cdc binary path; build into workdir if missing."""
+    """Return go-cdc binary path (absolute under WORKDIR); build if missing."""
     bin_path = Path(BINARY)
     if bin_path.is_file():
         return bin_path
@@ -307,12 +306,12 @@ def render_pipeline_yaml(profile: Profile, path: Path) -> None:
 
 def start_job(yaml_path: Path) -> subprocess.Popen:
     """Start go-cdc; pump stdout/stderr to workdir/cdc-scale-{profile}.log."""
-    ensure_binary()
+    bin_path = ensure_binary()
     profile_name = _profile_name_from_yaml(yaml_path)
     log_path = _log_path(profile_name)
     log_path.write_text("", encoding="utf-8")
     proc = subprocess.Popen(
-        [str(Path(BINARY)), str(yaml_path)],
+        [str(bin_path), str(yaml_path)],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
