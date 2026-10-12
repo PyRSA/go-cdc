@@ -11,14 +11,55 @@ concurrency:
   group: repo-checks-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-
 jobs:
+  # Skip push when an open same-repo PR already covers this branch head.
+  decide:
+    name: Decide run
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    permissions:
+      pull-requests: read
+    steps:
+      - id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" != "push" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "event=${EVENT_NAME}: run"
+            exit 0
+          fi
+          # Fail open on API errors so push CI still runs without PR coverage.
+          count="$(gh api \
+            "repos/${REPO}/pulls?state=open&head=${OWNER}:${REF_NAME}" \
+            --jq 'length' 2>/dev/null || true)"
+          if [[ "${count}" =~ ^[0-9]+$ && "${count}" -gt 0 ]]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "push skipped: ${count} open PR(s) for ${OWNER}:${REF_NAME}"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            if [[ -z "${count}" || ! "${count}" =~ ^[0-9]+$ ]]; then
+              echo "push runs: PR lookup failed or empty; fail-open"
+            else
+              echo "push runs: no open PR for ${OWNER}:${REF_NAME}"
+            fi
+          fi
+
   check-file-size:
     name: File size
+    needs: decide
+    if: needs.decide.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -86,8 +127,12 @@ jobs:
 
   check-license-decls:
     name: License
+    needs: decide
+    if: needs.decide.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
