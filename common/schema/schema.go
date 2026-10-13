@@ -7,17 +7,31 @@ type Column struct {
 	Type          string
 	Nullable      bool
 	AutoIncrement bool
-	Default       string
-	Comment       string
-	Charset       string
-	Collation     string
+	// Default is the raw default from information_schema (unquoted literal text,
+	// or a SQL expression when DefaultExpr is true). Meaningful only when
+	// HasDefault is true; "" with HasDefault means an explicit empty-string default.
+	Default string
+	// HasDefault is true when COLUMN_DEFAULT was non-NULL (including "").
+	HasDefault bool
+	// DefaultExpr is true when Default is a SQL expression (e.g. MySQL
+	// DEFAULT_GENERATED), not a quoted string literal.
+	DefaultExpr bool
+	Comment     string
+	Charset     string
+	Collation   string
 }
 
 // Index is a secondary or unique index (never the PRIMARY key).
 type Index struct {
-	Name    string
-	Unique  bool
+	Name   string
+	Unique bool
+	// Columns are index column names in order. Functional-index parts are omitted;
+	// if that leaves Columns empty the index is dropped during discovery.
 	Columns []string
+	// Prefixes parallels Columns; 0 means the full column, >0 is a prefix length.
+	Prefixes []int
+	// Type is the MySQL index type (BTREE, HASH, FULLTEXT, SPATIAL, …).
+	Type string
 }
 
 // Table is a projected table definition used to create the sink table.

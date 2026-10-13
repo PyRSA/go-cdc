@@ -438,8 +438,19 @@ func (c *Capture) binlogFrom(ctx context.Context, out chan<- source.Message, pos
 			if commit.Schema != nil {
 				schemaMsg = commit.Schema
 				if c.DB != nil {
-					if described, err := c.DB.DescribeTable(ctx, commit.Schema.Database, commit.Schema.Table); err == nil {
+					described, err := c.DB.DescribeTable(ctx, commit.Schema.Database, commit.Schema.Table)
+					if err == nil {
 						schemaMsg = cloneTable(described)
+					} else {
+						// Binlog CREATE schema may omit defaults, comments, charset,
+						// and secondary indexes. Prefer JDBC DescribeTable; on failure
+						// keep the binlog schema and surface the fallback explicitly.
+						c.warn(
+							"describe table failed; using binlog schema (defaults/comments/indexes may be incomplete)",
+							"database", commit.Schema.Database,
+							"table", commit.Schema.Table,
+							"err", err,
+						)
 					}
 				}
 			}
@@ -588,6 +599,7 @@ func cloneTable(table schema.Table) *schema.Table {
 	for i, index := range table.Indexes {
 		indexes[i] = index
 		indexes[i].Columns = append([]string(nil), index.Columns...)
+		indexes[i].Prefixes = append([]int(nil), index.Prefixes...)
 	}
 	table.Indexes = indexes
 	return &table

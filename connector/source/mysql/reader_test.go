@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -308,6 +309,7 @@ type memDB struct {
 	cols        []string
 	earliest    checkpoint.Position
 	atTime      checkpoint.Position
+	describeErr error
 	mu          sync.Mutex
 	inflight    int
 	maxInflight int
@@ -351,6 +353,9 @@ func (m *memDB) ListTables(context.Context) ([]schema.Table, error) {
 }
 
 func (m *memDB) DescribeTable(_ context.Context, database, table string) (schema.Table, error) {
+	if m.describeErr != nil {
+		return schema.Table{}, m.describeErr
+	}
 	tables, err := m.ListTables(context.Background())
 	if err != nil {
 		return schema.Table{}, err
@@ -649,6 +654,131 @@ func TestNewlyAddedSnapshotsTablesSerially(t *testing.T) {
 	}
 }
 
+func TestCloneTableCopiesIndexPrefixes(t *testing.T) {
+	src := schema.Table{
+		Database: "db", Table: "t",
+		Columns:     []schema.Column{{Name: "c", Type: "varchar(32)"}},
+		PrimaryKeys: []string{"c"},
+		Indexes: []schema.Index{{
+			Name: "idx_c", Columns: []string{"c"}, Prefixes: []int{8}, Type: "BTREE",
+		}},
+	}
+	cloned := cloneTable(src)
+	cloned.Indexes[0].Prefixes[0] = 99
+	cloned.Indexes[0].Columns[0] = "mutated"
+	if src.Indexes[0].Prefixes[0] != 8 || src.Indexes[0].Columns[0] != "c" {
+		t.Fatalf("cloneTable must deep-copy index slices; src=%#v", src.Indexes[0])
+	}
+}
+
+func TestDescribeTableFailureFallsBackWithWarning(t *testing.T) {
+	db := newMemDB([]string{"1"})
+	db.tables = []schema.Table{
+		{Database: "db", Table: "user", Columns: []schema.Column{{Name: "id", Type: "int"}}, PrimaryKeys: []string{"id"}},
+	}
+	db.describeErr = errors.New("jdbc down")
+	binlogSchema := &schema.Table{
+		Database: "db", Table: "crt",
+		Columns:     []schema.Column{{Name: "id", Type: "int"}},
+		PrimaryKeys: []string{"id"},
+	}
+	stream := &memStream{events: []Commit{
+		{Event: &event.Event{
+			Op: event.OpDDL, Database: "db", Table: "crt", SourceDatabase: "db", SourceTable: "crt",
+			DDL: "CREATE TABLE `db`.`crt` (id int primary key)",
+		}, Schema: binlogSchema},
+		{Position: &checkpoint.Position{File: "mysql-bin.000001", Pos: 500}},
+	}}
+	var warns []string
+	sel, err := definition.CompileSelector(`db\..*`, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap := &Capture{
+		Config: definition.Source{
+			StartupMode: definition.StartupInitial, Tables: sel,
+			NewlyAddedTable: false, BinlogNewlyAddedTable: true, SchemaChange: true,
+		},
+		State: checkpoint.State{
+			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
+			CapturedTables: []string{"db.user"},
+		},
+		DB: db, Stream: stream, Spill: OpenSpill(t.TempDir()),
+		Warn: func(msg string, _ ...any) { warns = append(warns, msg) },
+	}
+	msgs := collect(t, cap)
+	var sawSchema bool
+	for _, msg := range msgs {
+		if msg.Err != nil {
+			t.Fatal(msg.Err)
+		}
+		if msg.Schema != nil && msg.Schema.Table == "crt" {
+			sawSchema = true
+			if len(msg.Schema.Columns) != 1 || msg.Schema.Columns[0].Name != "id" {
+				t.Fatalf("fallback schema %#v", msg.Schema)
+			}
+		}
+	}
+	if !sawSchema {
+		t.Fatal("expected binlog schema fallback")
+	}
+	if len(warns) != 1 || !strings.Contains(warns[0], "describe table failed") {
+		t.Fatalf("warns %#v", warns)
+	}
+}
+
+func TestDescribeTableSuccessReplacesBinlogSchema(t *testing.T) {
+	db := newMemDB([]string{"1"})
+	db.tables = []schema.Table{
+		{Database: "db", Table: "user", Columns: []schema.Column{{Name: "id", Type: "int"}}, PrimaryKeys: []string{"id"}},
+		{
+			Database: "db", Table: "crt",
+			Columns: []schema.Column{
+				{Name: "id", Type: "int"},
+				{Name: "name", Type: "varchar(32)", Default: "x"},
+			},
+			PrimaryKeys: []string{"id"},
+			Indexes:     []schema.Index{{Name: "idx_name", Columns: []string{"name"}}},
+		},
+	}
+	stream := &memStream{events: []Commit{
+		{Event: &event.Event{
+			Op: event.OpDDL, Database: "db", Table: "crt", SourceDatabase: "db", SourceTable: "crt",
+			DDL: "CREATE TABLE `db`.`crt` (id int primary key)",
+		}, Schema: &schema.Table{
+			Database: "db", Table: "crt",
+			Columns:     []schema.Column{{Name: "id", Type: "int"}},
+			PrimaryKeys: []string{"id"},
+		}},
+		{Position: &checkpoint.Position{File: "mysql-bin.000001", Pos: 500}},
+	}}
+	sel, err := definition.CompileSelector(`db\..*`, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap := &Capture{
+		Config: definition.Source{
+			StartupMode: definition.StartupInitial, Tables: sel,
+			NewlyAddedTable: false, BinlogNewlyAddedTable: true, SchemaChange: true,
+		},
+		State: checkpoint.State{
+			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
+			CapturedTables: []string{"db.user"},
+		},
+		DB: db, Stream: stream, Spill: OpenSpill(t.TempDir()),
+	}
+	msgs := collect(t, cap)
+	for _, msg := range msgs {
+		if msg.Schema != nil && msg.Schema.Table == "crt" {
+			if len(msg.Schema.Columns) != 2 || len(msg.Schema.Indexes) != 1 {
+				t.Fatalf("want JDBC schema, got %#v", msg.Schema)
+			}
+			return
+		}
+	}
+	t.Fatal("missing schema message")
+}
+
 func TestNewlyAddedFalseBinlogFlagIgnoresDiffFollowsCreate(t *testing.T) {
 	db := newMemDB([]string{"1", "2"})
 	db.tables = []schema.Table{
@@ -916,7 +1046,15 @@ func countSpillLines(t *testing.T, spill *Spill, id string) int {
 	}
 	n := 0
 	for _, line := range strings.Split(string(body), "\n") {
-		if strings.TrimSpace(line) != "" {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var row spillLine
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			t.Fatal(err)
+		}
+		if row.Event != nil && !row.Fence {
 			n++
 		}
 	}

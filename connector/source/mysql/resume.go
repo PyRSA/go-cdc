@@ -191,6 +191,20 @@ func (c *Capture) snapshotResumeTables(ctx context.Context, out chan<- source.Me
 			}); err != nil {
 				return err
 			}
+			// Sink flush + checkpoint before persisting spill replay offset.
+			// Channel delivery alone must not advance .off (crash would skip events).
+			done := make(chan struct{})
+			if err := c.send(ctx, out, source.Message{CheckpointBarrier: true, BarrierDone: done}); err != nil {
+				return err
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-done:
+			}
+			if err := c.Spill.PersistReplay(id); err != nil {
+				return err
+			}
 		}
 		if err := c.send(ctx, out, source.Message{Captured: id}); err != nil {
 			return err

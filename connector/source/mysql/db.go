@@ -25,6 +25,12 @@ type sqlDB struct {
 	cfg    definition.Source
 	types  map[string]string
 	server uint32
+	warn   func(string, ...any) // optional; e.g. skipped functional indexes
+}
+
+// SetWarn installs an optional warning callback used during catalog discovery.
+func (d *sqlDB) SetWarn(fn func(string, ...any)) {
+	d.warn = fn
 }
 
 // OpenDB opens the JDBC-style connection used for snapshot reads and checks ROW/FULL.
@@ -296,10 +302,13 @@ WHERE c.table_schema NOT IN ('mysql', 'information_schema', 'performance_schema'
 			at = len(tables) - 1
 			index[id] = at
 		}
+		extraUpper := strings.ToUpper(extra)
 		tables[at].Columns = append(tables[at].Columns, schema.Column{
 			Name: column, Type: colType, Nullable: strings.EqualFold(nullable, "YES"),
-			AutoIncrement: strings.Contains(strings.ToUpper(extra), "AUTO_INCREMENT"),
+			AutoIncrement: strings.Contains(extraUpper, "AUTO_INCREMENT"),
 			Default:       nullString(colDefault),
+			HasDefault:    colDefault.Valid,
+			DefaultExpr:   strings.Contains(extraUpper, "DEFAULT_GENERATED"),
 			Comment:       comment.String,
 			Charset:       charset.String,
 			Collation:     collation.String,
@@ -373,12 +382,20 @@ WHERE t.table_schema NOT IN ('mysql', 'information_schema', 'performance_schema'
 	return rows.Err()
 }
 
+// indexAcc accumulates one secondary index while scanning STATISTICS rows.
+type indexAcc struct {
+	idx    schema.Index
+	order  int
+	skip   bool // functional / unsupported part seen
+	reason string
+}
+
 func (d *sqlDB) fillIndexes(ctx context.Context, tables []schema.Table, onlyDB, onlyTable string) error {
 	if len(tables) == 0 {
 		return nil
 	}
 	query := `
-SELECT table_schema, table_name, index_name, non_unique, seq_in_index, column_name
+SELECT table_schema, table_name, index_name, non_unique, seq_in_index, column_name, sub_part, index_type
 FROM information_schema.statistics
 WHERE table_schema NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')
   AND index_name <> 'PRIMARY'`
@@ -397,15 +414,13 @@ WHERE table_schema NOT IN ('mysql', 'information_schema', 'performance_schema', 
 	for i := range tables {
 		byID[tables[i].Database+"."+tables[i].Table] = &tables[i]
 	}
-	type acc struct {
-		idx   schema.Index
-		order int
-	}
-	pending := map[string]map[string]*acc{}
+	pending := map[string]map[string]*indexAcc{}
 	for rows.Next() {
-		var dbName, tableName, indexName, column string
+		var dbName, tableName, indexName, indexType string
 		var nonUnique, seq int
-		if err := rows.Scan(&dbName, &tableName, &indexName, &nonUnique, &seq, &column); err != nil {
+		var column sql.NullString
+		var subPart sql.NullInt64
+		if err := rows.Scan(&dbName, &tableName, &indexName, &nonUnique, &seq, &column, &subPart, &indexType); err != nil {
 			return err
 		}
 		id := dbName + "." + tableName
@@ -413,30 +428,79 @@ WHERE table_schema NOT IN ('mysql', 'information_schema', 'performance_schema', 
 			continue
 		}
 		if pending[id] == nil {
-			pending[id] = map[string]*acc{}
+			pending[id] = map[string]*indexAcc{}
 		}
 		item := pending[id][indexName]
 		if item == nil {
-			item = &acc{idx: schema.Index{Name: indexName, Unique: nonUnique == 0}, order: seq}
+			item = &indexAcc{
+				idx:   schema.Index{Name: indexName, Unique: nonUnique == 0, Type: indexType},
+				order: seq,
+			}
 			pending[id][indexName] = item
 		}
-		item.idx.Columns = append(item.idx.Columns, column)
+		if item.skip {
+			continue
+		}
+		name, prefix, ok := indexColumnFromStats(column, subPart)
+		if !ok {
+			// Functional indexes (MySQL 8+) expose NULL column_name; schema.Index
+			// cannot represent expressions — skip rather than emit wrong DDL.
+			item.skip = true
+			item.reason = "functional index"
+			item.idx.Columns = nil
+			item.idx.Prefixes = nil
+			continue
+		}
+		item.idx.Columns = append(item.idx.Columns, name)
+		item.idx.Prefixes = append(item.idx.Prefixes, prefix)
+		if item.idx.Type == "" {
+			item.idx.Type = indexType
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
 	for id, indexes := range pending {
-		tab := byID[id]
-		names := make([]string, 0, len(indexes))
-		for name := range indexes {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			tab.Indexes = append(tab.Indexes, indexes[name].idx)
-		}
+		attachDiscoveredIndexes(byID[id], indexes, d.warn)
 	}
 	return nil
+}
+
+// attachDiscoveredIndexes appends supported indexes and warns when an index was
+// deliberately skipped (e.g. functional-index parts with NULL column_name).
+func attachDiscoveredIndexes(tab *schema.Table, indexes map[string]*indexAcc, warn func(string, ...any)) {
+	if tab == nil || len(indexes) == 0 {
+		return
+	}
+	names := make([]string, 0, len(indexes))
+	for name := range indexes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	id := tab.Database + "." + tab.Table
+	for _, name := range names {
+		item := indexes[name]
+		if item.skip || len(item.idx.Columns) == 0 {
+			if item.skip && warn != nil {
+				warn("skipping unsupported index during discovery",
+					"table", id, "index", name, "reason", item.reason)
+			}
+			continue
+		}
+		tab.Indexes = append(tab.Indexes, item.idx)
+	}
+}
+
+// indexColumnFromStats maps one information_schema.STATISTICS column row.
+// ok is false when column_name is NULL (functional index expression).
+func indexColumnFromStats(column sql.NullString, subPart sql.NullInt64) (name string, prefix int, ok bool) {
+	if !column.Valid || column.String == "" {
+		return "", 0, false
+	}
+	if subPart.Valid && subPart.Int64 > 0 {
+		prefix = int(subPart.Int64)
+	}
+	return column.String, prefix, true
 }
 
 type pkPart struct {

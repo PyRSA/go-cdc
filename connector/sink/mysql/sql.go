@@ -71,8 +71,8 @@ func CreateTableSQL(table schema.Table) (string, error) {
 		if column.AutoIncrement {
 			parts = append(parts, "AUTO_INCREMENT")
 		}
-		if column.Default != "" {
-			parts = append(parts, "DEFAULT", formatDefault(column.Default))
+		if column.HasDefault {
+			parts = append(parts, "DEFAULT", formatDefault(column))
 		}
 		if column.Comment != "" {
 			parts = append(parts, "COMMENT", quoteString(column.Comment))
@@ -92,11 +92,22 @@ func CreateTableSQL(table schema.Table) (string, error) {
 		}
 		quoted := make([]string, len(index.Columns))
 		for i, name := range index.Columns {
-			quoted[i] = schema.Quote(name)
+			part := schema.Quote(name)
+			if i < len(index.Prefixes) && index.Prefixes[i] > 0 {
+				part = fmt.Sprintf("%s(%d)", part, index.Prefixes[i])
+			}
+			quoted[i] = part
 		}
 		kind := "KEY"
 		if index.Unique {
 			kind = "UNIQUE KEY"
+		}
+		// FULLTEXT / SPATIAL need their own keywords; BTREE/HASH stay as KEY/UNIQUE KEY.
+		switch strings.ToUpper(index.Type) {
+		case "FULLTEXT":
+			kind = "FULLTEXT KEY"
+		case "SPATIAL":
+			kind = "SPATIAL KEY"
 		}
 		cols = append(cols, fmt.Sprintf("%s %s (%s)", kind, schema.Quote(index.Name), strings.Join(quoted, ", ")))
 	}
@@ -117,8 +128,22 @@ func CreateTableSQL(table schema.Table) (string, error) {
 	return sql, nil
 }
 
-func formatDefault(def string) string {
-	trim := strings.TrimSpace(def)
+func formatDefault(column schema.Column) string {
+	trim := strings.TrimSpace(column.Default)
+	if column.DefaultExpr {
+		if trim == "" {
+			return "NULL"
+		}
+		// information_schema may omit outer parentheses for generated defaults.
+		if strings.HasPrefix(trim, "(") {
+			return trim
+		}
+		return "(" + trim + ")"
+	}
+	// Explicit empty-string default (HasDefault + "") must stay DEFAULT ''.
+	if column.Default == "" {
+		return quoteString("")
+	}
 	upper := strings.ToUpper(trim)
 	switch {
 	case upper == "NULL":

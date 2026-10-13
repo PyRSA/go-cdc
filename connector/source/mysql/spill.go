@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"bufio"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,15 @@ import (
 var ErrSpillClosed = errors.New("spill closed")
 
 // Spill is one on-disk binlog queue directory, with a file per snapshotting table.
+// Filenames are hex(tableID) so distinct ids cannot collide.
+//
+// Durability model (at-least-once):
+//   - AppendBatch is atomic per transaction via a trailing fence line + Sync.
+//   - Drain delivers events through fn but does not persist replay progress.
+//     Callers must establish sink+checkpoint durability (e.g. CheckpointBarrier)
+//     then call PersistReplay before treating the queue as consumed, or Remove
+//     the files after Captured is checkpointed. A crash before PersistReplay/
+//     Remove re-delivers spill events (duplicates), never skips them.
 type Spill struct {
 	dir string
 	mu  sync.Mutex
@@ -37,9 +47,12 @@ type spillTable struct {
 	closed   bool
 }
 
+// spillLine is one JSON line in the spill file.
+// Event rows carry Event; a batch ends with Fence=true (Event nil).
 type spillLine struct {
 	Pos   checkpoint.Position `json:"pos"`
-	Event event.Event         `json:"event"`
+	Event *event.Event        `json:"event,omitempty"`
+	Fence bool                `json:"fence,omitempty"`
 }
 
 // OpenSpill prepares a spill directory. Existing files are opened lazily per table.
@@ -48,7 +61,7 @@ func OpenSpill(dir string) *Spill {
 }
 
 func spillPaths(dir, id string) (binlog, off string) {
-	base := filepath.Join(dir, strings.ReplaceAll(id, ".", "_"))
+	base := filepath.Join(dir, hex.EncodeToString([]byte(id)))
 	return base + ".binlog", base + ".off"
 }
 
@@ -58,10 +71,10 @@ func (s *Spill) table(id string) (*spillTable, error) {
 	if tab, ok := s.tab[id]; ok {
 		return tab, nil
 	}
-	binlogPath, offPath := spillPaths(s.dir, id)
 	if err := os.MkdirAll(s.dir, 0o755); err != nil {
 		return nil, err
 	}
+	binlogPath, offPath := spillPaths(s.dir, id)
 	tab := &spillTable{path: binlogPath, offPath: offPath}
 	if err := tab.open(); err != nil {
 		return nil, err
@@ -94,19 +107,27 @@ func (t *spillTable) open() error {
 			return err
 		}
 		size = trimmed
+		trimmed, err = truncateIncompleteBatch(f, t.path, size)
+		if err != nil {
+			_ = f.Close()
+			return err
+		}
+		size = trimmed
 	}
 	if _, err := f.Seek(0, io.SeekEnd); err != nil {
 		_ = f.Close()
 		return err
 	}
 	t.f = f
+	// .off is only written by PersistReplay after sink+checkpoint durability.
+	// Drain itself never persists progress, so a crash mid-Drain re-delivers.
 	replayed, err := readOff(t.offPath)
 	if err != nil {
 		_ = f.Close()
 		return err
 	}
-	if replayed > size {
-		replayed = size
+	if replayed < 0 || replayed > size {
+		replayed = 0
 	}
 	t.replayed = replayed
 	last, has, err := scanLastPosition(t.path, size)
@@ -148,6 +169,74 @@ func truncatePartialLine(f *os.File, size int64) (int64, error) {
 		return 0, err
 	}
 	return 0, nil
+}
+
+// truncateIncompleteBatch drops a trailing unfenced event prefix so a crashed
+// AppendBatch cannot advance LastPosition / xid dedup. Batches always end with
+// a fence line; if none are present the whole file is an incomplete first
+// AppendBatch and is truncated to empty.
+func truncateIncompleteBatch(f *os.File, path string, size int64) (int64, error) {
+	if size == 0 {
+		return 0, nil
+	}
+	src, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer src.Close()
+	reader := bufio.NewReader(src)
+	var (
+		offset      int64
+		lastFenceAt int64
+		sawFence    bool
+	)
+	for offset < size {
+		line, err := reader.ReadBytes('\n')
+		if len(line) == 0 && errors.Is(err, io.EOF) {
+			break
+		}
+		end := offset + int64(len(line))
+		if errors.Is(err, io.EOF) && (len(line) == 0 || line[len(line)-1] != '\n') {
+			// incomplete trailing line already handled by truncatePartialLine
+			break
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			return 0, err
+		}
+		trim := line
+		if len(trim) > 0 && trim[len(trim)-1] == '\n' {
+			trim = trim[:len(trim)-1]
+		}
+		if len(trim) == 0 {
+			offset = end
+			continue
+		}
+		var row spillLine
+		if err := json.Unmarshal(trim, &row); err != nil {
+			return 0, fmt.Errorf("spill: decode %s: %w", path, err)
+		}
+		if row.Fence {
+			sawFence = true
+			lastFenceAt = end
+		}
+		offset = end
+		if errors.Is(err, io.EOF) {
+			break
+		}
+	}
+	if !sawFence {
+		if err := f.Truncate(0); err != nil {
+			return 0, err
+		}
+		return 0, nil
+	}
+	if lastFenceAt < size {
+		if err := f.Truncate(lastFenceAt); err != nil {
+			return 0, err
+		}
+		return lastFenceAt, nil
+	}
+	return size, nil
 }
 
 func readOff(path string) (int64, error) {
@@ -192,8 +281,10 @@ func scanLastPosition(path string, size int64) (checkpoint.Position, bool, error
 		return checkpoint.Position{}, false, err
 	}
 	defer f.Close()
-	var last checkpoint.Position
-	has := false
+	var (
+		last checkpoint.Position
+		has  bool
+	)
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	for sc.Scan() {
@@ -205,12 +296,18 @@ func scanLastPosition(path string, size int64) (checkpoint.Position, bool, error
 		if err := json.Unmarshal(line, &row); err != nil {
 			return checkpoint.Position{}, false, fmt.Errorf("spill: decode %s: %w", path, err)
 		}
-		last, has = row.Pos, true
+		if row.Fence {
+			last, has = row.Pos, true
+		}
 	}
-	return last, has, sc.Err()
+	if err := sc.Err(); err != nil {
+		return checkpoint.Position{}, false, err
+	}
+	return last, has, nil
 }
 
 // AppendBatch writes one transaction's events for a table and syncs once.
+// Progress (LastPosition / xid dedup) advances only after a fence line is synced.
 func (s *Spill) AppendBatch(id string, pos checkpoint.Position, items []event.Event) error {
 	tab, err := s.table(id)
 	if err != nil {
@@ -221,17 +318,38 @@ func (s *Spill) AppendBatch(id string, pos checkpoint.Position, items []event.Ev
 	if tab.closed {
 		return ErrSpillClosed
 	}
-	for _, item := range items {
-		row := spillLine{Pos: pos, Event: item}
+	start, err := tab.f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	rollback := func() {
+		_ = tab.f.Truncate(start)
+		_, _ = tab.f.Seek(0, io.SeekEnd)
+	}
+	for i := range items {
+		ev := items[i]
+		row := spillLine{Pos: pos, Event: &ev}
 		body, err := json.Marshal(row)
 		if err != nil {
+			rollback()
 			return err
 		}
 		if _, err := tab.f.Write(append(body, '\n')); err != nil {
+			rollback()
 			return err
 		}
 	}
+	fence, err := json.Marshal(spillLine{Pos: pos, Fence: true})
+	if err != nil {
+		rollback()
+		return err
+	}
+	if _, err := tab.f.Write(append(fence, '\n')); err != nil {
+		rollback()
+		return err
+	}
 	if err := tab.f.Sync(); err != nil {
+		rollback()
 		return err
 	}
 	tab.last, tab.hasLast = pos, true
@@ -239,6 +357,7 @@ func (s *Spill) AppendBatch(id string, pos checkpoint.Position, items []event.Ev
 }
 
 // Drain replays unread spill rows then closes the table queue.
+// It does not persist replay offsets; see PersistReplay and package comment.
 func (s *Spill) Drain(id string, fn func(event.Event) error) error {
 	tab, err := s.table(id)
 	if err != nil {
@@ -258,13 +377,21 @@ func (s *Spill) Drain(id string, fn func(event.Event) error) error {
 			}
 			tab.mu.Lock()
 			tab.replayed = row.end
-			writeErr := writeOff(tab.offPath, tab.replayed)
 			tab.mu.Unlock()
-			if writeErr != nil {
-				return writeErr
-			}
 		}
 	}
+}
+
+// PersistReplay writes the in-memory replay offset after the caller has made
+// delivered events durable (sink flush + checkpoint). Safe to call after Drain.
+func (s *Spill) PersistReplay(id string) error {
+	tab, err := s.table(id)
+	if err != nil {
+		return err
+	}
+	tab.mu.Lock()
+	defer tab.mu.Unlock()
+	return writeOff(tab.offPath, tab.replayed)
 }
 
 type spillBatchRow struct {
@@ -318,7 +445,15 @@ func (t *spillTable) readBatch() ([]spillBatchRow, error) {
 		if err := json.Unmarshal(trim, &row); err != nil {
 			return nil, fmt.Errorf("spill: decode: %w", err)
 		}
-		batch = append(batch, spillBatchRow{event: row.Event, end: end})
+		if row.Fence {
+			offset = end
+			continue
+		}
+		if row.Event == nil {
+			offset = end
+			continue
+		}
+		batch = append(batch, spillBatchRow{event: *row.Event, end: end})
 		offset = end
 	}
 	if _, err := t.f.Seek(0, io.SeekEnd); err != nil {
@@ -353,16 +488,32 @@ func (s *Spill) Remove(id string) error {
 		tab.mu.Lock()
 		tab.closed = true
 		if tab.f != nil {
-			_ = tab.f.Close()
+			if err := tab.f.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+				tab.mu.Unlock()
+				s.mu.Unlock()
+				return fmt.Errorf("spill: close %s: %w", id, err)
+			}
 			tab.f = nil
 		}
 		tab.mu.Unlock()
 	}
-	s.mu.Unlock()
 	binlogPath, offPath := spillPaths(s.dir, id)
-	_ = os.Remove(binlogPath)
-	_ = os.Remove(offPath)
-	return nil
+	if tab != nil {
+		binlogPath, offPath = tab.path, tab.offPath
+	}
+	s.mu.Unlock()
+	var first error
+	for _, path := range []string{binlogPath, offPath} {
+		if path == "" {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if first == nil {
+				first = fmt.Errorf("spill: remove %s: %w", path, err)
+			}
+		}
+	}
+	return first
 }
 
 func xidAlreadySpilled(last checkpoint.Position, hasLast bool, pos checkpoint.Position) bool {

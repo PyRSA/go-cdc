@@ -97,6 +97,7 @@ func (s *Set) ProjectTable(table schema.Table) schema.Table {
 	}
 	for i := range out.Indexes {
 		out.Indexes[i].Columns = append([]string(nil), table.Indexes[i].Columns...)
+		out.Indexes[i].Prefixes = append([]int(nil), table.Indexes[i].Prefixes...)
 	}
 	if s == nil {
 		return filterIndexes(out)

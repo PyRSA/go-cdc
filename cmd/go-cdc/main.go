@@ -71,6 +71,9 @@ func run(args []string) int {
 		logger.Error("open source", "err", err)
 		return 1
 	}
+	db.SetWarn(func(msg string, args ...any) {
+		logger.Warn(msg, args...)
+	})
 	pipe.Source.ServerID = db.ServerID()
 	stream, err := mysqlsrc.OpenStream(pipe.Source)
 	if err != nil {
@@ -95,7 +98,10 @@ func run(args []string) int {
 		if state.HasSnapshot(id) {
 			continue
 		}
-		_ = spill.Remove(id)
+		if err := spill.Remove(id); err != nil {
+			logger.Error("spill cleanup", "table", id, "err", err)
+			return 1
+		}
 	}
 	capture := &mysqlsrc.Capture{
 		Config:      pipe.Source,

@@ -494,11 +494,12 @@ func TestCapturedSaveFailureSkipsRemove(t *testing.T) {
 
 type recordingSpill struct {
 	removed []string
+	err     error
 }
 
 func (r *recordingSpill) Remove(id string) error {
 	r.removed = append(r.removed, id)
-	return nil
+	return r.err
 }
 
 type schemaSink struct {
