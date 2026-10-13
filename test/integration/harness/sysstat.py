@@ -39,7 +39,9 @@ def _read_cpu_jiffies() -> tuple[int, int] | None:
     if len(fields) < 4:
         return None
     idle = fields[3] + (fields[4] if len(fields) > 4 else 0)  # idle + iowait
-    return idle, sum(fields)
+    # guest/guest_nice (fields[8]/[9]) are already included in user/nice.
+    total = sum(fields[:8])
+    return idle, total
 
 
 def format_disk(path: str | Path | None = None) -> str:
