@@ -20,16 +20,23 @@ import (
 // ErrSpillClosed is returned when AppendBatch runs after Drain closed the table queue.
 var ErrSpillClosed = errors.New("spill closed")
 
+// ErrSpillCorrupt is returned when a table's spill file could not be rolled back
+// after a failed AppendBatch. The process should exit; a new OpenSpill truncates
+// any trailing unfenced prefix on reopen.
+var ErrSpillCorrupt = errors.New("spill corrupt")
+
 // Spill is one on-disk binlog queue directory, with a file per snapshotting table.
 // Filenames are hex(tableID) so distinct ids cannot collide.
 //
 // Durability model (at-least-once):
 //   - AppendBatch is atomic per transaction via a trailing fence line + Sync.
+//     If rollback after a failed write/Sync itself fails, the table is marked
+//     corrupt; further AppendBatch/Drain/PersistReplay return ErrSpillCorrupt.
 //   - Drain delivers events through fn but does not persist replay progress.
-//     Callers must establish sink+checkpoint durability (e.g. CheckpointBarrier)
-//     then call PersistReplay before treating the queue as consumed, or Remove
-//     the files after Captured is checkpointed. A crash before PersistReplay/
-//     Remove re-delivers spill events (duplicates), never skips them.
+//     On fn/read error, in-memory replayed is restored so the same Spill
+//     instance can Drain again without skipping. Callers must still establish
+//     sink+checkpoint durability then PersistReplay (or Remove after Captured).
+//     A crash before PersistReplay/Remove re-delivers spill events (duplicates).
 type Spill struct {
 	dir string
 	mu  sync.Mutex
@@ -45,6 +52,7 @@ type spillTable struct {
 	last     checkpoint.Position
 	hasLast  bool
 	closed   bool
+	corrupt  bool
 }
 
 // spillLine is one JSON line in the spill file.
@@ -315,6 +323,9 @@ func (s *Spill) AppendBatch(id string, pos checkpoint.Position, items []event.Ev
 	}
 	tab.mu.Lock()
 	defer tab.mu.Unlock()
+	if tab.corrupt {
+		return fmt.Errorf("spill: %w", ErrSpillCorrupt)
+	}
 	if tab.closed {
 		return ErrSpillClosed
 	}
@@ -322,35 +333,44 @@ func (s *Spill) AppendBatch(id string, pos checkpoint.Position, items []event.Ev
 	if err != nil {
 		return err
 	}
-	rollback := func() {
-		_ = tab.f.Truncate(start)
-		_, _ = tab.f.Seek(0, io.SeekEnd)
+	rollback := func() error {
+		if err := tab.f.Truncate(start); err != nil {
+			return err
+		}
+		if _, err := tab.f.Seek(0, io.SeekEnd); err != nil {
+			return err
+		}
+		return nil
+	}
+	fail := func(err error) error {
+		if rbErr := rollback(); rbErr != nil {
+			// Mark corrupt only — do not set closed. closed means "Drain finished";
+			// conflating it makes an in-flight Drain treat EOF and return success.
+			tab.corrupt = true
+			return fmt.Errorf("spill: append %s: %w (rollback: %v): %w", id, err, rbErr, ErrSpillCorrupt)
+		}
+		return err
 	}
 	for i := range items {
 		ev := items[i]
 		row := spillLine{Pos: pos, Event: &ev}
 		body, err := json.Marshal(row)
 		if err != nil {
-			rollback()
-			return err
+			return fail(err)
 		}
 		if _, err := tab.f.Write(append(body, '\n')); err != nil {
-			rollback()
-			return err
+			return fail(err)
 		}
 	}
 	fence, err := json.Marshal(spillLine{Pos: pos, Fence: true})
 	if err != nil {
-		rollback()
-		return err
+		return fail(err)
 	}
 	if _, err := tab.f.Write(append(fence, '\n')); err != nil {
-		rollback()
-		return err
+		return fail(err)
 	}
 	if err := tab.f.Sync(); err != nil {
-		rollback()
-		return err
+		return fail(err)
 	}
 	tab.last, tab.hasLast = pos, true
 	return nil
@@ -358,21 +378,48 @@ func (s *Spill) AppendBatch(id string, pos checkpoint.Position, items []event.Ev
 
 // Drain replays unread spill rows then closes the table queue.
 // It does not persist replay offsets; see PersistReplay and package comment.
+// If fn or readBatch fails (or the table is corrupt at empty EOF), in-memory
+// replayed is restored so a later Drain on the same Spill instance redelivers
+// from the replayed value captured at Drain start.
 func (s *Spill) Drain(id string, fn func(event.Event) error) error {
 	tab, err := s.table(id)
 	if err != nil {
 		return err
 	}
+	tab.mu.Lock()
+	if tab.corrupt {
+		tab.mu.Unlock()
+		return fmt.Errorf("spill: %w", ErrSpillCorrupt)
+	}
+	startReplayed := tab.replayed
+	tab.mu.Unlock()
+
+	rollbackReplay := func() {
+		tab.mu.Lock()
+		tab.replayed = startReplayed
+		tab.closed = false
+		tab.mu.Unlock()
+	}
+
 	for {
 		batch, err := tab.readBatch()
 		if err != nil {
+			rollbackReplay()
 			return err
 		}
 		if len(batch) == 0 {
+			tab.mu.Lock()
+			corrupt := tab.corrupt
+			tab.mu.Unlock()
+			if corrupt {
+				rollbackReplay()
+				return fmt.Errorf("spill: %w", ErrSpillCorrupt)
+			}
 			return nil
 		}
 		for _, row := range batch {
 			if err := fn(row.event); err != nil {
+				rollbackReplay()
 				return err
 			}
 			tab.mu.Lock()
@@ -391,6 +438,9 @@ func (s *Spill) PersistReplay(id string) error {
 	}
 	tab.mu.Lock()
 	defer tab.mu.Unlock()
+	if tab.corrupt {
+		return fmt.Errorf("spill: %w", ErrSpillCorrupt)
+	}
 	return writeOff(tab.offPath, tab.replayed)
 }
 
@@ -402,6 +452,9 @@ type spillBatchRow struct {
 func (t *spillTable) readBatch() ([]spillBatchRow, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.corrupt {
+		return nil, fmt.Errorf("spill: %w", ErrSpillCorrupt)
+	}
 	if t.closed {
 		return nil, nil
 	}

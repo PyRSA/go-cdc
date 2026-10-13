@@ -8,6 +8,34 @@ import (
 	"github.com/PyRSA/go-cdc/common/schema"
 )
 
+// TestColumnDefaultDiscoveryMapping mirrors db.go column default wiring
+// (HasDefault from NullString.Valid, DefaultExpr from DEFAULT_GENERATED).
+func TestColumnDefaultDiscoveryMapping(t *testing.T) {
+	cases := []struct {
+		name       string
+		colDefault sql.NullString
+		extra      string
+		wantDef    string
+		wantHas    bool
+		wantExpr   bool
+	}{
+		{"no default", sql.NullString{}, "", "", false, false},
+		{"empty string", sql.NullString{Valid: true, String: ""}, "", "", true, false},
+		{"literal", sql.NullString{Valid: true, String: "x"}, "", "x", true, false},
+		{"generated expr", sql.NullString{Valid: true, String: "(1 + 1)"}, "DEFAULT_GENERATED", "(1 + 1)", true, true},
+		{"generated case", sql.NullString{Valid: true, String: "uuid()"}, "default_generated", "uuid()", true, true},
+	}
+	for _, tc := range cases {
+		def := nullString(tc.colDefault)
+		has := tc.colDefault.Valid
+		expr := strings.Contains(strings.ToUpper(tc.extra), "DEFAULT_GENERATED")
+		if def != tc.wantDef || has != tc.wantHas || expr != tc.wantExpr {
+			t.Fatalf("%s: got def=%q has=%v expr=%v want def=%q has=%v expr=%v",
+				tc.name, def, has, expr, tc.wantDef, tc.wantHas, tc.wantExpr)
+		}
+	}
+}
+
 func TestIndexColumnFromStats(t *testing.T) {
 	name, prefix, ok := indexColumnFromStats(sql.NullString{String: "name", Valid: true}, sql.NullInt64{})
 	if !ok || name != "name" || prefix != 0 {

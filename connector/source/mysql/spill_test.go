@@ -152,6 +152,119 @@ func TestDrainCrashBeforePersistReplayRedelivers(t *testing.T) {
 	}
 }
 
+func TestDrainSameInstanceRetryAfterCallbackError(t *testing.T) {
+	dir := t.TempDir()
+	spill := OpenSpill(dir)
+	id := "db.t"
+	ev1 := event.Event{Op: event.OpCreate, Database: "db", Table: "t", After: map[string]any{"id": "1"}}
+	ev2 := event.Event{Op: event.OpCreate, Database: "db", Table: "t", After: map[string]any{"id": "2"}}
+	if err := spill.AppendBatch(id, checkpoint.Position{File: "mysql-bin.000001", Pos: 100}, []event.Event{ev1, ev2}); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	err := spill.Drain(id, func(event.Event) error {
+		n++
+		if n == 1 {
+			return nil // handed off; not yet PersistReplay
+		}
+		return errors.New("inject fail on second event")
+	})
+	if err == nil {
+		t.Fatal("expected injected error")
+	}
+	// Same Spill instance must redeliver both events (replayed rolled back).
+	var ids []string
+	if err := spill.Drain(id, func(item event.Event) error {
+		ids = append(ids, item.After["id"].(string))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 2 || ids[0] != "1" || ids[1] != "2" {
+		t.Fatalf("same-instance retry want [1 2], got %#v", ids)
+	}
+}
+
+func TestAppendBatchRejectedWhenCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	spill := OpenSpill(dir)
+	id := "db.t"
+	if err := spill.AppendBatch(id, checkpoint.Position{File: "mysql-bin.000001", Pos: 100}, []event.Event{
+		{Op: event.OpCreate, Database: "db", Table: "t", After: map[string]any{"id": "1"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tab, err := spill.table(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// fail() marks corrupt (not closed) when write/Sync fails and Truncate/Seek
+	// rollback also fails; further AppendBatch/Drain/PersistReplay must return
+	// ErrSpillCorrupt so dirty bytes are not extended.
+	tab.mu.Lock()
+	tab.corrupt = true
+	if tab.closed {
+		t.Fatal("fail() must mark corrupt without setting closed")
+	}
+	tab.mu.Unlock()
+
+	err = spill.AppendBatch(id, checkpoint.Position{File: "mysql-bin.000001", Pos: 200}, []event.Event{
+		{Op: event.OpCreate, Database: "db", Table: "t", After: map[string]any{"id": "2"}},
+	})
+	if err == nil || !errors.Is(err, ErrSpillCorrupt) {
+		t.Fatalf("want ErrSpillCorrupt, got %v", err)
+	}
+	if err := spill.Drain(id, func(event.Event) error { return nil }); err == nil || !errors.Is(err, ErrSpillCorrupt) {
+		t.Fatalf("Drain on corrupt table want ErrSpillCorrupt, got %v", err)
+	}
+	if err := spill.PersistReplay(id); err == nil || !errors.Is(err, ErrSpillCorrupt) {
+		t.Fatalf("PersistReplay on corrupt table want ErrSpillCorrupt, got %v", err)
+	}
+	tab.mu.Lock()
+	corrupt, closed := tab.corrupt, tab.closed
+	tab.mu.Unlock()
+	if !corrupt || closed {
+		t.Fatalf("after reject want corrupt && !closed, got corrupt=%v closed=%v", corrupt, closed)
+	}
+}
+
+func TestDrainFailsIfCorruptMidFlight(t *testing.T) {
+	// Approximates mid-Drain corrupt (as if AppendBatch rollback failed
+	// concurrently): corrupt must not look like a successful empty Drain.
+	dir := t.TempDir()
+	spill := OpenSpill(dir)
+	id := "db.t"
+	if err := spill.AppendBatch(id, checkpoint.Position{File: "mysql-bin.000001", Pos: 100}, []event.Event{
+		{Op: event.OpCreate, Database: "db", Table: "t", After: map[string]any{"id": "1"}},
+		{Op: event.OpCreate, Database: "db", Table: "t", After: map[string]any{"id": "2"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := spill.Drain(id, func(event.Event) error {
+		tab, err := spill.table(id)
+		if err != nil {
+			return err
+		}
+		tab.mu.Lock()
+		tab.corrupt = true
+		tab.mu.Unlock()
+		return nil
+	})
+	if err == nil || !errors.Is(err, ErrSpillCorrupt) {
+		t.Fatalf("Drain must return ErrSpillCorrupt when table turns corrupt mid-flight, got %v", err)
+	}
+	tab, err := spill.table(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tab.mu.Lock()
+	corrupt, closed := tab.corrupt, tab.closed
+	tab.mu.Unlock()
+	if !corrupt || closed {
+		t.Fatalf("mid-flight corrupt want corrupt && !closed, got corrupt=%v closed=%v", corrupt, closed)
+	}
+}
+
 func TestPersistReplaySkipsAlreadyDurableEvents(t *testing.T) {
 	dir := t.TempDir()
 	spill := OpenSpill(dir)

@@ -109,12 +109,18 @@ func TestCreateTableSQLIndexKindsAndPrefix(t *testing.T) {
 			{Name: "id", Type: "bigint"},
 			{Name: "a", Type: "varchar(64)"},
 			{Name: "b", Type: "varchar(64)"},
+			{Name: "body", Type: "text"},
+			{Name: "pt", Type: "point", Nullable: false},
 		},
 		PrimaryKeys: []string{"id"},
 		Indexes: []schema.Index{
 			{Name: "idx_a", Columns: []string{"a"}, Prefixes: []int{16}},
 			{Name: "idx_ab", Columns: []string{"a", "b"}, Prefixes: []int{0, 8}},
 			{Name: "uk_b", Unique: true, Columns: []string{"b"}},
+			{Name: "ft_body", Type: "FULLTEXT", Columns: []string{"body"}},
+			// Unique must not override FULLTEXT/SPATIAL keywords.
+			{Name: "ft_a", Type: "FULLTEXT", Unique: true, Columns: []string{"a"}},
+			{Name: "sp_pt", Type: "SPATIAL", Columns: []string{"pt"}},
 		},
 	})
 	if err != nil {
@@ -124,11 +130,17 @@ func TestCreateTableSQLIndexKindsAndPrefix(t *testing.T) {
 		"KEY `idx_a` (`a`(16))",
 		"KEY `idx_ab` (`a`, `b`(8))",
 		"UNIQUE KEY `uk_b` (`b`)",
+		"FULLTEXT KEY `ft_body` (`body`)",
+		"FULLTEXT KEY `ft_a` (`a`)",
+		"SPATIAL KEY `sp_pt` (`pt`)",
 	}
 	for _, part := range need {
 		if !strings.Contains(sql, part) {
 			t.Fatalf("missing %q in %s", part, sql)
 		}
+	}
+	if strings.Contains(sql, "UNIQUE KEY `ft_a`") {
+		t.Fatalf("FULLTEXT must not become UNIQUE KEY: %s", sql)
 	}
 }
 
