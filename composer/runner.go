@@ -3,7 +3,6 @@ package composer
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/PyRSA/go-cdc/common/event"
@@ -17,9 +16,14 @@ import (
 	"github.com/PyRSA/go-cdc/runtime/transform"
 )
 
+// SpillFiles removes per-table spill artifacts after a durable checkpoint save.
+type SpillFiles interface {
+	Remove(id string) error
+}
+
 // Run reads capture messages, writes them through one sink, and replaces the
 // checkpoint file on the configured interval and on shutdown.
-func Run(ctx context.Context, pipe *definition.Pipeline, msgs <-chan source.Message, sk sink.Sink, store checkpoint.Store, state checkpoint.State) error {
+func Run(ctx context.Context, pipe *definition.Pipeline, msgs <-chan source.Message, sk sink.Sink, store checkpoint.Store, state checkpoint.State, spill SpillFiles) error {
 	state.Normalize()
 	rules, err := transform.Compile(pipe.Transforms)
 	if err != nil {
@@ -87,10 +91,10 @@ func Run(ctx context.Context, pipe *definition.Pipeline, msgs <-chan source.Mess
 					return err
 				}
 			}
-			if err := applyMessage(pipe, rules, routes, sk, &state, &batch, msg); err != nil {
+			if err := applyMessage(pipe, rules, routes, sk, &state, &batch, msg, save, spill); err != nil {
 				return err
 			}
-			if msg.Split != nil || msg.Position != nil || msg.Watermark != nil || msg.Captured != "" || (pipe.Sink.WriteBatchSize > 0 && len(batch) >= pipe.Sink.WriteBatchSize) {
+			if msg.Split != nil || msg.Position != nil || msg.Watermark != nil || msg.Captured != "" || msg.SnapshotTable != "" || (pipe.Sink.WriteBatchSize > 0 && len(batch) >= pipe.Sink.WriteBatchSize) {
 				if err := flush(); err != nil {
 					return err
 				}
@@ -99,9 +103,14 @@ func Run(ctx context.Context, pipe *definition.Pipeline, msgs <-chan source.Mess
 	}
 }
 
-func applyMessage(pipe *definition.Pipeline, rules *transform.Set, routes *route.Set, sk sink.Sink, state *checkpoint.State, batch *[]event.Event, msg source.Message) error {
+func applyMessage(pipe *definition.Pipeline, rules *transform.Set, routes *route.Set, sk sink.Sink, state *checkpoint.State, batch *[]event.Event, msg source.Message, save func() error, spill SpillFiles) error {
 	if msg.Watermark != nil && state.LowWatermark == nil {
 		state.LowWatermark = &checkpoint.Position{File: msg.Watermark.File, Pos: msg.Watermark.Pos, GTID: msg.Watermark.GTID}
+	}
+	if msg.SnapshotTable != "" && msg.SnapshotMark != nil {
+		state.AddSnapshot(msg.SnapshotTable, checkpoint.Position{
+			File: msg.SnapshotMark.File, Pos: msg.SnapshotMark.Pos, GTID: msg.SnapshotMark.GTID,
+		})
 	}
 	if msg.Schema != nil {
 		if err := applyCatalog(pipe, rules, routes, sk, state, *msg.Schema); err != nil {
@@ -122,9 +131,30 @@ func applyMessage(pipe *definition.Pipeline, rules *transform.Set, routes *route
 	}
 	if msg.Captured != "" {
 		state.AddCaptured(msg.Captured)
+		state.ClearSnapshot(msg.Captured)
+		if save != nil {
+			if err := save(); err != nil {
+				return err
+			}
+		}
+		if spill != nil {
+			if err := spill.Remove(msg.Captured); err != nil {
+				return err
+			}
+		}
 	}
 	if msg.Position != nil {
 		state.AckedOffset = &checkpoint.Position{File: msg.Position.File, Pos: msg.Position.Pos, GTID: msg.Position.GTID}
+	}
+	if msg.CheckpointBarrier {
+		if save != nil {
+			if err := save(); err != nil {
+				return err
+			}
+		}
+		if msg.BarrierDone != nil {
+			close(msg.BarrierDone)
+		}
 	}
 	return nil
 }
@@ -145,10 +175,10 @@ func applyCatalog(pipe *definition.Pipeline, rules *transform.Set, routes *route
 		Database: table.Database, Table: table.Table,
 		SourceDatabase: table.Database, SourceTable: table.Table,
 	})
-	for _, copy := range routed {
+	for _, dst := range routed {
 		sinkTable := projected
-		sinkTable.Database = copy.Database
-		sinkTable.Table = copy.Table
+		sinkTable.Database = dst.Database
+		sinkTable.Table = dst.Table
 		// Create is best-effort: failure must not exclude the table or stop the job.
 		// A later Write against a missing table fails the job.
 		_ = sk.CreateTable(sinkTable)
@@ -158,18 +188,18 @@ func applyCatalog(pipe *definition.Pipeline, rules *transform.Set, routes *route
 
 func applyDDL(pipe *definition.Pipeline, rules *transform.Set, routes *route.Set, sk sink.Sink, state *checkpoint.State, item event.Event, catalogApplied bool) error {
 	routed := routes.Apply(item)
-	for _, copy := range routed {
-		projection := rules.ProjectedColumns(copy.SourceDatabase, copy.SourceTable)
-		decision := schemaevol.Decide(copy.DDL, projection, pipe.Sink.DropTruncate)
+	for _, dst := range routed {
+		projection := rules.ProjectedColumns(dst.SourceDatabase, dst.SourceTable)
+		decision := schemaevol.Decide(dst.DDL, projection, pipe.Sink.DropTruncate)
 		change := decision.Change
-		change.Database = copy.Database
-		change.Table = copy.Table
-		change.DDL = schemaevol.RewriteTable(copy.DDL, copy.Database, copy.Table)
+		change.Database = dst.Database
+		change.Table = dst.Table
+		change.DDL = schemaevol.RewriteTable(dst.DDL, dst.Database, dst.Table)
 		if pipe.Sink.Type == "stdout" {
-			change.DDL = copy.DDL
-			if copy.SourceDatabase != "" {
-				change.Database = copy.SourceDatabase
-				change.Table = copy.SourceTable
+			change.DDL = dst.DDL
+			if dst.SourceDatabase != "" {
+				change.Database = dst.SourceDatabase
+				change.Table = dst.SourceTable
 			}
 			if err := sk.ApplySchema(change); err != nil {
 				return err
@@ -178,15 +208,17 @@ func applyDDL(pipe *definition.Pipeline, rules *transform.Set, routes *route.Set
 		}
 		if decision.Change.Action == schema.ActionCreate && pipe.Sink.AutoCreate {
 			if catalogApplied {
-				state.AddCaptured(copy.SourceID())
+				state.AddCaptured(dst.SourceID())
 				continue
 			}
-			if len(copy.Columns) == 0 {
-				return fmt.Errorf("mysql: CREATE %s has no column metadata", copy.SourceID())
+			if len(dst.Columns) == 0 {
+				// Schema message path already AddCaptured above; empty CREATE without
+				// a prior catalog apply must not pretend the sink table exists.
+				continue
 			}
-			table := schema.Table{Database: copy.Database, Table: copy.Table, Columns: columnsOf(copy), PrimaryKeys: copy.Keys}
+			table := schema.Table{Database: dst.Database, Table: dst.Table, Columns: columnsOf(dst), PrimaryKeys: dst.Keys}
 			_ = sk.CreateTable(table)
-			state.AddCaptured(copy.SourceID())
+			state.AddCaptured(dst.SourceID())
 			continue
 		}
 		if decision.Execute {

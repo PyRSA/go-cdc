@@ -20,11 +20,12 @@ type Split struct {
 
 // State is the whole checkpoint document.
 type State struct {
-	LowWatermark   *Position          `json:"low_watermark"`
-	AckedOffset    *Position          `json:"acked_offset"`
-	FinishedSplits map[string][]Split `json:"finished_splits"`
-	CapturedTables []string           `json:"captured_tables"`
-	ExcludedTables []string           `json:"excluded_tables"`
+	LowWatermark   *Position           `json:"low_watermark"`
+	AckedOffset    *Position           `json:"acked_offset"`
+	FinishedSplits map[string][]Split  `json:"finished_splits"`
+	CapturedTables []string            `json:"captured_tables"`
+	ExcludedTables []string            `json:"excluded_tables"`
+	SnapshotTables map[string]Position `json:"snapshot_tables"`
 }
 
 // Normalize fills nil collections so the file matches the documented shape.
@@ -37,6 +38,9 @@ func (s *State) Normalize() {
 	}
 	if s.ExcludedTables == nil {
 		s.ExcludedTables = []string{}
+	}
+	if s.SnapshotTables == nil {
+		s.SnapshotTables = map[string]Position{}
 	}
 }
 
@@ -74,6 +78,27 @@ func (s *State) AddExcluded(id string) {
 	if !s.HasExcluded(id) {
 		s.ExcludedTables = append(s.ExcludedTables, id)
 	}
+}
+
+// HasSnapshot reports whether the table id is in snapshot_tables.
+func (s State) HasSnapshot(id string) bool {
+	if s.SnapshotTables == nil {
+		return false
+	}
+	_, ok := s.SnapshotTables[id]
+	return ok
+}
+
+// AddSnapshot records or replaces the binlog mark for a table being snapshotted.
+func (s *State) AddSnapshot(id string, pos Position) {
+	s.Normalize()
+	s.SnapshotTables[id] = pos
+}
+
+// ClearSnapshot removes a table from snapshot_tables.
+func (s *State) ClearSnapshot(id string) {
+	s.Normalize()
+	delete(s.SnapshotTables, id)
 }
 
 // AddSplit records a finished range for a table.

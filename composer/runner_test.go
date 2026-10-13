@@ -38,7 +38,7 @@ func TestRunRecordsSplitAndCommit(t *testing.T) {
 		Runtime:    definition.Runtime{Name: "demo", RouteMode: definition.RouteAllMatch},
 		Checkpoint: definition.Checkpoint{Interval: time.Hour},
 	}
-	if err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}); err != nil {
+	if err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	state, err := (checkpoint.Store{Path: path}).Load()
@@ -71,7 +71,7 @@ func TestCreateFailureDoesNotExclude(t *testing.T) {
 		Runtime:    definition.Runtime{RouteMode: definition.RouteAllMatch},
 		Checkpoint: definition.Checkpoint{Interval: time.Hour},
 	}
-	if err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}); err != nil {
+	if err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	state, err := (checkpoint.Store{Path: path}).Load()
@@ -86,8 +86,10 @@ func TestCreateFailureDoesNotExclude(t *testing.T) {
 	}
 }
 
-func TestCreateWithoutColumnMetadataFails(t *testing.T) {
+func TestCreateWithoutColumnMetadataDoesNotMarkCaptured(t *testing.T) {
+	// Empty-column CREATE without a prior Schema apply must not pretend the sink exists.
 	sk := &orderSink{}
+	path := filepath.Join(t.TempDir(), "checkpoint.ckpt")
 	msgs := make(chan source.Message, 1)
 	msgs <- source.Message{Event: &event.Event{
 		Op: event.OpDDL, Database: "db", Table: "t", SourceDatabase: "db", SourceTable: "t",
@@ -99,12 +101,52 @@ func TestCreateWithoutColumnMetadataFails(t *testing.T) {
 		Runtime:    definition.Runtime{RouteMode: definition.RouteAllMatch},
 		Checkpoint: definition.Checkpoint{Interval: time.Hour},
 	}
-	err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: filepath.Join(t.TempDir(), "checkpoint.ckpt")}, checkpoint.State{})
-	if err == nil {
-		t.Fatal("missing column metadata was not reported")
+	if err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil); err != nil {
+		t.Fatal(err)
 	}
 	if len(sk.created) != 0 {
 		t.Fatalf("created %#v", sk.created)
+	}
+	state, err := (checkpoint.Store{Path: path}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.HasCaptured("db.t") {
+		t.Fatalf("empty CREATE must not mark captured: %#v", state)
+	}
+}
+
+func TestSchemaOnCreateMessageMarksCaptured(t *testing.T) {
+	// Production CREATE commits carry Schema on the same message (catalogApplied).
+	sk := &orderSink{}
+	path := filepath.Join(t.TempDir(), "checkpoint.ckpt")
+	msgs := make(chan source.Message, 1)
+	msgs <- source.Message{
+		Schema: &schema.Table{
+			Database: "db", Table: "t",
+			Columns:     []schema.Column{{Name: "id", Type: "int", Nullable: false}},
+			PrimaryKeys: []string{"id"},
+		},
+		Event: &event.Event{
+			Op: event.OpDDL, Database: "db", Table: "t", SourceDatabase: "db", SourceTable: "t",
+			DDL: "CREATE TABLE db.t (id int)",
+		},
+	}
+	close(msgs)
+	pipe := &definition.Pipeline{
+		Sink:       definition.Sink{Type: "mysql", AutoCreate: true},
+		Runtime:    definition.Runtime{RouteMode: definition.RouteAllMatch},
+		Checkpoint: definition.Checkpoint{Interval: time.Hour},
+	}
+	if err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	state, err := (checkpoint.Store{Path: path}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.HasCaptured("db.t") {
+		t.Fatalf("schema+CREATE should mark captured: %#v", state)
 	}
 }
 
@@ -124,7 +166,7 @@ func TestCreateFailureStillCapturesTheSource(t *testing.T) {
 		Runtime:    definition.Runtime{RouteMode: definition.RouteAllMatch},
 		Checkpoint: definition.Checkpoint{Interval: time.Hour},
 	}
-	if err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}); err != nil {
+	if err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	state, err := (checkpoint.Store{Path: path}).Load()
@@ -159,7 +201,7 @@ func TestFanoutWriteToMissingSinkFailsJob(t *testing.T) {
 		Checkpoint: definition.Checkpoint{Interval: time.Hour},
 	}
 	path := filepath.Join(t.TempDir(), "checkpoint.ckpt")
-	err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{})
+	err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil)
 	if err == nil {
 		t.Fatal("write to missing sink table should fail the job")
 	}
@@ -191,7 +233,7 @@ func TestBatchFlushesAtConfiguredSize(t *testing.T) {
 		Checkpoint: definition.Checkpoint{Interval: time.Hour},
 	}
 	path := filepath.Join(t.TempDir(), "checkpoint.ckpt")
-	if err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}); err != nil {
+	if err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if len(sk.sizes) != 2 || sk.sizes[0] != 2 || sk.sizes[1] != 1 {
@@ -207,7 +249,7 @@ func TestShutdownSaveErrorIsReturned(t *testing.T) {
 		Runtime:    definition.Runtime{RouteMode: definition.RouteAllMatch},
 		Checkpoint: definition.Checkpoint{Interval: time.Hour},
 	}
-	err := Run(ctx, pipe, nil, &orderSink{}, checkpoint.Store{Path: filepath.Join(t.TempDir(), "missing", "checkpoint.ckpt")}, checkpoint.State{})
+	err := Run(ctx, pipe, nil, &orderSink{}, checkpoint.Store{Path: filepath.Join(t.TempDir(), "missing", "checkpoint.ckpt")}, checkpoint.State{}, nil)
 	if err != nil {
 		t.Fatal("cancelled run with a writable path should save and return nil, got", err)
 	}
@@ -215,7 +257,7 @@ func TestShutdownSaveErrorIsReturned(t *testing.T) {
 	if writeErr := os.WriteFile(blocked, []byte("x"), 0o644); writeErr != nil {
 		t.Fatal(writeErr)
 	}
-	err = Run(ctx, pipe, nil, &orderSink{}, checkpoint.Store{Path: filepath.Join(blocked, "checkpoint.ckpt")}, checkpoint.State{})
+	err = Run(ctx, pipe, nil, &orderSink{}, checkpoint.Store{Path: filepath.Join(blocked, "checkpoint.ckpt")}, checkpoint.State{}, nil)
 	if err == nil {
 		t.Fatal("save failure on shutdown was ignored")
 	}
@@ -251,7 +293,7 @@ func TestCatalogCreatesProjectedTableBeforeRows(t *testing.T) {
 		Checkpoint: definition.Checkpoint{Interval: time.Hour},
 	}
 	path := filepath.Join(t.TempDir(), "checkpoint.ckpt")
-	if err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}); err != nil {
+	if err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if sk.writeBeforeCreate || len(sk.created) != 1 || sk.writes != 1 {
@@ -332,7 +374,7 @@ func TestStdoutDDLPrintsSourceSQL(t *testing.T) {
 		Runtime:    definition.Runtime{RouteMode: definition.RouteAllMatch},
 		Checkpoint: definition.Checkpoint{Interval: time.Hour},
 	}
-	if err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: filepath.Join(t.TempDir(), "checkpoint.ckpt")}, checkpoint.State{}); err != nil {
+	if err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: filepath.Join(t.TempDir(), "checkpoint.ckpt")}, checkpoint.State{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if len(sk.applied) != 1 || sk.applied[0] != "ALTER TABLE db.users ADD COLUMN name varchar(32)" {
@@ -363,7 +405,7 @@ func TestFanoutCapturesSourceWhenOneSinkCreateFails(t *testing.T) {
 		Checkpoint: definition.Checkpoint{Interval: time.Hour},
 	}
 	path := filepath.Join(t.TempDir(), "checkpoint.ckpt")
-	if err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}); err != nil {
+	if err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	state, err := (checkpoint.Store{Path: path}).Load()
@@ -393,12 +435,71 @@ func TestAddColumnOutsideProjectionIsNotExecuted(t *testing.T) {
 		Checkpoint: definition.Checkpoint{Interval: time.Hour},
 	}
 	path := filepath.Join(t.TempDir(), "checkpoint.ckpt")
-	if err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}); err != nil {
+	if err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if len(sk.applied) != 0 {
 		t.Fatalf("excluded column was executed: %#v", sk.applied)
 	}
+}
+
+func TestCapturedSaveThenRemovesSpill(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "checkpoint.ckpt")
+	spill := &recordingSpill{}
+	msgs := make(chan source.Message, 1)
+	msgs <- source.Message{Captured: "db.order"}
+	close(msgs)
+	pipe := &definition.Pipeline{
+		Sink:       definition.Sink{Type: "stdout"},
+		Runtime:    definition.Runtime{RouteMode: definition.RouteAllMatch},
+		Checkpoint: definition.Checkpoint{Interval: time.Hour},
+	}
+	if err := Run(context.Background(), pipe, msgs, &orderSink{}, checkpoint.Store{Path: path}, checkpoint.State{}, spill); err != nil {
+		t.Fatal(err)
+	}
+	if len(spill.removed) != 1 || spill.removed[0] != "db.order" {
+		t.Fatalf("removed %#v", spill.removed)
+	}
+	state, err := (checkpoint.Store{Path: path}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.HasCaptured("db.order") {
+		t.Fatalf("%#v", state)
+	}
+}
+
+func TestCapturedSaveFailureSkipsRemove(t *testing.T) {
+	spill := &recordingSpill{}
+	blocked := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocked, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	msgs := make(chan source.Message, 1)
+	msgs <- source.Message{Captured: "db.order"}
+	close(msgs)
+	pipe := &definition.Pipeline{
+		Sink:       definition.Sink{Type: "stdout"},
+		Runtime:    definition.Runtime{RouteMode: definition.RouteAllMatch},
+		Checkpoint: definition.Checkpoint{Interval: time.Hour},
+	}
+	err := Run(context.Background(), pipe, msgs, &orderSink{}, checkpoint.Store{Path: filepath.Join(blocked, "checkpoint.ckpt")}, checkpoint.State{}, spill)
+	if err == nil {
+		t.Fatal("expected save failure")
+	}
+	if len(spill.removed) != 0 {
+		t.Fatalf("Remove ran despite save failure: %#v", spill.removed)
+	}
+}
+
+type recordingSpill struct {
+	removed []string
+	err     error
+}
+
+func (r *recordingSpill) Remove(id string) error {
+	r.removed = append(r.removed, id)
+	return r.err
 }
 
 type schemaSink struct {

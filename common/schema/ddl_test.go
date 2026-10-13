@@ -20,6 +20,8 @@ func TestClassify(t *testing.T) {
 		{"DROP TABLE IF EXISTS tests.users", ActionDropTable, "tests", "users", "", ""},
 		{"TRUNCATE TABLE tests.users", ActionTruncate, "tests", "users", "", ""},
 		{"ALTER TABLE users ADD INDEX idx_name (name)", ActionIndex, "", "users", "", ""},
+		{"ALTER TABLE users ADD FULLTEXT INDEX ft_body (body)", ActionIndex, "", "users", "", ""},
+		{"ALTER TABLE users ADD SPATIAL INDEX sp_pt (pt)", ActionIndex, "", "users", "", ""},
 		{"RENAME TABLE tests.users TO tests.people", ActionRenameTable, "tests", "users", "", ""},
 	}
 	for _, tc := range cases {

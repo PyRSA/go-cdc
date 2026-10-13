@@ -24,29 +24,32 @@ type Pipeline struct {
 
 // Source is the MySQL capture configuration.
 type Source struct {
-	Hostname          string
-	Port              int
-	Username          string
-	Password          string
-	Tables            *Selector
-	TablesInclude     string
-	TablesExclude     string
-	ServerID          uint32
-	TimeZone          string
-	StartupMode       string
-	SpecificFile      string
-	SpecificPos       uint32
-	SpecificGTID      string
-	SkipEvents        int
-	SkipRows          int
-	TimestampMillis   int64
-	ChunkSize         int
-	ChunkKeyColumn    string
-	FetchSize         int
-	SchemaChange      bool
-	ConnectTimeout    time.Duration
-	HeartbeatInterval time.Duration
-	JDBCProperties    map[string]string
+	Hostname              string
+	Port                  int
+	Username              string
+	Password              string
+	Tables                *Selector
+	TablesInclude         string
+	TablesExclude         string
+	ServerID              uint32
+	TimeZone              string
+	StartupMode           string
+	SpecificFile          string
+	SpecificPos           uint32
+	SpecificGTID          string
+	SkipEvents            int
+	SkipRows              int
+	TimestampMillis       int64
+	ChunkSize             int
+	ChunkKeyColumn        string
+	FetchSize             int
+	SchemaChange          bool
+	NewlyAddedTable       bool
+	NewlyAddedSnapshot    bool
+	BinlogNewlyAddedTable bool
+	ConnectTimeout        time.Duration
+	HeartbeatInterval     time.Duration
+	JDBCProperties        map[string]string
 }
 
 // Sink is stdout or MySQL for this release.

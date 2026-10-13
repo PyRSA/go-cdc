@@ -40,7 +40,7 @@ See [`configs/demo-mysql.yaml`](../../configs/demo-mysql.yaml). Target table nam
 | `port` | no | `3306` | Integer | Port |
 | `username` | yes | — | String | User |
 | `password` | yes | — | String | Password |
-| `auto-create-table` | no | `true` | Boolean | Create database/table from inferred schema when missing |
+| `auto-create-table` | no | `true` | Boolean | Create database/table from inferred schema when missing (columns after projection/route, plus comments, charset/collation, defaults, secondary/unique indexes; no FK/ENGINE/partition; `AUTO_INCREMENT` starts at 1) |
 | `write-batch-size` | no | `1000` | Integer | Flush when the batch reaches this many events (≥ 1) |
 | `write-batch-interval` | no | `1s` | Duration | Time-based flush; `0` disables the timer |
 | `max-retries` | no | `3` | Integer | Extra write attempts after failure (≥ 0) |
@@ -51,6 +51,7 @@ See [`configs/demo-mysql.yaml`](../../configs/demo-mysql.yaml). Target table nam
 - Without `route`, the sink table name stays as the event’s `database.table`.
 - With `route`, writes go to the mapped table.
 - Batching is applied by the job runner before calling the sink.
+- JDBC pool defaults (code, not YAML): `MaxIdleConns=1`, `ConnMaxLifetime=30m`, `ConnMaxIdleTime=10m`. Write retries stay on `max-retries` only.
 
 ## Related Docs
 

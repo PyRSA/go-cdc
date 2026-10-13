@@ -34,7 +34,6 @@ var rejectedExact = map[string]struct{}{
 	"metadata.list":                     {},
 	"treat-tinyint1-as-boolean.enabled": {},
 	"use.legacy.json.format":            {},
-	"scan.newly-added-table.enabled":    {},
 }
 
 // Parse decodes a pipeline YAML document and applies defaults.
@@ -94,15 +93,16 @@ func parseSource(raw map[string]any) (Source, error) {
 		return Source{}, configErr("source", "required")
 	}
 	out := Source{
-		Port:              defaultPort,
-		TimeZone:          "UTC",
-		StartupMode:       StartupInitial,
-		ChunkSize:         defaultChunkSize,
-		FetchSize:         defaultFetchSize,
-		SchemaChange:      true,
-		ConnectTimeout:    30 * time.Second,
-		HeartbeatInterval: 30 * time.Second,
-		JDBCProperties:    map[string]string{},
+		Port:               defaultPort,
+		TimeZone:           "UTC",
+		StartupMode:        StartupInitial,
+		ChunkSize:          defaultChunkSize,
+		FetchSize:          defaultFetchSize,
+		SchemaChange:       true,
+		NewlyAddedSnapshot: true,
+		ConnectTimeout:     30 * time.Second,
+		HeartbeatInterval:  30 * time.Second,
+		JDBCProperties:     map[string]string{},
 	}
 	var tables, exclude string
 	for key, value := range raw {
@@ -206,6 +206,24 @@ func parseSource(raw map[string]any) (Source, error) {
 				return Source{}, configf("source.schema-change.enabled", "%v", err)
 			}
 			out.SchemaChange = b
+		case "scan.newly-added-table.enabled":
+			b, err := asBool(value)
+			if err != nil {
+				return Source{}, configf("source.scan.newly-added-table.enabled", "%v", err)
+			}
+			out.NewlyAddedTable = b
+		case "scan.newly-added-table.snapshot.enabled":
+			b, err := asBool(value)
+			if err != nil {
+				return Source{}, configf("source.scan.newly-added-table.snapshot.enabled", "%v", err)
+			}
+			out.NewlyAddedSnapshot = b
+		case "scan.binlog.newly-added-table.enabled":
+			b, err := asBool(value)
+			if err != nil {
+				return Source{}, configf("source.scan.binlog.newly-added-table.enabled", "%v", err)
+			}
+			out.BinlogNewlyAddedTable = b
 		case "connect.timeout":
 			d, err := asDuration(value)
 			if err != nil {

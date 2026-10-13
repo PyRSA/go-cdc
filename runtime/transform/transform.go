@@ -83,19 +83,28 @@ func (s *Set) Validate(database, table string, columns []string) error {
 
 // ProjectTable keeps the projected columns and the sink business key.
 // A primary key that the projection drops is not copied onto the sink table.
+// Secondary indexes that reference a dropped column are discarded.
 func (s *Set) ProjectTable(table schema.Table) schema.Table {
 	out := schema.Table{
 		Database:    table.Database,
 		Table:       table.Table,
+		Comment:     table.Comment,
+		Charset:     table.Charset,
+		Collation:   table.Collation,
 		Columns:     append([]schema.Column(nil), table.Columns...),
 		PrimaryKeys: append([]string(nil), table.PrimaryKeys...),
+		Indexes:     append([]schema.Index(nil), table.Indexes...),
+	}
+	for i := range out.Indexes {
+		out.Indexes[i].Columns = append([]string(nil), table.Indexes[i].Columns...)
+		out.Indexes[i].Prefixes = append([]int(nil), table.Indexes[i].Prefixes...)
 	}
 	if s == nil {
-		return out
+		return filterIndexes(out)
 	}
 	rule, ok := s.match(table.Database, table.Table)
 	if !ok {
-		return out
+		return filterIndexes(out)
 	}
 	if len(rule.columns) > 0 {
 		byName := map[string]schema.Column{}
@@ -113,7 +122,7 @@ func (s *Set) ProjectTable(table schema.Table) schema.Table {
 	}
 	if len(rule.keys) > 0 {
 		out.PrimaryKeys = append([]string(nil), rule.keys...)
-		return out
+		return filterIndexes(out)
 	}
 	keep := map[string]struct{}{}
 	for _, column := range out.Columns {
@@ -126,7 +135,29 @@ func (s *Set) ProjectTable(table schema.Table) schema.Table {
 		}
 	}
 	out.PrimaryKeys = keys
-	return out
+	return filterIndexes(out)
+}
+
+func filterIndexes(table schema.Table) schema.Table {
+	keep := map[string]struct{}{}
+	for _, column := range table.Columns {
+		keep[strings.ToLower(column.Name)] = struct{}{}
+	}
+	indexes := make([]schema.Index, 0, len(table.Indexes))
+	for _, index := range table.Indexes {
+		ok := true
+		for _, column := range index.Columns {
+			if _, found := keep[strings.ToLower(column)]; !found {
+				ok = false
+				break
+			}
+		}
+		if ok && len(index.Columns) > 0 {
+			indexes = append(indexes, index)
+		}
+	}
+	table.Indexes = indexes
+	return table
 }
 
 // Apply projects and filters one event.

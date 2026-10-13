@@ -29,10 +29,34 @@ route:
     sink-table: ${FUNC_SNK_DB}.tp01_rows_out
   - source-table: '${FUNC_SRC_DB}\.tp02_keys'
     sink-table: ${FUNC_SNK_DB}.tp02_keys_out
-  - source-table: '${FUNC_SRC_DB}\.tp09_add'
-    sink-table: ${FUNC_SNK_DB}.tp09_add_out
-  - source-table: '${FUNC_SRC_DB}\.tp10_ddl'
-    sink-table: ${FUNC_SNK_DB}.tp10_ddl_out
+  - source-table: '${FUNC_SRC_DB}\.tp10_add'
+    sink-table: ${FUNC_SNK_DB}.tp10_add_out
+  - source-table: '${FUNC_SRC_DB}\.tp11_ddl'
+    sink-table: ${FUNC_SNK_DB}.tp11_ddl_out
+  - source-table: '${FUNC_SRC_DB}\.tp15_diff'
+    sink-table: ${FUNC_SNK_DB}.tp15_diff_out
+  - source-table: '${FUNC_SRC_DB}\.tp15_crt'
+    sink-table: ${FUNC_SNK_DB}.tp15_crt_out
+  - source-table: '${FUNC_SRC_DB}\.tp16_diff'
+    sink-table: ${FUNC_SNK_DB}.tp16_diff_out
+  - source-table: '${FUNC_SRC_DB}\.tp16_crt'
+    sink-table: ${FUNC_SNK_DB}.tp16_crt_out
+  - source-table: '${FUNC_SRC_DB}\.tp17_diff'
+    sink-table: ${FUNC_SNK_DB}.tp17_diff_out
+  - source-table: '${FUNC_SRC_DB}\.tp17_crt'
+    sink-table: ${FUNC_SNK_DB}.tp17_crt_out
+  - source-table: '${FUNC_SRC_DB}\.tp18_diff'
+    sink-table: ${FUNC_SNK_DB}.tp18_diff_out
+  - source-table: '${FUNC_SRC_DB}\.tp18_crt'
+    sink-table: ${FUNC_SNK_DB}.tp18_crt_out
+  - source-table: '${FUNC_SRC_DB}\.tp19_diff'
+    sink-table: ${FUNC_SNK_DB}.tp19_diff_out
+  - source-table: '${FUNC_SRC_DB}\.tp19_crt'
+    sink-table: ${FUNC_SNK_DB}.tp19_crt_out
+  - source-table: '${FUNC_SRC_DB}\.tp20_diff'
+    sink-table: ${FUNC_SNK_DB}.tp20_diff_out
+  - source-table: '${FUNC_SRC_DB}\.tp20_crt'
+    sink-table: ${FUNC_SNK_DB}.tp20_crt_out
   - source-table: '${FUNC_SRC_DB}\.tp07_fail'
     sink-table: no_such_db.tp07_fail_out
 
@@ -47,10 +71,46 @@ transform:
   - source-table: '${FUNC_SRC_DB}\.tp07_fail'
     projection: id, name
     primary-keys: id
-  - source-table: '${FUNC_SRC_DB}\.tp09_add'
+  - source-table: '${FUNC_SRC_DB}\.tp10_add'
     projection: id, name
     primary-keys: id
-  - source-table: '${FUNC_SRC_DB}\.tp10_ddl'
+  - source-table: '${FUNC_SRC_DB}\.tp11_ddl'
+    projection: id, name
+    primary-keys: id
+  - source-table: '${FUNC_SRC_DB}\.tp15_diff'
+    projection: id, name
+    primary-keys: id
+  - source-table: '${FUNC_SRC_DB}\.tp15_crt'
+    projection: id, name
+    primary-keys: id
+  - source-table: '${FUNC_SRC_DB}\.tp16_diff'
+    projection: id, name
+    primary-keys: id
+  - source-table: '${FUNC_SRC_DB}\.tp16_crt'
+    projection: id, name
+    primary-keys: id
+  - source-table: '${FUNC_SRC_DB}\.tp17_diff'
+    projection: id, name
+    primary-keys: id
+  - source-table: '${FUNC_SRC_DB}\.tp17_crt'
+    projection: id, name
+    primary-keys: id
+  - source-table: '${FUNC_SRC_DB}\.tp18_diff'
+    projection: id, name
+    primary-keys: id
+  - source-table: '${FUNC_SRC_DB}\.tp18_crt'
+    projection: id, name
+    primary-keys: id
+  - source-table: '${FUNC_SRC_DB}\.tp19_diff'
+    projection: id, name
+    primary-keys: id
+  - source-table: '${FUNC_SRC_DB}\.tp19_crt'
+    projection: id, name
+    primary-keys: id
+  - source-table: '${FUNC_SRC_DB}\.tp20_diff'
+    projection: id, name
+    primary-keys: id
+  - source-table: '${FUNC_SRC_DB}\.tp20_crt'
     projection: id, name
     primary-keys: id
 

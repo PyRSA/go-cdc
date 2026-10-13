@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/PyRSA/go-cdc/common/event"
+	"github.com/PyRSA/go-cdc/common/schema"
 	"github.com/PyRSA/go-cdc/composer/definition"
 )
 
@@ -159,6 +160,32 @@ func TestDecimalCompare(t *testing.T) {
 	})
 	if !ok {
 		t.Fatal("decimal string should compare numerically")
+	}
+}
+
+func TestProjectTableDropsIndexOnMissingColumn(t *testing.T) {
+	set, err := Compile([]definition.Transform{{SourceTable: `db\.t`, Projection: "id, name"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := set.ProjectTable(schema.Table{
+		Database: "db", Table: "t", Comment: "tbl", Charset: "utf8mb4",
+		Columns: []schema.Column{
+			{Name: "id", Type: "int"},
+			{Name: "name", Type: "varchar(8)"},
+			{Name: "extra", Type: "int"},
+		},
+		PrimaryKeys: []string{"id"},
+		Indexes: []schema.Index{
+			{Name: "idx_name", Columns: []string{"name"}},
+			{Name: "idx_extra", Columns: []string{"extra"}},
+		},
+	})
+	if out.Comment != "tbl" || out.Charset != "utf8mb4" {
+		t.Fatalf("meta %#v", out)
+	}
+	if len(out.Columns) != 2 || len(out.Indexes) != 1 || out.Indexes[0].Name != "idx_name" {
+		t.Fatalf("%#v", out)
 	}
 }
 

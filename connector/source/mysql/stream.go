@@ -26,6 +26,19 @@ type canalStream struct {
 	handler *handler
 }
 
+// binlogReadTimeout returns the canal/BinlogSyncer client read timeout.
+// Candidate default is 2×heartbeat (60s when heartbeat is unset). Verified against
+// go-mysql v1.16.0: SetReadDeadline is refreshed after each successful packet, so
+// server heartbeats that arrive as packets extend the deadline. This does not
+// prevent the server from closing a dump connection under net_write_timeout when
+// the client is slow to read.
+func binlogReadTimeout(heartbeat time.Duration) time.Duration {
+	if heartbeat <= 0 {
+		return 60 * time.Second
+	}
+	return 2 * heartbeat
+}
+
 // OpenStream builds the binlog reader. Snapshot connections stay on OpenDB.
 func OpenStream(cfg definition.Source) (*canalStream, error) {
 	cc := canal.NewDefaultConfig()
@@ -39,6 +52,11 @@ func OpenStream(cfg definition.Source) (*canalStream, error) {
 		return nil, fmt.Errorf("source.server-id: required")
 	}
 	cc.HeartbeatPeriod = cfg.HeartbeatInterval
+	// ReadTimeout is a client read deadline (go-mysql v1.16.0 refreshes it after each
+	// successful packet). It is not a fix for server-side net_write_timeout when the
+	// consumer blocks in the event handler and stops reading. Runtime disconnects
+	// still rely on canal's reconnect + position recovery.
+	cc.ReadTimeout = binlogReadTimeout(cfg.HeartbeatInterval)
 	cc.Dump.ExecutionPath = ""
 	cc.ParseTime = false
 	if loc, err := locationForZone(cfg.TimeZone); err == nil {
@@ -57,10 +75,11 @@ func OpenStream(cfg definition.Source) (*canalStream, error) {
 	stream := &canalStream{canal: instance, ch: make(chan Commit)}
 	stream.handler = &handler{
 		ch: stream.ch, canal: instance,
-		include:    compilePatterns(cfg.TablesInclude),
-		exclude:    compilePatterns(cfg.TablesExclude),
-		skipEvents: cfg.SkipEvents,
-		skipRows:   cfg.SkipRows,
+		include:          compilePatterns(cfg.TablesInclude),
+		exclude:          compilePatterns(cfg.TablesExclude),
+		skipEvents:       cfg.SkipEvents,
+		skipRows:         cfg.SkipRows,
+		binlogNewlyAdded: cfg.BinlogNewlyAddedTable,
 	}
 	instance.SetEventHandler(stream.handler)
 	return stream, nil
@@ -159,17 +178,34 @@ func (s *canalStream) Close() error {
 
 type handler struct {
 	canal.DummyEventHandler
-	ch         chan Commit
-	canal      *canal.Canal
-	include    []*regexp.Regexp
-	exclude    []*regexp.Regexp
-	gtid       mysql.GTIDSet
-	trackGTID  bool
-	skipEvents int
-	skipRows   int
+	ch               chan Commit
+	canal            *canal.Canal
+	include          []*regexp.Regexp
+	exclude          []*regexp.Regexp
+	allow            map[string]struct{}
+	binlogNewlyAdded bool
+	gtid             mysql.GTIDSet
+	trackGTID        bool
+	skipEvents       int
+	skipRows         int
 }
 
-func (h *handler) captured(database, table string) bool {
+func (s *canalStream) LimitTables(ids []string) {
+	if s.handler == nil {
+		return
+	}
+	if ids == nil {
+		s.handler.allow = nil
+		return
+	}
+	allow := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		allow[id] = struct{}{}
+	}
+	s.handler.allow = allow
+}
+
+func (h *handler) regexMatch(database, table string) bool {
 	if len(h.include) == 0 {
 		return false
 	}
@@ -188,6 +224,32 @@ func (h *handler) captured(database, table string) bool {
 		if fullMatch(re, id) {
 			return false
 		}
+	}
+	return true
+}
+
+func (h *handler) captured(database, table string) bool {
+	id := database + "." + table
+	if h.allow != nil {
+		if _, ok := h.allow[id]; !ok {
+			return false
+		}
+	} else if !h.binlogNewlyAdded {
+		// Callers must LimitTables when the flag is false; refuse open-ended capture.
+		return false
+	}
+	return h.regexMatch(database, table)
+}
+
+// admitCreate accepts a runtime CREATE when C=true even if the table is outside
+// the current allow set (config-diff tables stay blocked for DML until CREATE).
+func (h *handler) admitCreate(database, table string) bool {
+	if !h.binlogNewlyAdded || !h.regexMatch(database, table) {
+		return false
+	}
+	id := database + "." + table
+	if h.allow != nil {
+		h.allow[id] = struct{}{}
 	}
 	return true
 }
@@ -237,7 +299,11 @@ func (h *handler) OnDDL(_ *replication.EventHeader, _ mysql.Position, query *rep
 	if database == "" {
 		database = string(query.Schema)
 	}
-	if !h.captured(database, change.Table) {
+	accepted := h.captured(database, change.Table)
+	if !accepted && change.Action == schema.ActionCreate {
+		accepted = h.admitCreate(database, change.Table)
+	}
+	if !accepted {
 		return nil
 	}
 	if h.dropEvent() {

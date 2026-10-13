@@ -96,7 +96,7 @@ Both MySQL versions start near ~93% lag after the 90s source flood and drain
 toward ≤1% without stalls. 5.7 finishes earlier on this CI run; 8.0 takes
 longer but still converges.
 
-![Load peak catch-up lag % vs time (MySQL 5.7 vs 8.0)](docs/performance/load-peak-catchup-lag.svg)
+![Load peak catch-up lag % vs time (MySQL 5.7 vs 8.0)](load-peak-catchup-lag.svg)
 
 | Catch-up time (s) | MySQL 5.7 lag % | MySQL 8.0 lag % |
 | ---: | ---: | ---: |
