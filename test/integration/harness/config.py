@@ -51,13 +51,35 @@ CDC_SERVER_ID_STDOUT = env("CDC_SERVER_ID_STDOUT", "5612")
 CDC_SERVER_ID_TYPES = env("CDC_SERVER_ID_TYPES", "5614")
 CDC_SERVER_ID_LOAD = env("CDC_SERVER_ID_LOAD", "5615")
 
-# Binary artifact name matches the product: go-cdc (CDC_CLI kept as alias).
-BINARY = env("GO_CDC", env("CDC_CLI", str(WORKDIR / "go-cdc")))
 
-CHECKPOINT_DIR = env("CHECKPOINT_DIR", str(WORKDIR / "ckpts"))
-CHECKPOINT_STDOUT_DIR = env("CHECKPOINT_STDOUT_DIR", str(WORKDIR / "ckpts-stdout"))
-CHECKPOINT_TYPES_DIR = env("CHECKPOINT_TYPES_DIR", str(WORKDIR / "ckpts-types"))
-CHECKPOINT_LOAD_DIR = env("CHECKPOINT_LOAD_DIR", str(WORKDIR / "ckpts-load"))
+def it_rel_path(path: str | Path) -> str:
+    """Paths relative to test/integration for YAML/reports (absolute IT paths rewritten)."""
+    p = Path(path)
+    if not p.is_absolute():
+        return str(p)
+    try:
+        return str(p.resolve().relative_to(IT_ROOT))
+    except ValueError:
+        return str(p)
+
+
+def _abs_under_it(path: str) -> str:
+    """Make path absolute under IT_ROOT when relative (portable across machines)."""
+    p = Path(path)
+    return str(p if p.is_absolute() else IT_ROOT / p)
+
+
+# Runtime binary/checkpoints: absolute under WORKDIR (or IT_ROOT if override is relative).
+# YAML uses it_rel_path() so rendered file-path stays portable.
+BINARY = _abs_under_it(env("GO_CDC", env("CDC_CLI", str(WORKDIR / "go-cdc"))))
+CHECKPOINT_DIR = _abs_under_it(env("CHECKPOINT_DIR", str(WORKDIR / "ckpts")))
+CHECKPOINT_STDOUT_DIR = _abs_under_it(
+    env("CHECKPOINT_STDOUT_DIR", str(WORKDIR / "ckpts-stdout"))
+)
+CHECKPOINT_TYPES_DIR = _abs_under_it(
+    env("CHECKPOINT_TYPES_DIR", str(WORKDIR / "ckpts-types"))
+)
+CHECKPOINT_LOAD_DIR = _abs_under_it(env("CHECKPOINT_LOAD_DIR", str(WORKDIR / "ckpts-load")))
 
 PIPELINE_NAME = "tp_func_pipeline"
 PIPELINE_STDOUT_NAME = "tp_func_stdout"
@@ -91,6 +113,44 @@ def conn_kwargs(user: str, password: str, database: str) -> dict:
         database=database,
         charset="utf8mb4",
     )
+
+
+def project_display_path(path: str | Path) -> str:
+    """Rewrite absolute / IT-relative repo paths as ${PROJECT_ROOT}/... for reports."""
+    text = str(path)
+    root = str(ROOT)
+    if text == root or text.startswith(root + "/"):
+        return "${PROJECT_ROOT}" + text[len(root) :]
+    it = str(IT_ROOT)
+    if text == it or text.startswith(it + "/"):
+        return "${PROJECT_ROOT}/test/integration" + text[len(it) :]
+    # Already relative to test/integration (e.g. workdir/go-cdc).
+    if text.startswith("workdir/") or text == "workdir":
+        return "${PROJECT_ROOT}/test/integration/" + text
+    return text
+
+
+def md_cell(value, *, code: bool = False) -> str:
+    """Single-line Markdown table cell (newlines/pipes would break GFM tables)."""
+    if value is None:
+        text = "NULL"
+    else:
+        text = str(value)
+    text = (
+        text.replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\n", "<br>")
+        .replace("|", "\\|")
+    )
+    if code:
+        text = text.replace("`", "'")
+        return f"`{text}`"
+    return text
+
+
+def sanitize_report_text(text: str) -> str:
+    """Strip absolute repo roots from report bodies (belt-and-suspenders)."""
+    return text.replace(str(ROOT), "${PROJECT_ROOT}")
 
 
 SRC = conn_kwargs(SRC_USER, SRC_PASSWORD, SRC_DB)
@@ -130,10 +190,10 @@ def render_template(tpl_name: str, out_path: Path, extra: dict | None = None) ->
         "CDC_SERVER_ID_STDOUT": CDC_SERVER_ID_STDOUT,
         "CDC_SERVER_ID_TYPES": CDC_SERVER_ID_TYPES,
         "CDC_SERVER_ID_LOAD": CDC_SERVER_ID_LOAD,
-        "CHECKPOINT_DIR": CHECKPOINT_DIR,
-        "CHECKPOINT_STDOUT_DIR": CHECKPOINT_STDOUT_DIR,
-        "CHECKPOINT_TYPES_DIR": CHECKPOINT_TYPES_DIR,
-        "CHECKPOINT_LOAD_DIR": CHECKPOINT_LOAD_DIR,
+        "CHECKPOINT_DIR": it_rel_path(CHECKPOINT_DIR),
+        "CHECKPOINT_STDOUT_DIR": it_rel_path(CHECKPOINT_STDOUT_DIR),
+        "CHECKPOINT_TYPES_DIR": it_rel_path(CHECKPOINT_TYPES_DIR),
+        "CHECKPOINT_LOAD_DIR": it_rel_path(CHECKPOINT_LOAD_DIR),
         "PIPELINE_NAME": PIPELINE_NAME,
         "PIPELINE_STDOUT_NAME": PIPELINE_STDOUT_NAME,
         "PIPELINE_TYPES_NAME": PIPELINE_TYPES_NAME,

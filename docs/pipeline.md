@@ -132,7 +132,7 @@ DDL comes from the source when `source.schema-change.enabled` is `true` (default
 | --- | --- |
 | Add / drop / modify / rename column | May be applied after projection trimming |
 | DROP TABLE / TRUNCATE | Only if `schema.change.drop-truncate.enabled: true` |
-| CREATE TABLE (raw statement) | Not applied as raw SQL; sink tables come from inferred schema / `auto-create-table` |
+| CREATE TABLE (raw statement) | Not applied as raw SQL; MySQL sink builds `CREATE TABLE` from inferred schema / `auto-create-table` (comments, charset/collation, defaults, secondary/unique indexes; no FK/ENGINE/partition) |
 | Other (e.g. index-only) | Usually not executed on MySQL sink |
 
 Stdout sink prints `"op":"ddl"` for DDL that passes the policy.

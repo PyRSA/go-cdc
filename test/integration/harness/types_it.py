@@ -154,12 +154,12 @@ def md_table(rows: list[dict], columns: list[str] | None = None) -> str:
         lines = ["| Column | " + " | ".join(f"row{i+1}" for i in range(len(rows))) + " |",
                  "| --- | " + " | ".join(["---"] * len(rows)) + " |"]
         for c in cols:
-            cells = [str(rows[i].get(c, "")) for i in range(len(rows))]
-            lines.append("| " + c + " | " + " | ".join(cells) + " |")
+            cells = [cfg.md_cell(rows[i].get(c, "")) for i in range(len(rows))]
+            lines.append("| " + cfg.md_cell(c) + " | " + " | ".join(cells) + " |")
         return "\n".join(lines)
     lines = ["| " + " | ".join(cols) + " |", "| " + " | ".join(["---"] * len(cols)) + " |"]
     for r in rows:
-        lines.append("| " + " | ".join(str(r.get(c, "")) for c in cols) + " |")
+        lines.append("| " + " | ".join(cfg.md_cell(r.get(c, "")) for c in cols) + " |")
     return "\n".join(lines)
 
 
@@ -193,7 +193,10 @@ def col_compare(expected: dict, actual: dict, columns: list[str]) -> tuple[bool,
             hit = ev == av
         if not hit:
             ok = False
-        lines.append(f"| `{c}` | `{ev}` | `{av}` | {'✅' if hit else '❌'} |")
+        lines.append(
+            f"| {cfg.md_cell(c, code=True)} | {cfg.md_cell(ev, code=True)} | "
+            f"{cfg.md_cell(av, code=True)} | {'✅' if hit else '❌'} |"
+        )
     lines.append(f"| Summary | | | **{'✅ PASS' if ok else '❌ FAIL'}** |")
     return ok, "\n".join(lines)
 
@@ -586,9 +589,13 @@ def main() -> int:
     stop_job()
     report = write_report()
     failed = [r for r in results if not r.passed]
-    log("REPORT", report)
+    log("REPORT", cfg.project_display_path(report))
     log("PASS", sum(1 for r in results if r.passed), "FAIL", len(failed))
     return 0 if not failed else 1
+
+
+def _tp_anchor(tp_id: str) -> str:
+    return tp_id.lower()
 
 
 def write_report() -> Path:
@@ -598,6 +605,7 @@ def write_report() -> Path:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     lines = [
         "# go-cdc types / timezone integration test report\n",
+        '<a id="overview"></a>\n',
         "## 0. Overview\n",
         f"- Run time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"- MySQL：`{cfg.MYSQL_HOST}:{cfg.MYSQL_PORT}`（default-time-zone=UTC）",
@@ -609,7 +617,10 @@ def write_report() -> Path:
         "| --- | --- | --- |",
     ]
     for r in results:
-        lines.append(f"| {r.id} | {r.title} | {'✅ PASS' if r.passed else '❌ FAIL'} |")
+        lines.append(
+            f"| [{r.id}](#{_tp_anchor(r.id)}) | {r.title} | "
+            f"{'✅ PASS' if r.passed else '❌ FAIL'} |"
+        )
     lines += [
         "",
         "## Type coverage matrix\n",
@@ -621,24 +632,24 @@ def write_report() -> Path:
         "| Temporal | date / time(3) / datetime(6) / timestamp(6) |",
         "| Other | json / enum / set / bit / bool / blob / binary / NULL |",
         "",
+        "## Test points\n",
     ]
     for r in results:
+        anchor = _tp_anchor(r.id)
         lines += [
+            f'<a id="{anchor}"></a>\n',
             f"## {r.id} {r.title}\n",
+            f"- [↑ Overview](#overview)",
             f"- **Result: {'✅ PASS' if r.passed else '❌ FAIL'}**",
             f"- **Action:** {r.action}",
             f"- **Expected:** {r.expected_desc}\n",
-            "### Expected\n",
-            md_table(r.expected_rows),
-            "\n### Actual\n",
-            md_table(r.actual_rows),
-            "\n### Compare\n",
+            "### Expected vs actual\n",
             r.compare_md,
         ]
         if r.extra_md:
             lines += ["\n### Notes\n", r.extra_md]
         lines.append("")
-    path.write_text("\n".join(lines), encoding="utf-8")
+    path.write_text(cfg.sanitize_report_text("\n".join(lines)), encoding="utf-8")
     return path
 
 

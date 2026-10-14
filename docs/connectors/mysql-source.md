@@ -58,10 +58,19 @@ source:
 | `scan.incremental.snapshot.chunk.size` | no | `8096` | Integer | Snapshot chunk size in rows (≥ 1) |
 | `scan.incremental.snapshot.chunk.key-column` | no | first PK | String | Chunk key column |
 | `scan.snapshot.fetch.size` | no | `1024` | Integer | Rows fetched per page inside a chunk (≥ 1) |
+| `scan.newly-added-table.enabled` | no | `false` | Boolean | On resume with `acked_offset` and `initial` mode: whether config-diff tables are included (stop job, edit `tables`, restart from the same checkpoint) |
+| `scan.newly-added-table.snapshot.enabled` | no | `true` | Boolean | When parent is `true`: snapshot+spill for diff tables (`true`) or binlog-only after a warn (`false`); ignored when parent is `false` |
+| `scan.binlog.newly-added-table.enabled` | no | `false` | Boolean | While reading binlog: accept matching runtime `CREATE TABLE` and following rows without backfill |
 | `schema-change.enabled` | no | `true` | Boolean | Whether to capture DDL for schema evolution |
 | `connect.timeout` | no | `30s` | Duration | Connect timeout (≥ `250ms`) |
-| `heartbeat.interval` | no | `30s` | Duration | Heartbeat interval |
+| `heartbeat.interval` | no | `30s` | Duration | Master heartbeat period for the binlog dump connection |
 | `jdbc.properties.*` | no | — | String | Extra JDBC properties, e.g. `jdbc.properties.useSSL: "false"` |
+
+### Connection defaults (code, not YAML)
+
+- Snapshot JDBC pool: `MaxIdleConns=1`, `ConnMaxLifetime=30m`, `ConnMaxIdleTime=10m`.
+- Binlog client `ReadTimeout` defaults to `2 × heartbeat.interval` (or `60s` if heartbeat is unset). In go-mysql v1.16.0 the deadline refreshes after each packet; this does **not** stop the server from closing the dump under `net_write_timeout` when the consumer is slow to read.
+- Runtime dump disconnects use canal reconnect and its in-memory position; job restart uses the checkpoint file. Neither jumps to the latest binlog.
 
 ### `scan.startup.mode`
 

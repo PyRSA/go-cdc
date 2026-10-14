@@ -36,6 +36,12 @@ type Message struct {
 	Split *Split
 	// Captured is a table that must not be snapshotted again.
 	Captured string
+	// SnapshotTable + SnapshotMark mark a table entering concurrent snapshot.
+	SnapshotTable string
+	SnapshotMark  *Position
+	// CheckpointBarrier asks the runner to save before Capture continues.
+	CheckpointBarrier bool
+	BarrierDone       chan struct{}
 	// Schema is the source table definition, delivered before that table's snapshot rows.
 	Schema *schema.Table
 	// Err is a capture failure. The consumer must stop and return it.

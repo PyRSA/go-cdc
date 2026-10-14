@@ -505,7 +505,7 @@ def write_report(timings: dict[str, float] | None = None) -> Path:
             lines.append(r.compare_md + "\n")
         if r.extra_md:
             lines.append(r.extra_md + "\n")
-    path.write_text("\n".join(lines), encoding="utf-8")
+    path.write_text(cfg.sanitize_report_text("\n".join(lines)), encoding="utf-8")
     return path
 
 
@@ -771,7 +771,7 @@ def main() -> int:
         log(f"  {name:20s} {sec:8.1f}s", flush=True)
     report = write_report(timings)
     failed = [r for r in results if not r.passed]
-    log("REPORT", report, flush=True)
+    log("REPORT", cfg.project_display_path(report), flush=True)
     log("PASS", sum(1 for r in results if r.passed), "FAIL", len(failed), flush=True)
     return 0 if not failed else 1
 

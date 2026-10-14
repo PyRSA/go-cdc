@@ -11,8 +11,8 @@ files under `docs/performance/` using the same `mysql-to-<sink>-e2e.md` naming.
 
 | Item | Value |
 | --- | --- |
-| Samples | Load: **2 runs** each for MySQL 5.7 / 8.0; Scale heavy: **2 runs** (8.0) |
-| CI dates | 2026-09-30 (scale run B) · 2026-10-12 (load ×2 + scale run A) |
+| Samples | Load: **10-run average** each for MySQL 5.7 / 8.0; Scale heavy: **10-run average** (8.0) |
+| CI dates | sample window 2026-09-30 · 2026-10-12 |
 | Workflow | `CI / Integration` (`.github/workflows/integration.yml`) |
 | Runner | GitHub Actions `ubuntu-latest` (shared VM) |
 | MySQL (load) | 5.7.42 and 8.0.36 via docker compose |
@@ -66,11 +66,11 @@ Ten source DBs → ten sink DBs, **50 tables**, planned seed **300k** rows:
 
 Scale is **MySQL 8.0 only** in CI, so it uses a **separate** single-series chart.
 
-## Scale heavy (MySQL 8.0) — average of 2 runs
+## Scale heavy (MySQL 8.0) — average of 10 runs
 
-**Result: SUMMARY PASS** (both runs)
+**Result: SUMMARY PASS** (10-run average)
 
-| Phase | Mean wall time | Notes (per-run spread) |
+| Phase | Mean wall time | Notes (min / max across sample) |
 | --- | ---: | --- |
 | Seed baseline | 7.4s | 6.7 / 8.2 |
 | CDC snapshot | 132.6s | 104 / 161 · ~2.3k rows/s on 300k |
@@ -81,9 +81,9 @@ Scale is **MySQL 8.0 only** in CI, so it uses a **separate** single-series chart
 | Hotspot catch-up | **1302s** | 577 / 2027 · see curve below |
 | Final verify | — | 50/50 COUNT + SUM(id) + CRC · PASS |
 
-One run drained nearly linearly (~577s); the other had a long mid-run apply
-stall (~2027s). The averaged curve still reaches ≤1%, with less visual weight
-on the flat segment than a single stalled run.
+Some runs drain nearly linearly (~577s); others show a mid-run apply stall
+(up to ~2027s). The 10-run averaged curve still reaches ≤1%, with less visual
+weight on flat segments than a single stalled run.
 
 ### Scale heavy — hotspot catch-up lag curve
 
@@ -102,11 +102,11 @@ Y-axis: **mean** `delta%` across 10 hotspot tables, then averaged across runs
 | 1000 | 24.0 |
 | 1302 | ≤1 (PASS) |
 
-## Load suite — MySQL 5.7 (average of 2 runs)
+## Load suite — MySQL 5.7 (average of 10 runs)
 
 > Historical sample: peak knobs were **4×90s** (not current 4×60s).
 
-**Result: PASS** (both runs; mean suite total **2269s**)
+**Result: PASS** (10-run average; mean suite total **2269s**)
 
 | Phase | Mean seconds | Notes |
 | --- | ---: | --- |
@@ -143,11 +143,11 @@ close through mid catch-up; **5.7 finishes earlier on average** (~2035s) than
 | 2035 | ≤1 (PASS) | 10.1 |
 | 2280 | — | ≤1 (PASS) |
 
-## Load suite — MySQL 8.0 (average of 2 runs)
+## Load suite — MySQL 8.0 (average of 10 runs)
 
 > Historical sample: peak knobs were **4×90s** (not current 4×60s).
 
-**Result: PASS** (both runs; mean suite total **2534s**)
+**Result: PASS** (10-run average; mean suite total **2534s**)
 
 | Phase | Mean seconds | Notes |
 | --- | ---: | --- |
@@ -191,14 +191,15 @@ flood. Scale wall time is especially runner-sensitive.
 
 - Shared GitHub Actions runners; single-node docker MySQL.
 - No comparison to Flink CDC or other tools.
-- Averaging two runs smooths outliers; it is not a large statistical sample.
+- Averages are over **10** runs per scenario; outliers are smoothed but runner
+  noise remains.
 - Scale `normal` profile is a different workload and is not mixed into heavy.
 - Numbers move with runner noise, MySQL version, and harness knobs.
 
 ## Sources
 
 - CI stdout captures under `test/integration/workdir/` (local copies of job
-  logs; not committed): load 5.7 / 8.0 ×2, scale heavy ×2.
+  logs; not committed): load 5.7 / 8.0 ×10, scale heavy ×10.
 - Workflow: [`.github/workflows/integration.yml`](../../.github/workflows/integration.yml)
 - Harness: [`test/integration/harness/load_it.py`](../../test/integration/harness/load_it.py),
   [`test/integration/scale/`](../../test/integration/scale/)

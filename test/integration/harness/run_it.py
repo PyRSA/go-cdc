@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""go-cdc integration harness: Expected vs Actual tables per TP (TP-01..TP-13)."""
+"""go-cdc integration harness: Expected vs Actual tables per TP (TP-01..TP-20)."""
 from __future__ import annotations
 
 import json
@@ -74,7 +74,7 @@ def md_table(rows: list[dict], columns: list[str] | None = None) -> str:
         "| " + " | ".join(["---"] * len(cols)) + " |",
     ]
     for r in rows:
-        cells = ["NULL" if r.get(c) is None else str(r.get(c)) for c in cols]
+        cells = [cfg.md_cell(r.get(c)) for c in cols]
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
@@ -89,8 +89,9 @@ def side_by_side(expected: list[dict], actual: list[dict], columns: list[str]) -
     e = normalize(expected, columns)
     a = normalize(actual, columns)
     ok = e == a
+    n_cols = 1 + len(columns) * 2 + 1
     header = "| " + " | ".join(["Key/#"] + [f"exp.{c}" for c in columns] + [f"act.{c}" for c in columns] + ["Verdict"]) + " |"
-    sep = "| " + " | ".join(["---"] * (1 + len(columns) * 2 + 1)) + " |"
+    sep = "| " + " | ".join(["---"] * n_cols) + " |"
     lines = [header, sep]
     n = max(len(e), len(a), 1)
     for i in range(n):
@@ -98,12 +99,23 @@ def side_by_side(expected: list[dict], actual: list[dict], columns: list[str]) -
         ar = a[i] if i < len(a) else tuple(["_(extra)_"] * len(columns))
         hit = i < len(e) and i < len(a) and e[i] == a[i]
         key = er[0] if i < len(e) else (ar[0] if i < len(a) else i + 1)
-        row = [str(key)] + [str(x) for x in er] + [str(x) for x in ar] + ["✅" if hit else "❌"]
+        row = (
+            [cfg.md_cell(key)]
+            + [cfg.md_cell(x) for x in er]
+            + [cfg.md_cell(x) for x in ar]
+            + ["✅" if hit else "❌"]
+        )
         lines.append("| " + " | ".join(row) + " |")
     if len(e) != len(a):
         ok = False
-        lines.append(f"| Row count | {len(e)} | | {len(a)} | | ❌ |")
-    lines.append(f"| Summary | | | | | **{'✅ PASS' if ok else '❌ FAIL'}** |")
+        cells = [""] * n_cols
+        cells[0] = "Row count"
+        cells[1] = str(len(e))
+        cells[1 + len(columns)] = str(len(a))
+        cells[-1] = "❌"
+        lines.append("| " + " | ".join(cells) + " |")
+    summary = ["Summary"] + [""] * (n_cols - 2) + [f"**{'✅ PASS' if ok else '❌ FAIL'}**"]
+    lines.append("| " + " | ".join(summary) + " |")
     return ok, "\n".join(lines)
 
 
@@ -196,6 +208,206 @@ def set_tables_pattern(pattern: str):
     YAML.write_text(text, encoding="utf-8")
 
 
+def set_source_flag(key: str, value: bool):
+    """Upsert a boolean source.* key in the rendered pipeline YAML."""
+    text = YAML.read_text(encoding="utf-8")
+    line = f"  {key}: {'true' if value else 'false'}"
+    pattern = re.compile(rf"^  {re.escape(key)}:.*$", re.M)
+    if pattern.search(text):
+        text = pattern.sub(line, text)
+    else:
+        text = re.sub(
+            r"(  scan\.snapshot\.fetch\.size:.*\n)",
+            rf"\1{line}\n",
+            text,
+            count=1,
+        )
+    YAML.write_text(text, encoding="utf-8")
+
+
+def log_contains(needle: str) -> bool:
+    if not LOG.exists():
+        return False
+    return needle in LOG.read_text(encoding="utf-8", errors="replace")
+
+
+def _captured_has(ck: dict, table: str) -> bool:
+    return any(table in str(x) for x in (ck.get("captured_tables") or []))
+
+
+def run_newly_added_combo(
+    *,
+    tp_id: str,
+    title: str,
+    newly_added: bool,
+    snapshot: bool,
+    binlog_newly: bool,
+    diff_table: str,
+    seed_id: int,
+    crt_table: str,
+    crt_id: int,
+    tables_pattern: str,
+    live_id: int | None = None,
+) -> None:
+    """One start with fixed (A,B,C): assert config-diff and runtime CREATE together."""
+    stop_job()
+    time.sleep(1)
+    set_source_flag("scan.newly-added-table.enabled", newly_added)
+    set_source_flag("scan.newly-added-table.snapshot.enabled", snapshot)
+    set_source_flag("scan.binlog.newly-added-table.enabled", binlog_newly)
+    set_tables_pattern(tables_pattern)
+
+    diff_out = f"{diff_table}_out"
+    crt_out = f"{crt_table}_out"
+    try:
+        exec_sql(SNK, f"DROP TABLE IF EXISTS {diff_out}")
+        exec_sql(SNK, f"DROP TABLE IF EXISTS {crt_out}")
+    except Exception:
+        pass
+    exec_sql(SRC, f"DROP TABLE IF EXISTS {crt_table}")
+
+    # snapshot=false: user prepared sink (empty — no seed history).
+    if newly_added and not snapshot:
+        exec_sql(
+            SNK,
+            f"CREATE TABLE {diff_out} ("
+            "id BIGINT PRIMARY KEY, name VARCHAR(64) NOT NULL"
+            ") ENGINE=InnoDB",
+        )
+
+    start_job()
+    time.sleep(3)
+
+    if newly_added and not snapshot:
+        wait_until(
+            lambda: log_contains("scan.newly-added-table.snapshot.enabled=false"),
+            desc=f"{tp_id} snapshot-disabled warn",
+            timeout=30,
+        )
+        assert live_id is not None
+        exec_sql(SRC, f"INSERT INTO {diff_table}(id,name) VALUES ({live_id},'live-{tp_id}')")
+        wait_until(
+            lambda: any(
+                str(r.get("id")) == str(live_id)
+                for r in dump_table(SNK, SINK_DB, diff_out, "id")
+            ),
+            desc=f"{tp_id} diff live row",
+        )
+    elif newly_added and snapshot:
+        wait_until(
+            lambda: table_exists(SNK, SINK_DB, diff_out)
+            and any(
+                str(r.get("id")) == str(seed_id)
+                for r in dump_table(SNK, SINK_DB, diff_out, "id")
+            ),
+            desc=f"{tp_id} diff snapshot seed",
+        )
+    else:
+        # A=false: config-diff must stay ignored even when C=true (CREATE-only).
+        probe_id = seed_id + 1000
+        exec_sql(SRC, f"INSERT INTO {diff_table}(id,name) VALUES ({probe_id},'probe-{tp_id}')")
+        time.sleep(8)
+        if table_exists(SNK, SINK_DB, diff_out) and any(
+            str(r.get("id")) == str(probe_id) for r in dump_table(SNK, SINK_DB, diff_out, "id")
+        ):
+            raise AssertionError(
+                f"{tp_id}: A=false must ignore live INSERT on {diff_table} "
+                f"(saw id={probe_id} on sink)"
+            )
+
+    # Runtime CREATE axis (C).
+    exec_sql(
+        SRC,
+        f"CREATE TABLE {crt_table} ("
+        "id BIGINT PRIMARY KEY, name VARCHAR(64) NOT NULL"
+        ") ENGINE=InnoDB",
+    )
+    exec_sql(SRC, f"INSERT INTO {crt_table}(id,name) VALUES ({crt_id},'crt-{tp_id}')")
+    if binlog_newly:
+        wait_until(
+            lambda: table_exists(SNK, SINK_DB, crt_out)
+            and any(
+                str(r.get("id")) == str(crt_id)
+                for r in dump_table(SNK, SINK_DB, crt_out, "id")
+            ),
+            desc=f"{tp_id} runtime CREATE row",
+        )
+    else:
+        time.sleep(8)
+
+    time.sleep(2)
+    ck = json.loads(CK.read_text()) if CK.exists() else {}
+    diff_rows = dump_table(SNK, SINK_DB, diff_out, "id")
+    crt_rows = dump_table(SNK, SINK_DB, crt_out, "id")
+    has_seed = any(str(r.get("id")) == str(seed_id) for r in diff_rows)
+    has_live = (
+        any(str(r.get("id")) == str(live_id) for r in diff_rows) if live_id is not None else False
+    )
+    has_crt = any(str(r.get("id")) == str(crt_id) for r in crt_rows)
+    diff_cap = _captured_has(ck, diff_table)
+    crt_cap = _captured_has(ck, crt_table)
+    warn_ok = (not newly_added) or snapshot or log_contains(
+        "scan.newly-added-table.snapshot.enabled=false"
+    )
+    job_alive = proc is not None and proc.poll() is None
+
+    if not newly_added:
+        diff_ok = (not table_exists(SNK, SINK_DB, diff_out)) and (not diff_cap) and (not has_seed)
+    elif snapshot:
+        diff_ok = has_seed and diff_cap
+    else:
+        diff_ok = (not has_seed) and has_live and diff_cap and warn_ok
+
+    if binlog_newly:
+        crt_ok = has_crt and crt_cap
+    else:
+        crt_ok = (not table_exists(SNK, SINK_DB, crt_out)) and (not crt_cap) and (not has_crt)
+
+    ok = diff_ok and crt_ok and job_alive
+    flags = f"A={str(newly_added).lower()} B={str(snapshot).lower()} C={str(binlog_newly).lower()}"
+    cmp_md = (
+        "| Check | Expected | Actual | Verdict |\n| --- | --- | --- | --- |\n"
+        f"| flags | {flags} | {flags} | ✅ |\n"
+        f"| config-diff ok | yes | {'yes' if diff_ok else 'no'} | {'✅' if diff_ok else '❌'} |\n"
+        f"| runtime CREATE ok | yes | {'yes' if crt_ok else 'no'} | {'✅' if crt_ok else '❌'} |\n"
+        f"| diff seed id={seed_id} | "
+        f"{'present' if newly_added and snapshot else 'absent'} | "
+        f"{'yes' if has_seed else 'no'} | "
+        f"{'✅' if (has_seed if (newly_added and snapshot) else not has_seed) else '❌'} |\n"
+        f"| crt id={crt_id} | {'present' if binlog_newly else 'absent'} | "
+        f"{'yes' if has_crt else 'no'} | "
+        f"{'✅' if (has_crt if binlog_newly else not has_crt) else '❌'} |\n"
+        f"| job running | yes | {'yes' if job_alive else 'no'} | {'✅' if job_alive else '❌'} |\n"
+        f"| Summary | | | **{'✅ PASS' if ok else '❌ FAIL'}** |"
+    )
+    record(
+        TPResult(
+            id=tp_id,
+            title=title,
+            action=(
+                f"{flags}; add {diff_table} to tables; restart; "
+                f"runtime CREATE {crt_table}+INSERT({crt_id})"
+            ),
+            expected_desc=(
+                f"diff={'snapshot' if newly_added and snapshot else ('binlog-only' if newly_added else 'ignore')}; "
+                f"CREATE={'follow' if binlog_newly else 'drop'}"
+            ),
+            expected_rows=[{"ok": "yes"}],
+            actual_rows=[{"ok": "yes" if ok else "no"}],
+            columns=["ok"],
+            extra_md=(
+                f"#### {diff_out}\n"
+                + md_table(diff_rows, ["id", "name"])
+                + f"\n\n#### {crt_out}\n"
+                + md_table(crt_rows, ["id", "name"])
+                + "\n"
+            ),
+        ),
+        override=ok,
+        compare_md=cmp_md,
+    )
+
+
 def _checkpoint_shape_ok(ck: dict) -> bool:
     """True when acked_offset has file+pos and/or a non-empty gtid (no values leaked)."""
     ao = ck.get("acked_offset")
@@ -235,8 +447,20 @@ def main() -> int:
     for t in [
         "tp01_rows_out",
         "tp02_keys_out",
-        "tp09_add_out",
-        "tp10_ddl_out",
+        "tp10_add_out",
+        "tp11_ddl_out",
+        "tp16_diff_out",
+        "tp16_crt_out",
+        "tp17_diff_out",
+        "tp17_crt_out",
+        "tp18_diff_out",
+        "tp18_crt_out",
+        "tp19_diff_out",
+        "tp19_crt_out",
+        "tp20_diff_out",
+        "tp20_crt_out",
+        "tp20_diff_out",
+        "tp20_crt_out",
         "tp07_fail_out",
     ]:
         try:
@@ -430,7 +654,7 @@ def main() -> int:
         compare_md=cmp7,
     )
 
-    # TP-08
+    # TP-09
     exec_sql(SRC, "ALTER TABLE tp01_rows ADD COLUMN remark VARCHAR(32) NULL")
     exec_sql(SRC, "ALTER TABLE tp01_rows ADD COLUMN tag VARCHAR(32) NULL")
     exec_sql(SRC, "ALTER TABLE tp01_rows MODIFY name VARCHAR(128) NOT NULL")
@@ -452,7 +676,7 @@ def main() -> int:
     )
     record(
         TPResult(
-            id="TP-08",
+            id="TP-09",
             title="Extra projected columns not applied; in-projection type change applied",
             action="ADD remark/tag；MODIFY name VARCHAR(128)",
             expected_desc="Columns still id,name,city; name=varchar(128)",
@@ -465,19 +689,22 @@ def main() -> int:
         compare_md=cmp8,
     )
 
-    # TP-09
+    # TP-10 — newly-added=true + snapshot=true (original scenario; flags explicit)
     stop_job()
     time.sleep(2)
-    set_tables_pattern(rf"{SRC_DB}\\.tp(01_rows|02_keys|07_fail|09_add)")
+    set_source_flag("scan.newly-added-table.enabled", True)
+    set_source_flag("scan.newly-added-table.snapshot.enabled", True)
+    set_source_flag("scan.binlog.newly-added-table.enabled", False)
+    set_tables_pattern(rf"{SRC_DB}\\.tp(01_rows|02_keys|07_fail|10_add)")
     users_before = dump_table(SNK, SINK_DB, "tp01_rows_out", "id")
     start_job()
     wait_until(
-        lambda: table_exists(SNK, SINK_DB, "tp09_add_out")
-        and len(dump_table(SNK, SINK_DB, "tp09_add_out", "id")) >= 1,
-        desc="tp09_add snapshot",
+        lambda: table_exists(SNK, SINK_DB, "tp10_add_out")
+        and len(dump_table(SNK, SINK_DB, "tp10_add_out", "id")) >= 1,
+        desc="tp10_add snapshot",
     )
     time.sleep(2)
-    actual_kept = dump_table(SNK, SINK_DB, "tp09_add_out", "id")
+    actual_kept = dump_table(SNK, SINK_DB, "tp10_add_out", "id")
     users_after = dump_table(SNK, SINK_DB, "tp01_rows_out", "id")
     bob_in = any(str(r.get("id")) == "2" for r in users_after)
     ok9 = (
@@ -487,10 +714,13 @@ def main() -> int:
     )
     record(
         TPResult(
-            id="TP-09",
+            id="TP-10",
             title="After stop, add existing table: backfill that table only",
-            action="Add tp09_add to config and restart from saved resume state",
-            expected_desc="tp09_add=(7,add-row); tp01_rows unchanged; no id=2",
+            action=(
+                "scan.newly-added-table.enabled=true + snapshot.enabled=true; "
+                "add tp10_add; restart from saved resume state"
+            ),
+            expected_desc="tp10_add=(7,add-row); tp01_rows unchanged; no id=2",
             expected_rows=[{"id": 7, "name": "add-row"}],
             actual_rows=actual_kept,
             columns=["id", "name"],
@@ -505,48 +735,52 @@ def main() -> int:
         override=ok9,
     )
 
-    # TP-10
+    # TP-11 — binlog.newly-added=true (original scenario; flag explicit)
     stop_job()
     time.sleep(1)
-    set_tables_pattern(rf"{SRC_DB}\\.tp(01_rows|02_keys|07_fail|09_add|10_ddl)")
+    set_source_flag("scan.newly-added-table.enabled", True)
+    set_source_flag("scan.newly-added-table.snapshot.enabled", True)
+    set_source_flag("scan.binlog.newly-added-table.enabled", True)
+    set_tables_pattern(rf"{SRC_DB}\\.tp(01_rows|02_keys|07_fail|10_add|11_ddl)")
     start_job()
     time.sleep(5)
-    exec_sql(SRC, "DROP TABLE IF EXISTS tp10_ddl")
+    exec_sql(SRC, "DROP TABLE IF EXISTS tp11_ddl")
     try:
-        exec_sql(SNK, "DROP TABLE IF EXISTS tp10_ddl_out")
+        exec_sql(SNK, "DROP TABLE IF EXISTS tp11_ddl_out")
     except Exception:
         pass
     time.sleep(2)
-    exec_sql(SRC, "CREATE TABLE tp10_ddl (id BIGINT PRIMARY KEY, name VARCHAR(64) NOT NULL) ENGINE=InnoDB")
-    exec_sql(SRC, "INSERT INTO tp10_ddl(id,name) VALUES (9,'ddl-row')")
+    exec_sql(SRC, "CREATE TABLE tp11_ddl (id BIGINT PRIMARY KEY, name VARCHAR(64) NOT NULL) ENGINE=InnoDB")
+    exec_sql(SRC, "INSERT INTO tp11_ddl(id,name) VALUES (9,'ddl-row')")
     wait_until(
-        lambda: table_exists(SNK, SINK_DB, "tp10_ddl_out")
-        and any(str(r.get("id")) == "9" for r in dump_table(SNK, SINK_DB, "tp10_ddl_out", "id")),
+        lambda: table_exists(SNK, SINK_DB, "tp11_ddl_out")
+        and any(str(r.get("id")) == "9" for r in dump_table(SNK, SINK_DB, "tp11_ddl_out", "id")),
         desc="ddl-row",
     )
     time.sleep(3)
-    actual_live = dump_table(SNK, SINK_DB, "tp10_ddl_out", "id")
+    actual_live = dump_table(SNK, SINK_DB, "tp11_ddl_out", "id")
     ck = json.loads(CK.read_text()) if CK.exists() else {}
     captured = ck.get("captured_tables") or []
-    live_captured = any("tp10_ddl" in str(x) for x in captured)
+    live_captured = any("tp11_ddl" in str(x) for x in captured)
     ok10 = normalize(actual_live, ["id", "name"]) == normalize([{"id": 9, "name": "ddl-row"}], ["id", "name"]) and live_captured
     live_row_ok = normalize(actual_live, ["id", "name"]) == normalize(
         [{"id": 9, "name": "ddl-row"}], ["id", "name"]
     )
     cmp10 = (
         "| Check | Expected | Actual | Verdict |\n| --- | --- | --- | --- |\n"
+        f"| binlog.newly-added | true | true | ✅ |\n"
         f"| sink row (9,ddl-row) | present | {'yes' if live_row_ok else 'no'} | "
         f"{'✅' if live_row_ok else '❌'} |\n"
-        f"| captured_tables contains tp10_ddl | yes | {'yes' if live_captured else 'no'} | "
+        f"| captured_tables contains tp11_ddl | yes | {'yes' if live_captured else 'no'} | "
         f"{'✅' if live_captured else '❌'} |\n"
         f"| Summary | | | **{'✅ PASS' if ok10 else '❌ FAIL'}** |"
     )
     record(
         TPResult(
-            id="TP-10",
+            id="TP-11",
             title="Runtime CREATE TABLE: follows incremental and updates captured",
-            action="Runtime CREATE tp10_ddl + INSERT (9,ddl-row)",
-            expected_desc="Sink (9,ddl-row); captured includes tp10_ddl",
+            action="scan.binlog.newly-added-table.enabled=true; runtime CREATE tp11_ddl + INSERT (9,ddl-row)",
+            expected_desc="Sink (9,ddl-row); captured includes tp11_ddl",
             expected_rows=[{"id": 9, "name": "ddl-row"}],
             actual_rows=actual_live,
             columns=["id", "name"],
@@ -555,7 +789,87 @@ def main() -> int:
         compare_md=cmp10,
     )
 
-    # TP-12 — prove resume-state layout by shape only (no file contents in the report)
+    # TP-15..TP-20 — full (A,B,C) combos (renumbered from former TP-18..22).
+    _combo_base = rf"{SRC_DB}\\.tp(01_rows|02_keys|07_fail|10_add|11_ddl"
+    run_newly_added_combo(
+        tp_id="TP-15",
+        title="Combo#1 A=false C=false: ignore diff + drop CREATE",
+        newly_added=False,
+        snapshot=True,
+        binlog_newly=False,
+        diff_table="tp15_diff",
+        seed_id=15,
+        crt_table="tp15_crt",
+        crt_id=150,
+        tables_pattern=_combo_base + r"|15_diff|15_crt)",
+    )
+    run_newly_added_combo(
+        tp_id="TP-16",
+        title="Combo#2 A=false C=true: ignore diff + follow CREATE",
+        newly_added=False,
+        snapshot=True,
+        binlog_newly=True,
+        diff_table="tp16_diff",
+        seed_id=16,
+        crt_table="tp16_crt",
+        crt_id=160,
+        tables_pattern=_combo_base + r"|15_diff|15_crt|16_diff|16_crt)",
+    )
+    run_newly_added_combo(
+        tp_id="TP-17",
+        title="Combo#3 A=true B=true C=false: snapshot diff + drop CREATE",
+        newly_added=True,
+        snapshot=True,
+        binlog_newly=False,
+        diff_table="tp17_diff",
+        seed_id=17,
+        crt_table="tp17_crt",
+        crt_id=170,
+        tables_pattern=_combo_base + r"|15_diff|15_crt|16_diff|16_crt|17_diff|17_crt)",
+    )
+    run_newly_added_combo(
+        tp_id="TP-18",
+        title="Combo#4 A=true B=true C=true: snapshot diff + follow CREATE",
+        newly_added=True,
+        snapshot=True,
+        binlog_newly=True,
+        diff_table="tp18_diff",
+        seed_id=18,
+        crt_table="tp18_crt",
+        crt_id=180,
+        tables_pattern=_combo_base
+        + r"|15_diff|15_crt|16_diff|16_crt|17_diff|17_crt|18_diff|18_crt)",
+    )
+    run_newly_added_combo(
+        tp_id="TP-19",
+        title="Combo#5 A=true B=false C=false: binlog-only diff + drop CREATE",
+        newly_added=True,
+        snapshot=False,
+        binlog_newly=False,
+        diff_table="tp19_diff",
+        seed_id=19,
+        live_id=191,
+        crt_table="tp19_crt",
+        crt_id=190,
+        tables_pattern=_combo_base
+        + r"|15_diff|15_crt|16_diff|16_crt|17_diff|17_crt|18_diff|18_crt|19_diff|19_crt)",
+    )
+    run_newly_added_combo(
+        tp_id="TP-20",
+        title="Combo#6 A=true B=false C=true: binlog-only diff + follow CREATE",
+        newly_added=True,
+        snapshot=False,
+        binlog_newly=True,
+        diff_table="tp20_diff",
+        seed_id=20,
+        live_id=201,
+        crt_table="tp20_crt",
+        crt_id=200,
+        tables_pattern=_combo_base
+        + r"|15_diff|15_crt|16_diff|16_crt|17_diff|17_crt|18_diff|18_crt|19_diff|19_crt|20_diff|20_crt)",
+    )
+
+    # TP-13 — prove resume-state layout by shape only (no file contents in the report)
     ck = json.loads(CK.read_text()) if CK.exists() else {}
     only_one = CK.exists() and CK.is_file()
     has_offset = isinstance(ck.get("acked_offset"), dict) and bool(ck.get("acked_offset"))
@@ -574,7 +888,7 @@ def main() -> int:
     )
     record(
         TPResult(
-            id="TP-12",
+            id="TP-13",
             title="Resume state: splits and offset in one file",
             action="snapshot + incremental, interval=2s",
             expected_desc="One resume-state file with a well-formed offset (file+pos or gtid)",
@@ -586,7 +900,7 @@ def main() -> int:
         compare_md=cmp12,
     )
 
-    # TP-13 — abnormal stop (SIGKILL) then restart from on-disk checkpoint
+    # TP-14 — abnormal stop (SIGKILL) then restart from on-disk checkpoint
     wait_until(
         lambda: CK.exists() and _checkpoint_shape_ok(json.loads(CK.read_text())),
         desc="checkpoint flushed before kill",
@@ -595,7 +909,7 @@ def main() -> int:
     time.sleep(3)  # past checkpoint.interval=2s so latest flush is on disk
     ck_before = json.loads(CK.read_text())
     users_before = dump_table(SNK, SINK_DB, "tp01_rows_out", "id")
-    add_before = dump_table(SNK, SINK_DB, "tp09_add_out", "id")
+    add_before = dump_table(SNK, SINK_DB, "tp10_add_out", "id")
     kill_code = kill_job_hard()
     killed_ok = kill_code is not None and kill_code != 0
     ck_after_kill = json.loads(CK.read_text()) if CK.exists() else {}
@@ -618,7 +932,7 @@ def main() -> int:
     )
     time.sleep(2)
     users_after = dump_table(SNK, SINK_DB, "tp01_rows_out", "id")
-    add_after = dump_table(SNK, SINK_DB, "tp09_add_out", "id")
+    add_after = dump_table(SNK, SINK_DB, "tp10_add_out", "id")
     job_alive = proc is not None and proc.poll() is None
     old_kept = normalize(users_before, ["id", "name", "city"]) == normalize(
         [r for r in users_after if str(r.get("id")) != "13"],
@@ -647,14 +961,14 @@ def main() -> int:
         f"{'✅' if new_ok else '❌'} |\n"
         f"| filtered id=2 still absent | yes | {'yes' if not bob_back else 'no'} | "
         f"{'✅' if not bob_back else '❌'} |\n"
-        f"| tp09_add unchanged | yes | {'yes' if add_unchanged else 'no'} | "
+        f"| tp10_add unchanged | yes | {'yes' if add_unchanged else 'no'} | "
         f"{'✅' if add_unchanged else '❌'} |\n"
         f"| job running after restart | yes | {job_alive} | {'✅' if job_alive else '❌'} |\n"
         f"| Summary | | | **{'✅ PASS' if ok13 else '❌ FAIL'}** |"
     )
     record(
         TPResult(
-            id="TP-13",
+            id="TP-14",
             title="Abnormal stop (SIGKILL) then resume from checkpoint",
             action=(
                 "Wait for flushed acked_offset → SIGKILL (no graceful flush) → "
@@ -679,7 +993,7 @@ def main() -> int:
         compare_md=cmp13,
     )
 
-    # TP-07b: writing to a sink table that never got created fails the job
+    # TP-08 (was TP-07b): writing to a sink table that never got created fails the job
     log_before = LOG.read_text(errors="replace") if LOG.exists() else ""
     exec_sql(SRC, "INSERT INTO tp07_fail(id, name) VALUES (1, 'fail-row')")
     wait_until(
@@ -706,7 +1020,7 @@ def main() -> int:
     )
     record(
         TPResult(
-            id="TP-07b",
+            id="TP-08",
             title="Write after create failure: missing table fails job",
             action="INSERT INTO tp07_fail (routed to no_such_db)",
             expected_desc="Write fails on missing table; job fails; no silent drop from create failure",
@@ -720,7 +1034,7 @@ def main() -> int:
     )
     proc = None
 
-    # TP-11 stdout
+    # TP-12 stdout (was TP-11)
     stop_job()
     stdout_yaml = WORKDIR / "pipeline.stdout.yaml"
     cfg.render_template("pipeline.stdout.yaml.tpl", stdout_yaml)
@@ -764,7 +1078,7 @@ def main() -> int:
     )
     record(
         TPResult(
-            id="TP-11",
+            id="TP-12",
             title="stdout CRUD: u with before/after + ddl",
             action="stdout sink；UPDATE cara→cara2；ADD tag2",
             expected_desc="Single-line u(before+after) and ddl(tag2) appear",
@@ -779,9 +1093,22 @@ def main() -> int:
 
     report_path = write_report()
     failed = [r for r in results if not r.passed]
-    log("REPORT", report_path)
+    log("REPORT", cfg.project_display_path(report_path))
     log("PASS", sum(1 for r in results if r.passed), "FAIL", len(failed))
     return 0 if not failed else 1
+
+
+def _tp_sort_key(tp_id: str) -> tuple[int, str]:
+    """Sort TP-07 before TP-08; numeric id then optional letter suffix."""
+    m = re.fullmatch(r"TP-(\d+)([a-z]*)", tp_id)
+    if not m:
+        return (9999, tp_id)
+    return (int(m.group(1)), m.group(2))
+
+
+def _tp_anchor(tp_id: str) -> str:
+    """Stable fragment id for overview → detail links (e.g. TP-08 → tp-08)."""
+    return tp_id.lower()
 
 
 def write_report() -> Path:
@@ -789,20 +1116,25 @@ def write_report() -> Path:
     failed = len(results) - passed
     path = cfg.REPORT_FUNC
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    ordered = sorted(results, key=lambda item: _tp_sort_key(item.id))
     lines = [
         "# go-cdc integration test report (expected vs actual)\n",
+        '<a id="overview"></a>\n',
         "## 0. Overview\n",
         f"- Run time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"- Source: `{cfg.MYSQL_HOST}:{cfg.MYSQL_PORT}` / `{cfg.SRC_USER}` / `{SRC_DB}`",
         f"- Sink: `{cfg.MYSQL_HOST}:{cfg.MYSQL_PORT}` / `{cfg.SINK_USER}` / `{SINK_DB}`",
-        f"- Entry point: `{BINARY} <pipeline.yaml>`",
+        f"- Entry point: `{cfg.project_display_path(BINARY)} <pipeline.yaml>`",
         f"- **Summary: pass {passed} / fail {failed} / total {len(results)}** → "
         f"{'**all passed**' if failed == 0 else '**failures present**'}\n",
         "| TP | Name | Result |",
         "| --- | --- | --- |",
     ]
-    for r in results:
-        lines.append(f"| {r.id} | {r.title} | {'✅ PASS' if r.passed else '❌ FAIL'} |")
+    for r in ordered:
+        lines.append(
+            f"| [{r.id}](#{_tp_anchor(r.id)}) | {r.title} | "
+            f"{'✅ PASS' if r.passed else '❌ FAIL'} |"
+        )
     lines += [
         "",
         "## 1. Data flow\n",
@@ -811,18 +1143,18 @@ def write_report() -> Path:
         f"  src[{SRC_DB}] --> job[cdc_cli]",
         f"  job --> snk[{SINK_DB}]",
         "```\n",
+        "## 2. Test points\n",
     ]
-    for r in results:
+    for r in ordered:
+        anchor = _tp_anchor(r.id)
         lines += [
+            f'<a id="{anchor}"></a>\n',
             f"## {r.id} {r.title}\n",
+            f"- [↑ Overview](#overview)",
             f"- **Result: {'✅ PASS' if r.passed else '❌ FAIL'}**",
             f"- **Action:** {r.action}",
             f"- **Expected:** {r.expected_desc}\n",
-            "### Expected\n",
-            md_table(r.expected_rows, r.columns),
-            "\n### Actual\n",
-            md_table(r.actual_rows, r.columns),
-            "\n### Expected vs actual\n",
+            "### Expected vs actual\n",
             r.compare_md,
         ]
         if r.extra_md:
@@ -833,20 +1165,44 @@ def write_report() -> Path:
     for t, order in [
         ("tp01_rows", "id"),
         ("tp02_keys", "id"),
-        ("tp09_add", "id"),
-        ("tp10_ddl", "id"),
+        ("tp10_add", "id"),
+        ("tp11_ddl", "id"),
+        ("tp15_diff", "id"),
+        ("tp16_diff", "id"),
+        ("tp17_diff", "id"),
+        ("tp18_diff", "id"),
+        ("tp19_diff", "id"),
+        ("tp20_diff", "id"),
+        ("tp15_crt", "id"),
+        ("tp16_crt", "id"),
+        ("tp17_crt", "id"),
+        ("tp18_crt", "id"),
+        ("tp19_crt", "id"),
+        ("tp20_crt", "id"),
     ]:
         lines += [f"### source {SRC_DB}.{t}\n", md_table(dump_table(SRC, SRC_DB, t, order)), ""]
     lines.append("## Appendix: sink table snapshots\n")
     for t, order in [
         ("tp01_rows_out", "id"),
         ("tp02_keys_out", "docid"),
-        ("tp09_add_out", "id"),
-        ("tp10_ddl_out", "id"),
+        ("tp10_add_out", "id"),
+        ("tp11_ddl_out", "id"),
+        ("tp15_diff_out", "id"),
+        ("tp15_crt_out", "id"),
+        ("tp16_diff_out", "id"),
+        ("tp16_crt_out", "id"),
+        ("tp17_diff_out", "id"),
+        ("tp17_crt_out", "id"),
+        ("tp18_diff_out", "id"),
+        ("tp18_crt_out", "id"),
+        ("tp19_diff_out", "id"),
+        ("tp19_crt_out", "id"),
+        ("tp20_diff_out", "id"),
+        ("tp20_crt_out", "id"),
     ]:
         lines += [f"### sink {SINK_DB}.{t}\n", md_table(dump_table(SNK, SINK_DB, t, order)), ""]
 
-    path.write_text("\n".join(lines), encoding="utf-8")
+    path.write_text(cfg.sanitize_report_text("\n".join(lines)), encoding="utf-8")
     return path
 
 

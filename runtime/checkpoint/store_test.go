@@ -44,8 +44,34 @@ func TestLoadMissingFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.AckedOffset != nil || state.FinishedSplits == nil || state.CapturedTables == nil {
+	if state.AckedOffset != nil || state.FinishedSplits == nil || state.CapturedTables == nil || state.SnapshotTables == nil {
 		t.Fatalf("empty state %#v", state)
+	}
+}
+
+func TestSnapshotTablesRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "checkpoint.ckpt")
+	store := Store{Path: path}
+	state := State{
+		AckedOffset:    &Position{File: "mysql-bin.000018", Pos: 451},
+		CapturedTables: []string{"db.user"},
+		SnapshotTables: map[string]Position{
+			"db.order": {File: "mysql-bin.000018", Pos: 451},
+		},
+	}
+	if err := store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.HasSnapshot("db.order") || loaded.HasSnapshot("db.user") {
+		t.Fatalf("%#v", loaded.SnapshotTables)
+	}
+	loaded.ClearSnapshot("db.order")
+	if loaded.HasSnapshot("db.order") {
+		t.Fatal("snapshot flag remained")
 	}
 }
 

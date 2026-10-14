@@ -122,9 +122,9 @@ to validate snapshot replication, incremental CDC processing, multi-database
 replication, hotspot workloads, and catch-up behavior under sustained write
 pressure.
 
-Results below are **averages across CI runs** (load: 2× each version; scale
-heavy: 2×). **Source write** and **CDC apply** are different metrics. Charts
-use run-normalized average lag curves and collapse flat plateau segments.
+Results below are **averages of 10 CI runs** per scenario (load per MySQL
+version; scale heavy). **Source write** and **CDC apply** are different metrics.
+Charts use run-normalized average lag curves and collapse flat plateau segments.
 Load peak knobs are now **4×60s**; catch-up timings/chart below are still from
 prior **4×90s** samples until remeasured.
 
@@ -152,7 +152,7 @@ MySQL **8.0.36** only (no 5.7 scale matrix in CI): 10 source databases, 50
 tables, concurrent hotspot workloads — separate chart from load.
 
 
-| Metric              | Result (avg of 2 heavy runs)          |
+| Metric              | Result (avg of 10 heavy runs)         |
 | ------------------- | ------------------------------------- |
 | **Test type**       | **Scale** (heavy)                     |
 | Databases / tables  | 10 DBs / 50 tables                    |

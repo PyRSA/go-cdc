@@ -43,6 +43,9 @@ func Open(cfg definition.Sink, timeZone string) (*Sink, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sink.mysql: %w", err)
 	}
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	db.SetConnMaxIdleTime(10 * time.Minute)
 	return &Sink{db: db, cfg: cfg}, nil
 }
 
