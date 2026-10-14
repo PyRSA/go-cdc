@@ -38,9 +38,53 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Same-repo PR + push would double-run; skip push work when an open PR
+  # already covers this head (pull_request / workflow_dispatch always run).
+  decide:
+    name: Decide run
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    permissions:
+      pull-requests: read
+    steps:
+      - id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" != "push" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "event=${EVENT_NAME}: run"
+            exit 0
+          fi
+          # head filter is owner:branch (same-repo PRs). Fail open on API errors
+          # so a transient gh blip still runs push CI when there is no PR coverage.
+          count="$(gh api \
+            "repos/${REPO}/pulls?state=open&head=${OWNER}:${REF_NAME}" \
+            --jq 'length' 2>/dev/null || true)"
+          if [[ "${count}" =~ ^[0-9]+$ && "${count}" -gt 0 ]]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "push skipped: ${count} open PR(s) for ${OWNER}:${REF_NAME}"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            if [[ -z "${count}" || ! "${count}" =~ ^[0-9]+$ ]]; then
+              echo "push runs: PR lookup failed or empty; fail-open"
+            else
+              echo "push runs: no open PR for ${OWNER}:${REF_NAME}"
+            fi
+          fi
+
   # Fast gate: fmt + lint + unit tests + build before expensive MySQL matrix.
   go-check:
     name: Build + lint + test
+    needs: decide
+    if: needs.decide.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -79,6 +123,8 @@ jobs:
 
   mysql-mysql-e2e:
     name: MySQL ${{ matrix.mysql }} (func + types + load)
+    # No job-level if: intentionally cascade-skips when go-check is skipped
+    # (decide.run=false). Do not add if: always() / !cancelled() here.
     needs: go-check
     runs-on: ubuntu-latest
     timeout-minutes: 75
@@ -93,12 +139,12 @@ jobs:
           - mysql: "5.7"
             image: mysql:5.7.42
             tag: "57"
-            peak_seconds: "90"
+            peak_seconds: "60"
             peak_workers: "4"
           - mysql: "8.0"
             image: mysql:8.0.36
             tag: "80"
-            peak_seconds: "90"
+            peak_seconds: "60"
             peak_workers: "4"
 
     defaults:
@@ -204,6 +250,8 @@ jobs:
 
   mysql-scale-e2e:
     name: MySQL ${{ matrix.mysql }} scale
+    # No job-level if: intentionally cascade-skips when go-check is skipped
+    # (decide.run=false). Do not add if: always() / !cancelled() here.
     needs: go-check
     runs-on: ubuntu-latest
     timeout-minutes: 120

@@ -11,23 +11,28 @@ files under `docs/performance/` using the same `mysql-to-<sink>-e2e.md` naming.
 
 | Item | Value |
 | --- | --- |
-| Date (CI wall clock) | 2026-09-30 ~04:34 UTC |
+| Samples | Load: **10-run average** each for MySQL 5.7 / 8.0; Scale heavy: **10-run average** (8.0) |
+| CI dates | sample window 2026-09-30 · 2026-10-12 |
 | Workflow | `CI / Integration` (`.github/workflows/integration.yml`) |
 | Runner | GitHub Actions `ubuntu-latest` (shared VM) |
 | MySQL (load) | 5.7.42 and 8.0.36 via docker compose |
-| MySQL (scale) | 8.0.36 |
-| Profiles | `LOAD_PROFILE=full` (`LOAD_ROWS_PER_TABLE=100000`); `SCALE_PROFILE=heavy` |
-| Peak knobs (load) | 4 workers × 90s, batch 200 |
+| MySQL (scale) | 8.0.36 · `SCALE_PROFILE=heavy` only |
+| Profiles | `LOAD_PROFILE=full` (`LOAD_ROWS_PER_TABLE=100000`); heavy scale |
+| Peak knobs (load) | **Current CI:** 4 workers × 60s, batch 200 |
 | Scale knobs | 8 workers; hotspot burst 50k/table × 10; peak 45s |
 
-**How to read these numbers**
+**How numbers and charts are built**
 
-- **Source write throughput** = rows inserted into MySQL by the test harness
-  during a timed peak (pressure on the source).
-- **CDC apply throughput** = sink rows gained / wall time while catching up
-  (how fast go-cdc drains backlog), usually **combined** across stressed tables.
-- These are integration-stress results on shared CI hardware, **not** a
-  vendor-grade benchmark. Do not treat them as capacity guarantees.
+- Phase timings in tables are **arithmetic means** across the listed runs.
+- Lag curves are **run-normalized averages**: each run’s catch-up time is mapped
+  to \\([0,1]\\), lag is averaged at each fraction, then the X axis is scaled to
+  the **mean** catch-up duration. This keeps shape comparable when runs finish
+  at different wall times.
+- Chart polylines/markers **collapse plateaus**: points are kept when lag moves
+  by ≳1.5–2%, plus endpoints — flat “stuck” stretches are not over-sampled.
+- A `SCALE_PROFILE=normal` log (no hotspot phase) is **excluded** from scale
+  averages.
+- These are shared-runner stress results, **not** vendor-grade benchmarks.
 
 ## Workloads
 
@@ -37,10 +42,17 @@ One source DB → one sink DB, six tables (`t1`–`t4`, `typed`, `large`):
 
 1. Seed **100k rows × 5** normal tables + **50 × 2 MiB** LONGBLOB/LONGTEXT rows.
 2. Snapshot catch-up (≤1% row lag).
-3. Peak: 4 concurrent writers × 90s INSERT into `tpl01_t1` + `tpl01_typed`.
+3. Peak: 4 concurrent writers × 60s INSERT into `tpl01_t1` + `tpl01_typed`.
 4. Peak catch-up until both tables are within **≤1%** lag (harness budget 3600s).
 
 Functional (TP-01..13) and types (TP-D01..D04) ran in the same job before load.
+
+> **Evidence note:** Load phase timings, apply rates, and the lag chart below are
+> **historical averages from prior CI with peak = 4×90s**. Current knobs are
+> **4×60s**; remeasure before treating those numbers as current CI baselines.
+
+The load lag chart has **two lines** because CI runs the same load suite on
+**MySQL 5.7 and 8.0**.
 
 ### Scale suite (heavy)
 
@@ -52,125 +64,142 @@ Ten source DBs → ten sink DBs, **50 tables**, planned seed **300k** rows:
 4. **Hotspot peak**: 8 workers × 45s timed inserts across the same 10 tables.
 5. Hotspot catch-up to **≤1%** lag, then final checksum on all 50 tables.
 
-## Scale heavy (MySQL 8.0) — primary headline
+Scale is **MySQL 8.0 only** in CI, so it uses a **separate** single-series chart.
 
-**Result: SUMMARY PASS**
+## Scale heavy (MySQL 8.0) — average of 10 runs
 
-| Phase | Wall time | Derived / notes |
+**Result: SUMMARY PASS** (10-run average)
+
+| Phase | Mean wall time | Notes (min / max across sample) |
 | --- | ---: | --- |
-| Seed baseline | 6.7s | 300k planned rows, workers=8 |
-| CDC snapshot | 104.1s | ~2,882 rows/s; 50/50 tables ready |
-| Mutate | 0.9s | — |
-| Mutate catch-up | 5.0s | checksum match |
-| Hotspot burst | 15.7s | 500k inserts ≈ 31.8k source rows/s |
-| Hotspot peak write | 45.1s | **1,356,000** rows ≈ **30,082** source rows/s |
-| Hotspot catch-up | 577.0s | ≤1% lag; ~**3.1k** aggregate apply rows/s across 10 hotspots (steady interval after ~154s) |
+| Seed baseline | 7.4s | 6.7 / 8.2 |
+| CDC snapshot | 132.6s | 104 / 161 · ~2.3k rows/s on 300k |
+| Mutate | 1.0s | 0.9 / 1.1 |
+| Mutate catch-up | 14.5s | 5.0 / 23.9 |
+| Hotspot burst | 17.0s | 15.7 / 18.3 · 500k inserts |
+| Hotspot peak write | 45.1s | mean **1.17M** rows ≈ **26.1k** source rows/s |
+| Hotspot catch-up | **1302s** | 577 / 2027 · see curve below |
 | Final verify | — | 50/50 COUNT + SUM(id) + CRC · PASS |
 
-Aggregate CDC apply (~3.1k rows/s) is the **sum** across ten hotspot tables, not
-a single-table rate.
+Some runs drain nearly linearly (~577s); others show a mid-run apply stall
+(up to ~2027s). The 10-run averaged curve still reaches ≤1%, with less visual
+weight on flat segments than a single stalled run.
 
-## Load suite — MySQL 5.7 (complete)
+### Scale heavy — hotspot catch-up lag curve
 
-**Result: PASS** (load TP-L01..L04; suite total 2294.2s)
+Y-axis: **mean** `delta%` across 10 hotspot tables, then averaged across runs
+(normalized time). Markers follow lag change, not every log line.
 
-| Phase | Seconds | Notes |
+![Scale hotspot catch-up lag % vs time (MySQL 8.0, avg)](scale-hotspot-catchup-lag.svg)
+
+| Catch-up time (s) | Mean lag % (avg) |
+| ---: | ---: |
+| 0 | 89.6 |
+| 200 | 66.5 |
+| 400 | 46.2 |
+| 600 | 38.8 |
+| 800 | 31.4 |
+| 1000 | 24.0 |
+| 1302 | ≤1 (PASS) |
+
+## Load suite — MySQL 5.7 (average of 10 runs)
+
+> Historical sample: peak knobs were **4×90s** (not current 4×60s).
+
+**Result: PASS** (10-run average; mean suite total **2269s**)
+
+| Phase | Mean seconds | Notes |
 | --- | ---: | --- |
-| schema_setup | 0.6 | — |
-| seed_baseline | 5.6 | 100k×5 + 50 large |
-| cdc_snapshot | 168.5 | ~500k rows ≈ **2,968** apply rows/s |
-| peak_write | 90.0 | **3,050,400** rows ≈ **33,885** source rows/s |
-| cdc_peak_catchup | 2023.1 | ≤1% lag · ~**2.9k** aggregate apply rows/s on 2 tables |
-| suite_total | 2294.2 | — |
+| seed_baseline | 6.7 | 100k×5 + 50 large |
+| cdc_snapshot | 130.4 | 46 / 215 · ~500k rows |
+| peak_write | 90.0 | **prior 4×90s**; final src ≈ **2.87M**/table (mean) |
+| cdc_peak_catchup | **2035** | 1663 / 2408 · ~**2.8k** aggregate apply rows/s |
+| suite_total | 2269 | — |
 
 ### Peak backlog drain (5.7)
 
-After the 90s flood, both stressed tables start near **~94%** lag (~2.96M
-rows/table backlog). Catch-up is near-linear over ~34 minutes with no stall
-(see [lag curve](#load-suite--peak-catch-up-lag-curve) below). Per-table apply
-stayed near **~1.45k rows/s** (combined ~**2.9k** rows/s).
+Start lag ~**94%**. Catch-up is near-linear on average to ≤1% in ~34 minutes
+(see [lag curve](#load-suite--peak-catch-up-lag-curve)).
 
 ## Load suite — peak catch-up lag curve
 
-Both MySQL versions start near ~93% lag after the 90s source flood and drain
-toward ≤1% without stalls. 5.7 finishes earlier on this CI run; 8.0 takes
-longer but still converges.
+> Historical sample: peak knobs were **4×90s** (not current 4×60s).
 
-![Load peak catch-up lag % vs time (MySQL 5.7 vs 8.0)](load-peak-catchup-lag.svg)
+Both versions start near **~94%** lag after the 90s flood. Averaged curves stay
+close through mid catch-up; **5.7 finishes earlier on average** (~2035s) than
+8.0 (~2280s).
+
+![Load peak catch-up lag % vs time (MySQL 5.7 vs 8.0, avg)](load-peak-catchup-lag.svg)
 
 | Catch-up time (s) | MySQL 5.7 lag % | MySQL 8.0 lag % |
 | ---: | ---: | ---: |
-| 0 | 93.9 | 92.9 |
-| 300 | 80.4 | 80.9 |
-| 600 | 66.8 | 71.8 |
-| 900 | 52.3 | 62.6 |
-| 1200 | 38.4 | 53.8 |
-| 1500 | 24.3 | 44.6 |
-| 1800 | 11.0 | 35.8 |
-| 2023 | ≤1 (PASS) | 29.4 |
-| 2433 | — | 17.1 |
-| 2699 | — | 9.2 |
-| 2983.5 | — | ≤1 (PASS) |
+| 0 | 93.9 | 94.4 |
+| 300 | 85.1 | 81.7 |
+| 600 | 70.7 | 68.9 |
+| 900 | 55.9 | 56.2 |
+| 1200 | 41.3 | 43.4 |
+| 1500 | 26.6 | 30.8 |
+| 1800 | 11.7 | 19.2 |
+| 2035 | ≤1 (PASS) | 10.1 |
+| 2280 | — | ≤1 (PASS) |
 
-## Load suite — MySQL 8.0 (complete)
+## Load suite — MySQL 8.0 (average of 10 runs)
 
-**Result: PASS** (load TP-L01..L04; suite total 3315.3s)
+> Historical sample: peak knobs were **4×90s** (not current 4×60s).
 
-| Phase | Seconds | Notes |
+**Result: PASS** (10-run average; mean suite total **2534s**)
+
+| Phase | Mean seconds | Notes |
 | --- | ---: | --- |
-| schema_setup | 0.5 | — |
-| seed_baseline | 7.7 | 100k×5 + 50 large |
-| cdc_snapshot | 228.7 | ~500k rows ≈ **2,186** apply rows/s |
-| peak_write | 90.0 | **2,241,400** rows ≈ **24,900** source rows/s |
-| cdc_peak_catchup | 2983.5 | ≤1% lag · ~**1.5k** aggregate apply rows/s on 2 tables |
-| suite_total | 3315.3 | — |
+| seed_baseline | 6.1 | 100k×5 + 50 large |
+| cdc_snapshot | 152.3 | 76 / 228 · ~500k rows |
+| peak_write | 90.0 | **prior 4×90s**; final src ≈ **2.30M**/table (mean) |
+| cdc_peak_catchup | **2280** | 2235 / 2326 · ~**1.9k** aggregate apply rows/s |
+| suite_total | 2534 | — |
 
 ### Peak backlog drain (8.0)
 
-Same load knobs as 5.7. Lag starts near **~93%**; apply is slower than 5.7 on
-this CI run (~1.5k vs ~2.9k aggregate rows/s) but still linear to ≤1% (see
-[lag curve](#load-suite--peak-catch-up-lag-curve)). Per-table apply ~**0.73k**
-rows/s (combined ~**1.5k**).
+Same **prior 4×90s** knobs as 5.7. Start lag ~**94%**; combined apply ~**1.9k**
+rows/s on average; near-linear drain to ≤1% (see curve above).
 
-## Apply-rate comparison (derived)
+## Apply-rate comparison (derived, averaged)
 
 | Scenario | Approx apply rows/s | Definition |
 | --- | ---: | --- |
-| Snapshot (5.7 load) | ~2,968 | sink rows / snapshot wait |
-| Snapshot (8.0 load) | ~2,186 | includes mega-field tables |
-| Peak catch-up (5.7 load) | ~2,900 | 2 tables combined |
-| Peak catch-up (8.0 load) | ~1,500 | 2 tables combined |
-| Snapshot (scale heavy) | ~2,882 | 50 tables / 300k rows |
-| Hotspot catch-up (scale) | ~3,130 | 10 hotspots combined |
+| Snapshot (5.7 load) | ~3,800 | 500k / mean snapshot wait (high variance) |
+| Snapshot (8.0 load) | ~3,300 | same |
+| Peak catch-up (5.7 load) | ~2,800 | 2 tables combined, mean of runs |
+| Peak catch-up (8.0 load) | ~1,900 | 2 tables combined, mean of runs |
+| Snapshot (scale heavy) | ~2,300 | 300k / mean snapshot wait |
+| Hotspot catch-up (scale) | varies | 577s vs 2027s runs; see curve |
 
-Source peak pressure on these runs was roughly **25–34k rows/s** for tens of
-seconds. CDC apply on this CI path is roughly **1.5–3k rows/s**. The tests
-assert **eventual** ≤1% catch-up, not real-time parity during the flood.
+The tests assert **eventual** ≤1% catch-up, not real-time parity during the
+flood. Scale wall time is especially runner-sensitive.
 
 ## What this supports
 
-1. Under a multi-million-row backlog (5.7 and 8.0 load peaks), go-cdc applied
-   steadily with a linear lag curve to ≤1% (≈34 min on 5.7, ≈50 min on 8.0 in
-   this CI run).
-2. Scale heavy on MySQL 8: multi-DB snapshot, concurrent hotspot burst/peak,
-   ≤1% catch-up in 577s, checksum PASS.
+1. Under **prior 4×90s** multi-million-row load peaks, go-cdc drained to ≤1% with
+   a near-linear averaged lag curve (~34 min on 5.7, ~38 min on 8.0 across those
+   historical samples). Current CI uses **4×60s**; expect smaller backlog /
+   shorter catch-up until remeasured.
+2. Scale heavy on MySQL 8 reaches ≤1% catch-up and checksum PASS; individual
+   runs may include mid-run apply stalls (visible when not averaged away).
 3. Correctness suites (func + types) passed in the same CI jobs as the stress
    paths.
 
 ## Limitations
 
-- Shared GitHub Actions runners; single-node docker MySQL; no dedicated
-  hardware or tuned InnoDB/binlog settings.
+- Shared GitHub Actions runners; single-node docker MySQL.
 - No comparison to Flink CDC or other tools.
-- 5.7 vs 8.0 load apply rates differ on the same day; treat as runner/MySQL
-  variance, not a version ranking.
-- Numbers move with runner noise, MySQL version, and harness knobs
-  (`LOAD_*`, `SCALE_*`).
+- Averages are over **10** runs per scenario; outliers are smoothed but runner
+  noise remains.
+- Scale `normal` profile is a different workload and is not mixed into heavy.
+- Numbers move with runner noise, MySQL version, and harness knobs.
 
 ## Sources
 
-- CI stdout captures: load MySQL 5.7 / 8.0 jobs and scale heavy job
-  (`test/integration` harness TIMING / catch-up progress lines).
+- CI stdout captures under `test/integration/workdir/` (local copies of job
+  logs; not committed): load 5.7 / 8.0 ×10, scale heavy ×10.
 - Workflow: [`.github/workflows/integration.yml`](../../.github/workflows/integration.yml)
 - Harness: [`test/integration/harness/load_it.py`](../../test/integration/harness/load_it.py),
   [`test/integration/scale/`](../../test/integration/scale/)

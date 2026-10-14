@@ -122,44 +122,51 @@ to validate snapshot replication, incremental CDC processing, multi-database
 replication, hotspot workloads, and catch-up behavior under sustained write
 pressure.
 
-Results below are from the same `master` CI day (2026-09-30). **Source write**
-and **CDC apply** are different metrics.
+Results below are **averages of 10 CI runs** per scenario (load per MySQL
+version; scale heavy). **Source write** and **CDC apply** are different metrics.
+Charts use run-normalized average lag curves and collapse flat plateau segments.
+Load peak knobs are now **4×60s**; catch-up timings/chart below are still from
+prior **4×90s** samples until remeasured.
 
 ### Load test
 
 
-| Metric              | MySQL 5.7.42                   | MySQL 8.0.36                   |
-| ------------------- | ------------------------------ | ------------------------------ |
-| **Test type**       | **Load** (func + types + load) | **Load** (func + types + load) |
-| Snapshot            | ~500K rows / 168.5s            | ~500K rows / 228.7s            |
-| Peak source write   | 3.05M rows / 90s (~34K rows/s) | 2.24M rows / 90s (~25K rows/s) |
-| Stressed tables     | 2 (`tpl01_t1` + typed)         | 2 (`tpl01_t1` + typed)         |
-| Aggregate CDC apply | ~2.9K rows/s (2 tables)        | ~1.5K rows/s (2 tables)        |
-| CDC catch-up        | ≤1% lag in 2023s (~34 min)     | ≤1% lag in 2983.5s (~50 min)   |
-| Result              | **PASS**                       | **PASS**                       |
+| Metric              | MySQL 5.7.42                     | MySQL 8.0.36                     |
+| ------------------- | -------------------------------- | -------------------------------- |
+| **Test type**       | **Load** (func + types + load)   | **Load** (func + types + load)   |
+| Snapshot            | ~500K rows / ~130s (avg)         | ~500K rows / ~152s (avg)         |
+| Peak source write   | 60s (est. final src ≈1.5M/table) | 60s (est. final src ≈1.2M/table) |
+| Stressed tables     | 2 (`tpl01_t1` + typed)           | 2 (`tpl01_t1` + typed)           |
+| Aggregate CDC apply | ~2.8K rows/s (2 tables, avg)     | ~1.9K rows/s (2 tables, avg)     |
+| CDC catch-up        | ≤1% lag in ~2035s (~34 min)*     | ≤1% lag in ~2280s (~38 min)*     |
+| Result              | **PASS**                         | **PASS**                         |
 
+\*Prior 4×90s CI average; expect roughly ~⅔ wall time under 4×60s.
 
-Lag-over-time chart (5.7 vs 8.0 catch-up):  
-![Load peak catch-up lag % vs time (MySQL 5.7 vs 8.0)](docs/performance/load-peak-catchup-lag.svg)。
+Lag-over-time chart (same load suite on 5.7 vs 8.0, averaged; prior 4×90s):  
+![Load peak catch-up lag % vs time (MySQL 5.7 vs 8.0)](docs/performance/load-peak-catchup-lag.svg)
 
 ### Scale test (heavy)
 
 MySQL **8.0.36** only (no 5.7 scale matrix in CI): 10 source databases, 50
-tables, concurrent hotspot workloads.
+tables, concurrent hotspot workloads — separate chart from load.
 
 
-| Metric              | Result                                |
+| Metric              | Result (avg of 10 heavy runs)         |
 | ------------------- | ------------------------------------- |
 | **Test type**       | **Scale** (heavy)                     |
 | Databases / tables  | 10 DBs / 50 tables                    |
-| Snapshot            | 300K rows / 104.1s                    |
-| Hotspot burst       | 500K rows / 15.7s                     |
-| Peak source write   | 1.356M rows / 45s (~30K rows/s)       |
+| Snapshot            | 300K rows / ~133s                     |
+| Hotspot burst       | 500K rows / ~17s                      |
+| Peak source write   | ~1.17M rows / 45s (~26K rows/s)       |
 | Hotspot tables      | 10                                    |
-| Aggregate CDC apply | ~3.1K rows/s across 10 hotspot tables |
-| CDC catch-up        | ≤1% lag in 577s                       |
+| CDC catch-up        | ≤1% lag in ~1302s (577s / 2027s)      |
 | Final verification  | COUNT + SUM(id) + CRC passed          |
 | Result              | **PASS**                              |
+
+
+Hotspot catch-up lag (mean of 10 tables, averaged runs):  
+![Scale hotspot catch-up lag % vs time (MySQL 8.0)](docs/performance/scale-hotspot-catchup-lag.svg)
 
 
 These results come from GitHub Actions shared runners and should not be
