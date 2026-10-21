@@ -89,9 +89,9 @@ Unroutable / invalid topics fail the write (no silent drop).
 
 ## Message key
 
-When `Keys` are present, the key is the `fmt.Sprint` of each key column from
-`after` (or `before` on delete), joined with `|`. Otherwise the key is empty
-(Kafka partitioning is then by broker default).
+When `Keys` are present, the key is a JSON array of the ordered key-column
+values from `after` (or `before` on delete). Missing or nil columns become
+`""`. Otherwise the key is empty (Kafka partitioning is then by broker default).
 
 ## Message format
 

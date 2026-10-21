@@ -79,7 +79,7 @@ func TestIntegrationProduceAndConsume(t *testing.T) {
 			if env["op"] != "c" {
 				t.Fatalf("op=%v", env["op"])
 			}
-			if string(rec.Key) != "1" {
+			if string(rec.Key) != "[1]" {
 				t.Fatalf("key=%q", rec.Key)
 			}
 			return

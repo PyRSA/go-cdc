@@ -3,6 +3,7 @@ package kafka
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -199,9 +200,13 @@ func (s *Sink) Write(batch []event.Event) error {
 		if err != nil {
 			return err
 		}
+		key, err := messageKey(item)
+		if err != nil {
+			return err
+		}
 		rec := &kgo.Record{
 			Topic: topic,
-			Key:   messageKey(item),
+			Key:   key,
 			Value: body,
 		}
 		s.inflight.Add(1)
@@ -291,24 +296,31 @@ func topicFor(item event.Event, defaultTopic string) (string, error) {
 	return defaultTopic, nil
 }
 
-func messageKey(item event.Event) []byte {
+// messageKey encodes ordered primary-key values as a JSON array so composite
+// keys cannot collide when a value contains a delimiter (unlike joining with "|").
+// Missing and nil key columns both become "" (same as the prior join encoding).
+func messageKey(item event.Event) ([]byte, error) {
 	row := item.After
 	if item.Op == event.OpDelete {
 		row = item.Before
 	}
 	if len(item.Keys) == 0 || row == nil {
-		return nil
+		return nil, nil
 	}
-	parts := make([]string, 0, len(item.Keys))
+	vals := make([]any, 0, len(item.Keys))
 	for _, k := range item.Keys {
 		v, ok := row[k]
 		if !ok || v == nil {
-			parts = append(parts, "")
+			vals = append(vals, "")
 			continue
 		}
-		parts = append(parts, fmt.Sprint(v))
+		vals = append(vals, v)
 	}
-	return []byte(strings.Join(parts, "|"))
+	b, err := json.Marshal(vals)
+	if err != nil {
+		return nil, fmt.Errorf("kafka: message key: %w", err)
+	}
+	return b, nil
 }
 
 // setProducerForTest injects a fake producer (unit tests only).

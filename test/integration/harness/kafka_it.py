@@ -195,6 +195,20 @@ def topic_end_sum(topic: str) -> int:
         c.close()
 
 
+def topic_catchup_done(end: int, *, baseline: int, min_increase: int) -> bool:
+    """True when end - baseline covers the expected increase (ignores prior history)."""
+    return (end - baseline) >= min_increase
+
+
+def peak_msg_min_increase(src_before: int, src_after: int) -> int:
+    """Kafka offset growth to wait for after a peak write (99% of new source rows).
+
+    Uses only this operation's row delta — never mixes cumulative source rows with
+    cumulative topic end offsets (historical Kafka data can exceed source counts).
+    """
+    return max(0, int((src_after - src_before) * 0.99))
+
+
 def consume_until(
     topics: list[str],
     *,
@@ -231,11 +245,16 @@ def consume_until(
 def wait_topic_msgs(
     topic: str,
     *,
-    min_end: int,
+    baseline: int,
+    min_increase: int,
     timeout_s: float = 3600.0,
     interval: float = 10.0,
     desc: str = "kafka catch-up",
 ) -> float:
+    """Wait until topic end-offset sum grows by at least min_increase since baseline.
+
+    Callers must capture baseline before the operation under test starts producing.
+    """
     t0 = time.time()
     deadline = t0 + timeout_s
     last_log = 0.0
@@ -243,16 +262,24 @@ def wait_topic_msgs(
         if proc is not None and proc.poll() is not None:
             raise RuntimeError(f"go-cdc exited during {desc}: {proc.returncode}")
         n = topic_end_sum(topic)
-        if n >= min_end:
+        if topic_catchup_done(n, baseline=baseline, min_increase=min_increase):
             elapsed = time.time() - t0
-            log(f"TIMING  wait [{desc}] done in {elapsed:.1f}s (end={n} need>={min_end})")
+            log(
+                f"TIMING  wait [{desc}] done in {elapsed:.1f}s "
+                f"(end={n} baseline={baseline} +{n - baseline} need>={min_increase})"
+            )
             return elapsed
         now = time.time()
         if now - last_log >= 15.0:
-            log(f"    {desc} {now - t0:.0f}s: {topic} end={n} need>={min_end}")
+            log(
+                f"    {desc} {now - t0:.0f}s: {topic} end={n} "
+                f"baseline={baseline} delta={n - baseline} need>={min_increase}"
+            )
             last_log = now
         time.sleep(interval)
-    raise TimeoutError(f"timeout waiting for {desc}: {topic} need>={min_end}")
+    raise TimeoutError(
+        f"timeout waiting for {desc}: {topic} baseline={baseline} need_increase>={min_increase}"
+    )
 
 
 def wait_ckpt(path: Path, timeout_s: float = 30.0) -> bool:
@@ -371,7 +398,7 @@ def tp_k02_crud_and_keys() -> None:
     c_ok = (
         len(creates) >= 1
         and creates[0].get("before") is None
-        and creates[0].get("_key") == "3"
+        and creates[0].get("_key") == "[3]"
         and "secret" not in (creates[0].get("after") or {})
     )
     u = updates[0] if updates else {}
@@ -380,14 +407,14 @@ def tp_k02_crud_and_keys() -> None:
         and isinstance(u.get("before"), dict)
         and isinstance(u.get("after"), dict)
         and (u.get("after") or {}).get("name") == "alice2"
-        and u.get("_key") == "1"
+        and u.get("_key") == "[1]"
     )
     d = deletes[0] if deletes else {}
     d_ok = (
         len(deletes) >= 1
         and d.get("after") is None
         and isinstance(d.get("before"), dict)
-        and d.get("_key") == "11"
+        and d.get("_key") == "[11]"
     )
     filt_ok = len(filtered) == 0
     ok = c_ok and u_ok and d_ok and filt_ok
@@ -555,13 +582,23 @@ def tp_k05_snapshot_load() -> None:
     load.seed_baseline()
     # drop unused biz tables' data cost: seed_baseline seeds all TABLES including t2-t4;
     # pipeline only watches t1|typed|large — OK, extra tables just sit in MySQL.
+    # Baseline before CDC starts so historical topic data cannot satisfy the wait.
+    base_t1 = topic_end_sum(TOPIC_T1)
+    base_ty = topic_end_sum(TOPIC_TYPED)
+    base_lg = topic_end_sum(TOPIC_LARGE)
     start_load_cdc()
     need_t1 = int(load.ROWS * 0.99)
     need_typed = int(load.ROWS * 0.99)
     need_large = int(load.LARGE_ROWS * 0.99)
-    t_t1 = wait_topic_msgs(TOPIC_T1, min_end=need_t1, timeout_s=3600, desc="k05 t1 snapshot")
-    t_ty = wait_topic_msgs(TOPIC_TYPED, min_end=need_typed, timeout_s=3600, desc="k05 typed snapshot")
-    t_lg = wait_topic_msgs(TOPIC_LARGE, min_end=need_large, timeout_s=3600, desc="k05 large snapshot")
+    t_t1 = wait_topic_msgs(
+        TOPIC_T1, baseline=base_t1, min_increase=need_t1, timeout_s=3600, desc="k05 t1 snapshot"
+    )
+    t_ty = wait_topic_msgs(
+        TOPIC_TYPED, baseline=base_ty, min_increase=need_typed, timeout_s=3600, desc="k05 typed snapshot"
+    )
+    t_lg = wait_topic_msgs(
+        TOPIC_LARGE, baseline=base_lg, min_increase=need_large, timeout_s=3600, desc="k05 large snapshot"
+    )
     end_t1 = topic_end_sum(TOPIC_T1)
     end_ty = topic_end_sum(TOPIC_TYPED)
     end_lg = topic_end_sum(TOPIC_LARGE)
@@ -723,7 +760,9 @@ def tp_k08_large_fields() -> None:
 def tp_k06_peak_catchup() -> None:
     """Peak writers on MySQL; Kafka end offsets catch up within 1% behind."""
     src_before = load.count_rows(load.SRC, load.SRC_DB, "tpl01_t1")
+    src_ty_before = load.count_rows(load.SRC, load.SRC_DB, load.TYPED_TABLE)
     end_before = topic_end_sum(TOPIC_T1)
+    base_ty = topic_end_sum(TOPIC_TYPED)
     stop_at = time.time() + load.PEAK_SEC
     counter = [0]
     lock = threading.Lock()
@@ -735,28 +774,40 @@ def tp_k06_peak_catchup() -> None:
         ]
         written = sum(f.result() for f in futs)
     src_after = load.count_rows(load.SRC, load.SRC_DB, "tpl01_t1")
-    need = int(src_after * 0.99)
-    elapsed = wait_topic_msgs(TOPIC_T1, min_end=need, timeout_s=3600, desc="k06 peak catch-up")
-    # typed also received peak inserts
     src_ty = load.count_rows(load.SRC, load.SRC_DB, load.TYPED_TABLE)
+    # Wait for this peak's CDC volume only (not cumulative src vs cumulative end).
+    need_inc = peak_msg_min_increase(src_before, src_after)
+    elapsed = wait_topic_msgs(
+        TOPIC_T1,
+        baseline=end_before,
+        min_increase=need_inc,
+        timeout_s=3600,
+        desc="k06 peak catch-up",
+    )
+    need_inc_ty = peak_msg_min_increase(src_ty_before, src_ty)
     wait_topic_msgs(
         TOPIC_TYPED,
-        min_end=int(src_ty * 0.99),
+        baseline=base_ty,
+        min_increase=need_inc_ty,
         timeout_s=3600,
         desc="k06 typed peak catch-up",
     )
     end_after = topic_end_sum(TOPIC_T1)
-    behind = max(0, src_after - end_after) / max(src_after, 1)
-    grew = end_after > end_before and src_after > src_before
+    src_inc = src_after - src_before
+    kafka_inc = end_after - end_before
+    behind = max(0, src_inc - kafka_inc) / max(src_inc, 1)
+    grew = kafka_inc > 0 and src_inc > 0
     ok = behind <= 0.01 and grew and written > 0
     detail = (
         "| Check | Actual | Verdict |\n| --- | --- | --- |\n"
         f"| peak written (per-worker sum) | {written} | {'✅' if written > 0 else '❌'} |\n"
-        f"| src t1 before→after | {src_before}→{src_after} | {'✅' if src_after > src_before else '❌'} |\n"
-        f"| kafka end before→after | {end_before}→{end_after} | {'✅' if grew else '❌'} |\n"
-        f"| behind src | {behind:.2%} | {'✅' if behind <= 0.01 else '❌'} |\n"
+        f"| src t1 before→after | {src_before}→{src_after} (Δ{src_inc}) | "
+        f"{'✅' if src_inc > 0 else '❌'} |\n"
+        f"| kafka end before→after | {end_before}→{end_after} (Δ{kafka_inc}, need≥{need_inc}) | "
+        f"{'✅' if grew else '❌'} |\n"
+        f"| behind this peak | {behind:.2%} | {'✅' if behind <= 0.01 else '❌'} |\n"
         f"| catch-up time | {elapsed:.1f}s | |\n"
-        "| lag metric | distinct-id ALO: use end≥0.99×src (dups OK) | ✅ |\n"
+        "| lag metric | ALO: kafka Δ ≥ 0.99×src Δ for this peak | ✅ |\n"
     )
     record(
         TPResult(

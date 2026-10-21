@@ -506,16 +506,94 @@ func TestTopicForWhitespace(t *testing.T) {
 }
 
 func TestMessageKey(t *testing.T) {
-	key := messageKey(event.Event{
+	key, err := messageKey(event.Event{
 		Op: event.OpUpdate, Keys: []string{"id", "tenant"},
 		After: map[string]any{"id": 7, "tenant": "a"},
 	})
-	if string(key) != "7|a" {
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(key) != `[7,"a"]` {
 		t.Fatalf("key=%q", key)
 	}
-	key = messageKey(event.Event{Op: event.OpDelete, Keys: []string{"id"}, Before: map[string]any{"id": 3}})
-	if string(key) != "3" {
+	key, err = messageKey(event.Event{Op: event.OpDelete, Keys: []string{"id"}, Before: map[string]any{"id": 3}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(key) != `[3]` {
 		t.Fatalf("delete key=%q", key)
+	}
+
+	// Composite values containing '|' must not collide.
+	a, err := messageKey(event.Event{
+		Op: event.OpCreate, Keys: []string{"a", "b"},
+		After: map[string]any{"a": "x|y", "b": "z"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := messageKey(event.Event{
+		Op: event.OpCreate, Keys: []string{"a", "b"},
+		After: map[string]any{"a": "x", "b": "y|z"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(a) == string(b) {
+		t.Fatalf("collision: both=%q", a)
+	}
+	if string(a) != `["x|y","z"]` || string(b) != `["x","y|z"]` {
+		t.Fatalf("a=%q b=%q", a, b)
+	}
+
+	// Deterministic: same ordered values → same key.
+	again, err := messageKey(event.Event{
+		Op: event.OpCreate, Keys: []string{"a", "b"},
+		After: map[string]any{"a": "x|y", "b": "z"},
+	})
+	if err != nil || string(again) != string(a) {
+		t.Fatalf("deterministic: %q err=%v", again, err)
+	}
+
+	// Missing and nil both encode as "" (prior join behavior).
+	miss, err := messageKey(event.Event{
+		Op: event.OpCreate, Keys: []string{"id", "tenant"},
+		After: map[string]any{"id": 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nilTenant, err := messageKey(event.Event{
+		Op: event.OpCreate, Keys: []string{"id", "tenant"},
+		After: map[string]any{"id": 1, "tenant": nil},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(miss) != `[1,""]` || string(nilTenant) != `[1,""]` {
+		t.Fatalf("missing/nil: miss=%q nil=%q", miss, nilTenant)
+	}
+
+	// Type distinction: int vs string.
+	asInt, err := messageKey(event.Event{
+		Op: event.OpCreate, Keys: []string{"id"}, After: map[string]any{"id": 7},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	asStr, err := messageKey(event.Event{
+		Op: event.OpCreate, Keys: []string{"id"}, After: map[string]any{"id": "7"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(asInt) != `[7]` || string(asStr) != `["7"]` || string(asInt) == string(asStr) {
+		t.Fatalf("type: int=%q str=%q", asInt, asStr)
+	}
+
+	empty, err := messageKey(event.Event{Op: event.OpCreate, Keys: nil, After: map[string]any{"id": 1}})
+	if err != nil || empty != nil {
+		t.Fatalf("no keys: %q err=%v", empty, err)
 	}
 }
 
