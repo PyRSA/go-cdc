@@ -19,6 +19,7 @@ REPORT_DIR = ROOT / "docs" / "test" / "reports"
 REPORT_FUNC = REPORT_DIR / "mysql-mysql-func.md"
 REPORT_TYPES = REPORT_DIR / "mysql-mysql-types.md"
 REPORT_LOAD = REPORT_DIR / "mysql-mysql-load.md"
+REPORT_KAFKA = REPORT_DIR / "mysql-kafka.md"
 
 
 def env(name: str, default: str = "") -> str:
@@ -50,6 +51,12 @@ CDC_SERVER_ID = env("CDC_SERVER_ID", "5613")
 CDC_SERVER_ID_STDOUT = env("CDC_SERVER_ID_STDOUT", "5612")
 CDC_SERVER_ID_TYPES = env("CDC_SERVER_ID_TYPES", "5614")
 CDC_SERVER_ID_LOAD = env("CDC_SERVER_ID_LOAD", "5615")
+CDC_SERVER_ID_KAFKA = env("CDC_SERVER_ID_KAFKA", "5616")
+CDC_SERVER_ID_KAFKA_LOAD = env("CDC_SERVER_ID_KAFKA_LOAD", "5617")
+
+KAFKA_BROKERS = env("KAFKA_BROKERS", "127.0.0.1:19092")
+KAFKA_DEFAULT_TOPIC = env("KAFKA_DEFAULT_TOPIC", "cdc_default")
+KAFKA_EMIT_DDL = env("KAFKA_EMIT_DDL", "false")
 
 
 def it_rel_path(path: str | Path) -> str:
@@ -80,11 +87,17 @@ CHECKPOINT_TYPES_DIR = _abs_under_it(
     env("CHECKPOINT_TYPES_DIR", str(WORKDIR / "ckpts-types"))
 )
 CHECKPOINT_LOAD_DIR = _abs_under_it(env("CHECKPOINT_LOAD_DIR", str(WORKDIR / "ckpts-load")))
+CHECKPOINT_KAFKA_DIR = _abs_under_it(env("CHECKPOINT_KAFKA_DIR", str(WORKDIR / "ckpts-kafka")))
+CHECKPOINT_KAFKA_LOAD_DIR = _abs_under_it(
+    env("CHECKPOINT_KAFKA_LOAD_DIR", str(WORKDIR / "ckpts-kafka-load"))
+)
 
 PIPELINE_NAME = "tp_func_pipeline"
 PIPELINE_STDOUT_NAME = "tp_func_stdout"
 PIPELINE_TYPES_NAME = "tp_types_pipeline"
 PIPELINE_LOAD_NAME = "tp_load_pipeline"
+PIPELINE_KAFKA_NAME = "tp_kafka_pipeline"
+PIPELINE_KAFKA_LOAD_NAME = "tp_kafka_load_pipeline"
 
 ASSERT_TIME_ZONE = env("ASSERT_TIME_ZONE", "+08:00")
 
@@ -166,6 +179,8 @@ CHECKPOINT_PATH = checkpoint_file(CHECKPOINT_DIR, PIPELINE_NAME)
 CHECKPOINT_STDOUT_PATH = checkpoint_file(CHECKPOINT_STDOUT_DIR, PIPELINE_STDOUT_NAME)
 CHECKPOINT_TYPES_PATH = checkpoint_file(CHECKPOINT_TYPES_DIR, PIPELINE_TYPES_NAME)
 CHECKPOINT_LOAD_PATH = checkpoint_file(CHECKPOINT_LOAD_DIR, PIPELINE_LOAD_NAME)
+CHECKPOINT_KAFKA_PATH = checkpoint_file(CHECKPOINT_KAFKA_DIR, PIPELINE_KAFKA_NAME)
+CHECKPOINT_KAFKA_LOAD_PATH = checkpoint_file(CHECKPOINT_KAFKA_LOAD_DIR, PIPELINE_KAFKA_LOAD_NAME)
 
 
 def render_template(tpl_name: str, out_path: Path, extra: dict | None = None) -> Path:
@@ -190,14 +205,24 @@ def render_template(tpl_name: str, out_path: Path, extra: dict | None = None) ->
         "CDC_SERVER_ID_STDOUT": CDC_SERVER_ID_STDOUT,
         "CDC_SERVER_ID_TYPES": CDC_SERVER_ID_TYPES,
         "CDC_SERVER_ID_LOAD": CDC_SERVER_ID_LOAD,
+        "CDC_SERVER_ID_KAFKA": CDC_SERVER_ID_KAFKA,
+        "CDC_SERVER_ID_KAFKA_LOAD": CDC_SERVER_ID_KAFKA_LOAD,
         "CHECKPOINT_DIR": it_rel_path(CHECKPOINT_DIR),
         "CHECKPOINT_STDOUT_DIR": it_rel_path(CHECKPOINT_STDOUT_DIR),
         "CHECKPOINT_TYPES_DIR": it_rel_path(CHECKPOINT_TYPES_DIR),
         "CHECKPOINT_LOAD_DIR": it_rel_path(CHECKPOINT_LOAD_DIR),
+        "CHECKPOINT_KAFKA_DIR": it_rel_path(CHECKPOINT_KAFKA_DIR),
+        "CHECKPOINT_KAFKA_LOAD_DIR": it_rel_path(CHECKPOINT_KAFKA_LOAD_DIR),
         "PIPELINE_NAME": PIPELINE_NAME,
         "PIPELINE_STDOUT_NAME": PIPELINE_STDOUT_NAME,
         "PIPELINE_TYPES_NAME": PIPELINE_TYPES_NAME,
         "PIPELINE_LOAD_NAME": PIPELINE_LOAD_NAME,
+        "PIPELINE_KAFKA_NAME": PIPELINE_KAFKA_NAME,
+        "PIPELINE_KAFKA_LOAD_NAME": PIPELINE_KAFKA_LOAD_NAME,
+        "KAFKA_BROKERS": KAFKA_BROKERS,
+        "KAFKA_DEFAULT_TOPIC": KAFKA_DEFAULT_TOPIC,
+        "KAFKA_EMIT_DDL": KAFKA_EMIT_DDL,
+        "LOAD_PARALLELISM": str(LOAD_PARALLELISM),
     }
     if extra:
         mapping.update({k: str(v) for k, v in extra.items()})

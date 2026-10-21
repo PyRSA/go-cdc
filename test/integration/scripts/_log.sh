@@ -36,9 +36,13 @@ absolutize_go_cdc() {
 }
 
 # Checkpoint dirs used by rm -rf before cd IT; keep absolute under IT.
+# Only touch variables that the caller exported (kafka-e2e may omit mysql dirs).
 absolutize_checkpoint_dirs() {
-  _absolutize_under_it CHECKPOINT_DIR
-  _absolutize_under_it CHECKPOINT_STDOUT_DIR
-  _absolutize_under_it CHECKPOINT_TYPES_DIR
-  _absolutize_under_it CHECKPOINT_LOAD_DIR
+  local name
+  for name in CHECKPOINT_DIR CHECKPOINT_STDOUT_DIR CHECKPOINT_TYPES_DIR \
+    CHECKPOINT_LOAD_DIR CHECKPOINT_KAFKA_DIR CHECKPOINT_KAFKA_LOAD_DIR; do
+    if [ -n "${!name:-}" ]; then
+      _absolutize_under_it "${name}"
+    fi
+  done
 }

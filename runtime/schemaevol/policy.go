@@ -1,4 +1,4 @@
-// Package schemaevol decides which DDL reaches MySQL and which is stdout-only.
+// Package schemaevol decides which DDL MySQL executes; stdout/Kafka may still emit envelopes.
 package schemaevol
 
 import (
@@ -15,7 +15,8 @@ type Decision struct {
 
 // Decide classifies SQL and applies projection plus the drop/truncate switch.
 // CREATE is not executed as raw SQL: the sink builds the table from the projected columns.
-// A false Execute still leaves the statement available for stdout.
+// A false Execute still leaves the statement available for stdout/Kafka envelopes
+// (Kafka also gates on sink.schema.change.emit.enabled).
 func Decide(sql string, projection []string, dropTruncate bool) Decision {
 	change := schema.Classify(sql)
 	decision := Decision{Change: change}

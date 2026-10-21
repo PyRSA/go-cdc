@@ -6,26 +6,34 @@ import (
 	"testing"
 
 	"github.com/PyRSA/go-cdc/common/event"
+	"github.com/PyRSA/go-cdc/common/schema"
 )
 
 func TestCRUDOneLinePerEvent(t *testing.T) {
 	var buf bytes.Buffer
 	sink := New(&buf)
+	sink.SetSourceName("demo")
 	err := sink.Write([]event.Event{{
 		Op: event.OpUpdate, Database: "tests", Table: "users",
+		SourceDatabase: "tests", SourceTable: "users",
 		Before: map[string]any{"id": int64(1), "name": "alice"},
 		After:  map[string]any{"id": int64(1), "name": "alice2"},
 	}, {
 		Op: event.OpRead, Database: "tests", Table: "users",
+		SourceDatabase: "tests", SourceTable: "users",
 		After: map[string]any{"id": int64(1), "name": "alice"},
 	}, {
 		Op: event.OpCreate, Database: "tests", Table: "users",
+		SourceDatabase: "tests", SourceTable: "users",
 		After: map[string]any{"id": int64(2), "name": "bob"},
 	}, {
 		Op: event.OpDelete, Database: "tests", Table: "users",
+		SourceDatabase: "tests", SourceTable: "users",
 		Before: map[string]any{"id": int64(1), "name": "alice"},
 	}, {
-		Op: event.OpDDL, Database: "tests", Table: "users", DDL: "ALTER TABLE users ADD COLUMN age int",
+		Op: event.OpDDL, Database: "tests", Table: "users",
+		SourceDatabase: "tests", SourceTable: "users",
+		DDL: "ALTER TABLE users ADD COLUMN age int",
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -52,12 +60,13 @@ func TestCRUDOneLinePerEvent(t *testing.T) {
 		if item["op"] != want[i].op {
 			t.Fatalf("line %d op=%v want %s", i, item["op"], want[i].op)
 		}
+		src, _ := item["source"].(map[string]any)
+		if src["name"] != "demo" || src["db"] != "tests" || src["table"] != "users" {
+			t.Fatalf("line %d source=%v", i, src)
+		}
 		if want[i].op == "ddl" {
-			if _, ok := item["before"]; ok {
-				t.Fatalf("ddl has before: %s", raw)
-			}
-			if _, ok := item["after"]; ok {
-				t.Fatalf("ddl has after: %s", raw)
+			if item["before"] != nil || item["after"] != nil {
+				t.Fatalf("ddl has row images: %s", raw)
 			}
 			continue
 		}
@@ -69,5 +78,25 @@ func TestCRUDOneLinePerEvent(t *testing.T) {
 		if hasAfter != want[i].after {
 			t.Fatalf("line %d after present=%v want %v: %s", i, hasAfter, want[i].after, raw)
 		}
+	}
+}
+
+func TestApplySchemaSourceTSMs(t *testing.T) {
+	var buf bytes.Buffer
+	sink := New(&buf)
+	sink.SetSourceName("demo")
+	if err := sink.ApplySchema(schema.Change{
+		Database: "tests", Table: "users",
+		DDL: "ALTER TABLE users ADD COLUMN age int", SourceTSMs: 42,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var item map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &item); err != nil {
+		t.Fatal(err)
+	}
+	src, _ := item["source"].(map[string]any)
+	if item["op"] != "ddl" || src["ts_ms"] != float64(42) {
+		t.Fatalf("got %s", buf.String())
 	}
 }

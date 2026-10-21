@@ -32,6 +32,9 @@ type Event struct {
 	Keys           []string
 	SourceDatabase string
 	SourceTable    string
+	// SourceTSMs is the binlog event time in Unix milliseconds when known.
+	// Zero means unavailable; sinks must not invent a wall-clock substitute.
+	SourceTSMs int64
 }
 
 // SourceID returns the capturing table as database.table.

@@ -14,10 +14,11 @@ YAML-driven MySQL CDC. Binary: `go-cdc`.
 | `docs/pipeline.md` | Source / Transform / Projection / Route / Schema Evolution / Sink |
 | `docs/connectors/mysql-source.md` | MySQL source options |
 | `docs/connectors/mysql-sink.md` | MySQL sink options |
-| `docs/connectors/stdout-sink.md` | Stdout sink (`type` only) + JSON format |
+| `docs/connectors/stdout-sink.md` | Stdout sink + shared CDC JSON format |
+| `docs/connectors/kafka-sink.md` | Kafka sink (franz-go, at-least-once) |
 | `docs/performance/mysql-to-mysql-e2e.md` | MySQL→MySQL CI scale/load performance detail; README has summary |
 
-Demos: `configs/demo-stdout.yaml`, `configs/demo-mysql.yaml`  
+Demos: `configs/demo-stdout.yaml`, `configs/demo-mysql.yaml`, `configs/demo-kafka.yaml`  
 Internal design: `docs/architecture.md`
 
 ## Commands

@@ -1,5 +1,5 @@
 // Command go-cdc runs one YAML pipeline.
-// sink.type selects stdout or mysql. Kafka, Doris, and Elasticsearch are rejected at startup.
+// sink.type selects stdout, mysql, or kafka. Doris and Elasticsearch are rejected at startup.
 package main
 
 import (
@@ -15,6 +15,7 @@ import (
 	"github.com/PyRSA/go-cdc/composer"
 	"github.com/PyRSA/go-cdc/composer/definition"
 	"github.com/PyRSA/go-cdc/connector/sink"
+	kafkasink "github.com/PyRSA/go-cdc/connector/sink/kafka"
 	mysqlsink "github.com/PyRSA/go-cdc/connector/sink/mysql"
 	"github.com/PyRSA/go-cdc/connector/sink/stdout"
 	mysqlsrc "github.com/PyRSA/go-cdc/connector/source/mysql"
@@ -34,7 +35,7 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: go-cdc <pipeline.yaml>")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Run one YAML pipeline (source → transform/route → sink).")
-		fmt.Fprintln(os.Stderr, "Supported sinks in this release: stdout, mysql.")
+		fmt.Fprintln(os.Stderr, "Supported sinks in this release: stdout, mysql, kafka.")
 		return 0
 	}
 	if len(args) != 1 {
@@ -142,12 +143,22 @@ func openSink(pipe *definition.Pipeline) (sink.Sink, error) {
 	switch pipe.Sink.Type {
 	case "stdout":
 		sk := stdout.New(os.Stdout)
+		sk.SetSourceName(pipe.Runtime.Name)
 		if err := sk.Open(context.Background()); err != nil {
 			return nil, err
 		}
 		return sk, nil
 	case "mysql":
 		sk, err := mysqlsink.Open(pipe.Sink, pipe.Source.TimeZone)
+		if err != nil {
+			return nil, err
+		}
+		if err := sk.Open(context.Background()); err != nil {
+			return nil, err
+		}
+		return sk, nil
+	case "kafka":
+		sk, err := kafkasink.Open(pipe.Sink, pipe.Runtime.Name)
 		if err != nil {
 			return nil, err
 		}

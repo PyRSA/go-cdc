@@ -33,8 +33,9 @@ Writes results. Supported types:
 | --- | --- |
 | `stdout` | [connectors/stdout-sink.md](connectors/stdout-sink.md) |
 | `mysql` | [connectors/mysql-sink.md](connectors/mysql-sink.md) |
+| `kafka` | [connectors/kafka-sink.md](connectors/kafka-sink.md) |
 
-`kafka`, `doris`, and `elasticsearch` are **not** available in this release (startup fails if configured).
+`doris` and `elasticsearch` are **not** available in this release (startup fails if configured).
 
 ---
 
@@ -128,16 +129,23 @@ DDL comes from the source when `source.schema-change.enabled` is `true` (default
 
 ### Behavior summary
 
-| DDL kind | Behavior |
+**MySQL sink** honors `schemaevol.Decide` (`Execute`) and `schema.change.drop-truncate.enabled`:
+
+| DDL kind | MySQL sink |
 | --- | --- |
-| Add / drop / modify / rename column | May be applied after projection trimming |
+| Add / drop / modify / rename column | Applied when the column is in the projection (or projection is `*`) |
 | DROP TABLE / TRUNCATE | Only if `schema.change.drop-truncate.enabled: true` |
-| CREATE TABLE (raw statement) | Not applied as raw SQL; MySQL sink builds `CREATE TABLE` from inferred schema / `auto-create-table` (comments, charset/collation, defaults, secondary/unique indexes; no FK/ENGINE/partition) |
-| Other (e.g. index-only) | Usually not executed on MySQL sink |
+| CREATE TABLE (raw statement) | Not applied as raw SQL; builds `CREATE TABLE` from inferred schema / `auto-create-table` |
+| Other (e.g. index-only) | Usually not executed |
 
-Stdout sink prints `"op":"ddl"` for DDL that passes the policy.
+**Stdout / Kafka** do **not** gate on `Execute` or drop-truncate:
 
-Details: [MySQL Source](connectors/mysql-source.md), [MySQL Sink](connectors/mysql-sink.md).
+| Sink | DDL envelopes |
+| --- | --- |
+| Stdout | Always prints `"op":"ddl"` when source emits DDL |
+| Kafka | Emits `"op":"ddl"` only when `schema.change.emit.enabled: true`; topic follows the same route rules as DML (see [Kafka Sink](connectors/kafka-sink.md)) |
+
+Details: [MySQL Source](connectors/mysql-source.md), [MySQL Sink](connectors/mysql-sink.md), [Stdout Sink](connectors/stdout-sink.md), [Kafka Sink](connectors/kafka-sink.md).
 
 ---
 
@@ -167,7 +175,7 @@ source:
   type: mysql
   # … see mysql-source.md
 sink:
-  type: mysql   # or stdout — see sink docs
+  type: mysql   # or stdout / kafka — see sink docs
   # …
 transform:
   - source-table: demo_db\.orders
@@ -195,3 +203,4 @@ checkpoint:
 - Sink connectors
   - [MySQL Sink](connectors/mysql-sink.md)
   - [Stdout Sink](connectors/stdout-sink.md)
+  - [Kafka Sink](connectors/kafka-sink.md)

@@ -1,0 +1,34 @@
+# Quick start: MySQL → Kafka (at-least-once)
+# Edit hostname / brokers / tables, then:
+#   ./bin/go-cdc configs/demo-kafka.yaml
+
+source:
+  type: mysql
+  hostname: 127.0.0.1
+  port: 3306
+  username: root
+  password: secret
+  tables: demo_db\..*
+  server-id: 5403
+  server-time-zone: Asia/Shanghai
+  scan.startup.mode: initial
+
+sink:
+  type: kafka
+  brokers: 127.0.0.1:9092
+  topic: cdc_events
+  source-name: demo-mysql
+  schema.change.emit.enabled: false
+
+# Optional: send users to topic "kafka.users" instead of cdc_events
+# route:
+#   - source-table: demo_db\.users
+#     sink-table: kafka.users
+
+pipeline:
+  name: demo-kafka
+
+checkpoint:
+  storage: file
+  interval: 10s
+  file-path: ./checkpoints
