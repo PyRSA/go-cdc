@@ -92,7 +92,7 @@ func Open(cfg definition.Sink, pipelineName string) (*Sink, error) {
 			clientID = "go-cdc-" + pipelineName
 		}
 	}
-	batch := int32(defaultProducerBatchMaxBytes)
+	batch := defaultProducerBatchMaxBytes
 	if cfg.ProducerBatchMaxBytes > 0 {
 		batch = int32(cfg.ProducerBatchMaxBytes)
 	}
