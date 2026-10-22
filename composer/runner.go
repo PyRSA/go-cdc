@@ -48,13 +48,14 @@ func Run(ctx context.Context, pipe *definition.Pipeline, msgs <-chan source.Mess
 
 	var batch []event.Event
 	flush := func() error {
-		if len(batch) == 0 {
-			return nil
+		// Always Flush so out-of-band sink writes (e.g. Kafka ApplySchema DDL)
+		// are acknowledged before checkpoint, even when the DML batch is empty.
+		if len(batch) > 0 {
+			if err := sk.Write(batch); err != nil {
+				return err
+			}
+			batch = batch[:0]
 		}
-		if err := sk.Write(batch); err != nil {
-			return err
-		}
-		batch = batch[:0]
 		return sk.Flush()
 	}
 	save := func() error {
@@ -195,12 +196,13 @@ func applyDDL(pipe *definition.Pipeline, rules *transform.Set, routes *route.Set
 		change.Database = dst.Database
 		change.Table = dst.Table
 		change.DDL = schemaevol.RewriteTable(dst.DDL, dst.Database, dst.Table)
-		if pipe.Sink.Type == "stdout" {
+		if pipe.Sink.Type == "stdout" || pipe.Sink.Type == "kafka" {
+			// Keep Database/Table as the routed sink id (topic = DML). Envelope source.*
+			// uses SourceDatabase/SourceTable from the capturing table.
 			change.DDL = dst.DDL
-			if dst.SourceDatabase != "" {
-				change.Database = dst.SourceDatabase
-				change.Table = dst.SourceTable
-			}
+			change.SourceTSMs = item.SourceTSMs
+			change.SourceDatabase = dst.SourceDatabase
+			change.SourceTable = dst.SourceTable
 			if err := sk.ApplySchema(change); err != nil {
 				return err
 			}

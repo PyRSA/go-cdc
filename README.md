@@ -4,13 +4,14 @@
 
 ## Introduction
 
-go-cdc is a YAML-driven Change Data Capture (CDC) tool. You describe one sync job in a single YAML file: capture full and incremental changes from MySQL, apply optional transform and route, then write to **stdout** or **MySQL**. One process, one config, one binary: `go-cdc`.
+go-cdc is a YAML-driven Change Data Capture (CDC) tool. You describe one sync job in a single YAML file: capture full and incremental changes from MySQL, apply optional transform and route, then write to **stdout**, **MySQL**, or **Kafka** (at-least-once). One process, one config, one binary: `go-cdc`.
 
 Features in this release:
 
 - MySQL source (snapshot + binlog)
-- Stdout sink (newline-delimited JSON) and MySQL sink
+- Stdout sink (newline-delimited JSON), MySQL sink, and Kafka sink (at-least-once)
 - Projection, filter, table route, schema-change policy, file checkpoints
+- **Note:** stdout JSON now uses the shared Debezium-inspired envelope (`source.db` / `source.table`); older top-level `database` / `table` fields are gone
 
 ## Build Environment
 
@@ -101,6 +102,7 @@ See the guides under `[docs/](docs/)`:
 - Sink connectors
   - [MySQL Sink](docs/connectors/mysql-sink.md)
   - [Stdout Sink](docs/connectors/stdout-sink.md)
+  - [Kafka Sink](docs/connectors/kafka-sink.md)
 
 **Minimal run (MySQL → stdout):**
 

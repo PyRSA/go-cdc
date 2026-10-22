@@ -70,4 +70,11 @@ type Change struct {
 	Column   string
 	NewName  string
 	DDL      string
+	// SourceDatabase / SourceTable are the capturing table when set (stdout/Kafka envelopes).
+	// Database / Table remain the routed sink id so Kafka topicFor can match DML routing.
+	SourceDatabase string
+	SourceTable    string
+	// SourceTSMs is the binlog event time in Unix milliseconds when known (same as event.SourceTSMs).
+	// Zero means unavailable → JSON source.ts_ms is null. Stdout/Kafka copy it into DDL envelopes.
+	SourceTSMs int64
 }

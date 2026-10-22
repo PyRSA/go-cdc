@@ -12,7 +12,8 @@ YAML-driven MySQL CDC. Binary: `go-cdc`.
 - `docs/pipeline.md`
 - `docs/connectors/mysql-source.md`
 - `docs/connectors/mysql-sink.md`
-- `docs/connectors/stdout-sink.md` — only `type: stdout`
+- `docs/connectors/stdout-sink.md` — stdout + shared CDC JSON
+- `docs/connectors/kafka-sink.md` — Kafka (franz-go, at-least-once)
 - `docs/performance/mysql-to-mysql-e2e.md` — MySQL→MySQL CI performance detail (README summary only)
 
 Document only options accepted by `composer/definition/parse.go`.

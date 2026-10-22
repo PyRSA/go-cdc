@@ -122,7 +122,7 @@ jobs:
         run: make build
 
   mysql-mysql-e2e:
-    name: MySQL ${{ matrix.mysql }} (func + types + load)
+    name: MySQL ${{ matrix.mysql }} (func + types + load${{ matrix.mysql == '8.0' && ' + kafka' || '' }})
     # No job-level if: intentionally cascade-skips when go-check is skipped
     # (decide.run=false). Do not add if: always() / !cancelled() here.
     needs: go-check
@@ -204,6 +204,31 @@ jobs:
           LOAD_LARGE_FIELD_BYTES: "2097152"
         run: bash scripts/run-e2e.sh
 
+      # Kafka sink IT (TP-K01..K08): MySQL 8.0 matrix only; reuses the same compose project.
+      # Load knobs inherit LOAD_* from GITHUB_ENV (same tier as mysql→mysql load) + peak matrix.
+      - name: Start Kafka (docker compose)
+        if: matrix.mysql == '8.0'
+        env:
+          MYSQL_TAG: ${{ matrix.tag }}
+          COMPOSE_PROJECT_NAME: gocdc-it-${{ matrix.tag }}
+          KAFKA_HOST_PORT: "19092"
+        run: bash scripts/kafka-up.sh
+
+      - name: Run Kafka sink harness
+        if: matrix.mysql == '8.0'
+        env:
+          MYSQL_HOST: 127.0.0.1
+          MYSQL_PORT: 13306
+          MYSQL_TAG: ${{ matrix.tag }}
+          COMPOSE_PROJECT_NAME: gocdc-it-${{ matrix.tag }}
+          KAFKA_BROKERS: 127.0.0.1:19092
+          KAFKA_HOST_PORT: "19092"
+          LOAD_PEAK_SECONDS: ${{ matrix.peak_seconds }}
+          LOAD_PEAK_WORKERS: ${{ matrix.peak_workers }}
+          LOAD_LARGE_ROWS: "50"
+          LOAD_LARGE_FIELD_BYTES: "2097152"
+        run: bash scripts/run-kafka-e2e.sh
+
       - name: Prune prior IT report artifact
         if: >
           always() &&
@@ -236,6 +261,7 @@ jobs:
           name: go-cdc-it-report-mysql-${{ matrix.mysql }}
           path: |
             docs/test/reports/mysql-mysql-*.md
+            docs/test/reports/mysql-kafka.md
             test/integration/workdir/ckpts*/**/*.ckpt
             test/integration/workdir/*.log
           if-no-files-found: warn

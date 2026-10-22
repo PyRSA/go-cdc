@@ -275,18 +275,23 @@ func (h *handler) OnRow(e *canal.RowsEvent) error {
 		return err
 	}
 	keys := primaryKeys(e.Table)
+	var sourceTSMs int64
+	if e.Header != nil && e.Header.Timestamp != 0 {
+		sourceTSMs = int64(e.Header.Timestamp) * 1000
+	}
 	for i := range events {
 		if h.dropRow() {
 			continue
 		}
 		item := events[i]
 		item.Keys = append([]string(nil), keys...)
+		item.SourceTSMs = sourceTSMs
 		h.ch <- Commit{Event: &item}
 	}
 	return nil
 }
 
-func (h *handler) OnDDL(_ *replication.EventHeader, _ mysql.Position, query *replication.QueryEvent) error {
+func (h *handler) OnDDL(header *replication.EventHeader, _ mysql.Position, query *replication.QueryEvent) error {
 	text := string(query.Query)
 	if strings.EqualFold(text, "BEGIN") {
 		return nil
@@ -309,9 +314,14 @@ func (h *handler) OnDDL(_ *replication.EventHeader, _ mysql.Position, query *rep
 	if h.dropEvent() {
 		return nil
 	}
+	var sourceTSMs int64
+	if header != nil && header.Timestamp != 0 {
+		sourceTSMs = int64(header.Timestamp) * 1000
+	}
 	commit := Commit{Event: &event.Event{
 		Op: event.OpDDL, Database: database, Table: change.Table,
 		SourceDatabase: database, SourceTable: change.Table, DDL: text,
+		SourceTSMs: sourceTSMs,
 	}}
 	if change.Action == schema.ActionCreate && h.canal != nil {
 		table, err := h.canal.GetTable(database, change.Table)

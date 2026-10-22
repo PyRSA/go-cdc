@@ -10,13 +10,19 @@ import (
 )
 
 const (
-	defaultPort       = 3306
-	defaultChunkSize  = 8096
-	defaultFetchSize  = 1024
-	defaultParallel   = 1
-	defaultBatchSize  = 1000
-	defaultMaxRetries = 3
-	minConnectTimeout = 250 * time.Millisecond
+	defaultPort                  = 3306
+	defaultChunkSize             = 8096
+	defaultFetchSize             = 1024
+	defaultParallel              = 1
+	defaultBatchSize             = 1000
+	defaultMaxRetries            = 3
+	minConnectTimeout            = 250 * time.Millisecond
+	defaultProducerBatchMaxBytes = 10 << 20 // 10 MiB
+	// franz-go v1.21.7 accepts ProducerBatchMaxBytes in [512, maxBrokerWriteBytes].
+	// The default maxBrokerWriteBytes is 100<<20; BrokerMaxWriteBytes is not raised.
+	minProducerBatchMaxBytes = 512
+	maxProducerBatchMaxBytes = 100 << 20 // 104857600
+	defaultFlushTimeout      = 30 * time.Second
 )
 
 var startupModes = map[string]struct{}{
@@ -278,11 +284,14 @@ func parseSink(raw map[string]any) (Sink, error) {
 		return Sink{}, configErr("sink", "required")
 	}
 	out := Sink{
-		Port:            defaultPort,
-		AutoCreate:      true,
-		WriteBatchSize:  defaultBatchSize,
-		WriteBatchEvery: time.Second,
-		MaxRetries:      defaultMaxRetries,
+		Port:                  defaultPort,
+		AutoCreate:            true,
+		WriteBatchSize:        defaultBatchSize,
+		WriteBatchEvery:       time.Second,
+		MaxRetries:            defaultMaxRetries,
+		AllowAutoCreateTopics: true, // kafka: keep prior Always-on AllowAutoTopicCreation
+		ProducerBatchMaxBytes: defaultProducerBatchMaxBytes,
+		FlushTimeout:          defaultFlushTimeout,
 	}
 	for key, value := range raw {
 		switch key {
@@ -330,6 +339,42 @@ func parseSink(raw map[string]any) (Sink, error) {
 				return Sink{}, configf("sink.schema.change.drop-truncate.enabled", "%v", err)
 			}
 			out.DropTruncate = b
+		case "brokers":
+			list, err := asStringList(value)
+			if err != nil {
+				return Sink{}, configf("sink.brokers", "%v", err)
+			}
+			out.Brokers = list
+		case "topic":
+			out.Topic = strings.TrimSpace(fmt.Sprint(value))
+		case "source-name":
+			out.SourceName = strings.TrimSpace(fmt.Sprint(value))
+		case "client-id":
+			out.ClientID = strings.TrimSpace(fmt.Sprint(value))
+		case "schema.change.emit.enabled":
+			b, err := asBool(value)
+			if err != nil {
+				return Sink{}, configf("sink.schema.change.emit.enabled", "%v", err)
+			}
+			out.EmitDDL = b
+		case "allow.auto.create.topics":
+			b, err := asBool(value)
+			if err != nil {
+				return Sink{}, configf("sink.allow.auto.create.topics", "%v", err)
+			}
+			out.AllowAutoCreateTopics = b
+		case "producer-batch-max-bytes":
+			n, err := asInt(value)
+			if err != nil || n < minProducerBatchMaxBytes || n > maxProducerBatchMaxBytes {
+				return Sink{}, configf("sink.producer-batch-max-bytes", "must be an integer in %d..%d", minProducerBatchMaxBytes, maxProducerBatchMaxBytes)
+			}
+			out.ProducerBatchMaxBytes = n
+		case "flush-timeout":
+			d, err := asDuration(value)
+			if err != nil || d <= 0 {
+				return Sink{}, configErr("sink.flush-timeout", "must be a positive duration")
+			}
+			out.FlushTimeout = d
 		default:
 			return Sink{}, configErr("sink."+key, "unknown field")
 		}
@@ -346,7 +391,22 @@ func parseSink(raw map[string]any) (Sink, error) {
 		if out.Password == "" {
 			return Sink{}, configErr("sink.password", "required")
 		}
-	case "kafka", "doris", "elasticsearch":
+	case "kafka":
+		if len(out.Brokers) == 0 {
+			return Sink{}, configErr("sink.brokers", "required")
+		}
+		for i, b := range out.Brokers {
+			if strings.TrimSpace(b) == "" {
+				return Sink{}, configf("sink.brokers", "entry %d is empty", i)
+			}
+		}
+		if out.Topic == "" {
+			return Sink{}, configErr("sink.topic", "required")
+		}
+		if strings.ContainsAny(out.Topic, " \t\n") {
+			return Sink{}, configErr("sink.topic", "must not contain whitespace")
+		}
+	case "doris", "elasticsearch":
 		return Sink{}, configf("sink.type", "%s is not implemented in this release", out.Type)
 	default:
 		if out.Type == "" {
@@ -592,6 +652,40 @@ func asBool(value any) (bool, error) {
 		}
 	}
 	return false, fmt.Errorf("not a boolean")
+}
+
+func asStringList(value any) ([]string, error) {
+	switch typed := value.(type) {
+	case string:
+		parts := strings.Split(typed, ",")
+		out := make([]string, 0, len(parts))
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			out = append(out, p)
+		}
+		if len(out) == 0 {
+			return nil, fmt.Errorf("empty list")
+		}
+		return out, nil
+	case []any:
+		if len(typed) == 0 {
+			return nil, fmt.Errorf("empty list")
+		}
+		out := make([]string, 0, len(typed))
+		for i, item := range typed {
+			s := strings.TrimSpace(fmt.Sprint(item))
+			if s == "" {
+				return nil, fmt.Errorf("entry %d is empty", i)
+			}
+			out = append(out, s)
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("must be a string or list")
+	}
 }
 
 func asDuration(value any) (time.Duration, error) {

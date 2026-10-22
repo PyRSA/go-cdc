@@ -52,7 +52,7 @@ type Source struct {
 	JDBCProperties        map[string]string
 }
 
-// Sink is stdout or MySQL for this release.
+// Sink is stdout, MySQL, or Kafka for this release.
 type Sink struct {
 	Type            string
 	Hostname        string
@@ -64,6 +64,15 @@ type Sink struct {
 	WriteBatchEvery time.Duration
 	MaxRetries      int
 	DropTruncate    bool
+	// Kafka
+	Brokers               []string
+	Topic                 string
+	SourceName            string
+	ClientID              string
+	EmitDDL               bool
+	AllowAutoCreateTopics bool          // allow.auto.create.topics; default true via parseSink
+	ProducerBatchMaxBytes int           // producer-batch-max-bytes; bytes; default via parseSink
+	FlushTimeout          time.Duration // flush-timeout; default 30s via parseSink
 }
 
 // Route sends one source table pattern to a sink table.

@@ -6,6 +6,7 @@ Local runs and GitHub Actions both start a binlog-enabled MySQL via **Docker Com
 2. **Types / timezone** TP-D01..TP-D04 (`harness/types_it.py`)
 3. **Load / peak** TP-L01..TP-L04 (`harness/load_it.py`, tier A)
 4. **Scale** multi-DB/table E2E (`scale/scale_it.py`, profiles `normal` / `heavy`) — run separately via [`scale/run-scale.sh`](scale/run-scale.sh); creates scale DBs at runtime as MySQL root (see [`scale/README.md`](scale/README.md))
+5. **Kafka sink** TP-K01..TP-K04 (`harness/kafka_it.py`) — run via [`scripts/run-kafka-e2e.sh`](scripts/run-kafka-e2e.sh) after MySQL + Kafka are up
 
 Generated Markdown reports (English) land in `docs/test/reports/`:
 
@@ -15,6 +16,7 @@ Generated Markdown reports (English) land in `docs/test/reports/`:
 | Types | `docs/test/reports/mysql-mysql-types.md` |
 | Load | `docs/test/reports/mysql-mysql-load.md` |
 | Scale | `docs/test/reports/mysql-mysql-scale-{normal\|heavy}.md` |
+| Kafka | `docs/test/reports/mysql-kafka.md` |
 
 Static notes: [`docs/test/TYPES.md`](../../docs/test/TYPES.md) (not a run report).
 
@@ -94,7 +96,7 @@ Jobs:
 | Job | When / matrix | What |
 | --- | --- | --- |
 | `go-check` | always | `gofmt`, `golangci-lint`, `make test`, build, **scale unit tests** (`pytest scale/test_*.py`) |
-| `mysql-mysql-e2e` | MySQL **5.7** + **8.0** | functional + types + load |
+| `mysql-mysql-e2e` | MySQL **5.7** + **8.0** | functional + types + load; **8.0 also runs Kafka sink** TP-K01..K04 |
 | `mysql-scale-e2e` | MySQL **8.0 only** | scale `normal` or `heavy` (separate compose project / host port `13307`) |
 
 **Load tier** (`LOAD_ROWS_PER_TABLE`):
@@ -118,3 +120,25 @@ MYSQL_IMAGE=mysql:5.7.42 MYSQL_TAG=57 bash test/integration/scripts/mysql-up.sh
 bash test/integration/scripts/run-e2e.sh
 MYSQL_TAG=57 bash test/integration/scripts/mysql-down.sh
 ```
+
+## Kafka sink suite
+
+```bash
+bash test/integration/scripts/mysql-up.sh
+bash test/integration/scripts/kafka-up.sh
+bash test/integration/scripts/run-kafka-e2e.sh
+# report: docs/test/reports/mysql-kafka.md
+```
+
+| TP | Coverage |
+| --- | --- |
+| K01 | snapshot: route + default topic + projection + `city='hz'` filter + `before=null` |
+| K02 | incremental `c`/`u`/`d` + message keys; filtered `city=sh` insert absent |
+| K03 | DDL emit off (no `ddl`) and on (`ddl` on default topic) |
+| K04 | restart keeping checkpoint; new row + prior row still readable (ALO dups OK) |
+| K05 | load snapshot volume (`tpl01_t1` / typed / large) via Kafka end offsets ≥99% src |
+| K06 | peak catch-up (same `LOAD_PEAK_*` knobs as mysql→mysql load) |
+| K07 | typed column JSON spot-check |
+| K08 | mega LONGBLOB/LONGTEXT (JPEG magic + length) |
+
+CI runs this on the **MySQL 8.0** matrix job after mysql→mysql e2e, with the same `LOAD_ROWS_PER_TABLE` / peak knobs.

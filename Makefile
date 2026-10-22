@@ -5,6 +5,7 @@ GOLANGCI_LINT_VERSION ?= v2.1.6
 
 .PHONY: all build test unit fmt fmt-check lint clean \
 	integration-up integration-test integration-down \
+	integration-kafka-up integration-kafka-test \
 	integration-scale-normal integration-scale-heavy
 
 build:
@@ -45,6 +46,13 @@ integration-test:
 
 integration-down:
 	bash test/integration/scripts/mysql-down.sh
+
+# MySQL + Kafka sink IT (compose kafka service; report docs/test/reports/mysql-kafka.md).
+integration-kafka-up: integration-up
+	bash test/integration/scripts/kafka-up.sh
+
+integration-kafka-test:
+	bash test/integration/scripts/run-kafka-e2e.sh
 
 integration-scale-normal:
 	bash test/integration/scale/run-scale.sh normal

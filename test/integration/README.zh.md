@@ -77,7 +77,7 @@ make integration-scale-heavy
 | Job | 矩阵 | 内容 |
 | --- | --- | --- |
 | `go-check` | — | fmt / lint / `make test` / build / **scale 单测**（`pytest scale/test_*.py`） |
-| `mysql-mysql-e2e` | MySQL **5.7** + **8.0** | 功能 + 类型 + 负载 |
+| `mysql-mysql-e2e` | MySQL **5.7** + **8.0** | 功能 + 类型 + 负载；**8.0 另跑 Kafka sink** TP-K01..K04 |
 | `mysql-scale-e2e` | 仅 MySQL **8.0** | scale `normal` / `heavy`（独立 compose 项目，宿主机端口 `13307`） |
 
 **负载分档**（`LOAD_ROWS_PER_TABLE`）：PR / `main` / `master` / `release-*` → **100000**（`LOAD_PROFILE=full`）；其他分支 push → **30000**（`normal`）。峰值：5.7 / 8.0 均为 **60s×4**。
