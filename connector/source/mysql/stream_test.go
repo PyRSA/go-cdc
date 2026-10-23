@@ -1,6 +1,8 @@
 package mysql
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -83,7 +85,9 @@ func TestFillAddColumnUsesCatalogMetadata(t *testing.T) {
 		Action: schema.ActionAddColumn, Database: "db", Table: "orders",
 		DDL: "ALTER TABLE `db`.`orders` ADD COLUMN `note` varchar(32) NULL",
 	}
-	h.fillAddColumn("db", &change)
+	if err := h.fillAddColumn("db", &change); err != nil {
+		t.Fatal(err)
+	}
 	if len(change.AddColumns) != 1 || change.AddColumns[0] != "note" {
 		t.Fatalf("AddColumns %#v", change.AddColumns)
 	}
@@ -92,15 +96,35 @@ func TestFillAddColumnUsesCatalogMetadata(t *testing.T) {
 	}
 }
 
-func TestFillAddColumnWithoutCatalogLeavesDefinitionNil(t *testing.T) {
+func TestFillAddColumnWithoutCatalogFails(t *testing.T) {
 	h := &handler{}
 	change := schema.Change{
 		Action: schema.ActionAddColumn, Database: "db", Table: "orders",
 		DDL: "ALTER TABLE db.orders ADD COLUMN note varchar(32) NULL",
 	}
-	h.fillAddColumn("db", &change)
+	err := h.fillAddColumn("db", &change)
+	if err == nil || !strings.Contains(err.Error(), "no catalog connection") {
+		t.Fatalf("err=%v change %#v", err, change)
+	}
 	if len(change.AddColumns) != 1 || change.ColumnDef != nil {
 		t.Fatalf("change %#v", change)
+	}
+}
+
+func TestFillAddColumnDescribeFailurePropagates(t *testing.T) {
+	db := newMemDB(nil)
+	db.describeErr = fmt.Errorf("catalog refused")
+	h := &handler{db: db}
+	change := schema.Change{
+		Action: schema.ActionAddColumn, Database: "db", Table: "orders",
+		DDL: "ALTER TABLE db.orders ADD COLUMN note varchar(32) NULL",
+	}
+	err := h.fillAddColumn("db", &change)
+	if err == nil || !strings.Contains(err.Error(), "catalog refused") {
+		t.Fatalf("err=%v", err)
+	}
+	if change.ColumnDef != nil {
+		t.Fatalf("ColumnDef should stay nil: %#v", change.ColumnDef)
 	}
 }
 
@@ -110,7 +134,9 @@ func TestFillAddColumnMultiAddIsNotGuessed(t *testing.T) {
 		Action: schema.ActionAddColumn, Database: "db", Table: "orders",
 		DDL: "ALTER TABLE db.orders ADD COLUMN note varchar(32), ADD COLUMN extra int",
 	}
-	h.fillAddColumn("db", &change)
+	if err := h.fillAddColumn("db", &change); err != nil {
+		t.Fatal(err)
+	}
 	if len(change.AddColumns) != 2 || change.ColumnDef != nil {
 		t.Fatalf("change %#v", change)
 	}

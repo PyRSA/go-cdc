@@ -20,7 +20,8 @@ import (
 const maxResponseBytes = 1 << 20
 
 // loadResponse is the subset of the Doris Stream Load JSON response that the
-// state machine uses. Missing fields are treated as "unknown", never success.
+// state machine uses. Unknown Status / missing ExistingJobStatus go through
+// SHOW LOAD; a Success response with bad row counts is fatal, not unknown.
 type loadResponse struct {
 	Status             string `json:"Status"`
 	Message            string `json:"Message"`
@@ -72,8 +73,10 @@ func newHTTPClient(cfg definition.Sink) (*httpClient, error) {
 			return fmt.Errorf("unsafe redirect scheme %q", req.URL.Scheme)
 		}
 		// Go strips Authorization on a cross-host redirect. Doris FE redirects
-		// Stream Load to a BE; re-attach credentials only for the FE host or a
-		// private/loopback BE address so a public Location cannot exfiltrate auth.
+		// Stream Load to a BE; re-attach credentials only when the Location host
+		// is the FE hostname itself or a loopback/private/link-local IP. Non-IP
+		// BE DNS names (for example doris-be-0) are refused — use IP Locations
+		// or FE hostname equality so a public Location cannot exfiltrate auth.
 		if !redirectAuthAllowed(feHost, req.URL.Hostname()) {
 			return fmt.Errorf("sink.doris: refusing to forward credentials to redirect host %q", req.URL.Hostname())
 		}
@@ -86,7 +89,9 @@ func newHTTPClient(cfg definition.Sink) (*httpClient, error) {
 	}, nil
 }
 
-// redirectAuthAllowed permits FE→FE and FE→private/loopback BE redirects.
+// redirectAuthAllowed permits FE→FE (same hostname) and FE→BE when the BE
+// Location host is a loopback, private, or link-local IP. Hostname-only BE
+// addresses are rejected unless they equal the FE host.
 func redirectAuthAllowed(feHost, redirectHost string) bool {
 	redirectHost = strings.ToLower(strings.TrimSpace(redirectHost))
 	feHost = strings.ToLower(strings.TrimSpace(feHost))

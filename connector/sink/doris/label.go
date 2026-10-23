@@ -22,8 +22,8 @@ func (s *labelSequence) next(table string) string {
 	return fmt.Sprintf("go-cdc_%x_%d_%d", hash.Sum64(), time.Now().UnixNano(), s.value.Add(1))
 }
 
-// loadStatus values documented for Stream Load on Doris 2.1.x. The exact
-// strings are verified against the target environment in S8.
+// loadStatus values from Doris 2.1.x Stream Load docs. Exact strings are covered
+// by unit tests; real-cluster confirmation remains pending until CI is green.
 const (
 	statusSuccess          = "Success"
 	statusPublishTimeout   = "Publish Timeout"

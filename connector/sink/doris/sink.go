@@ -96,7 +96,9 @@ func (s *Sink) CreateTable(table schema.Table) error {
 	if err := validateTarget(table, columns); err != nil {
 		return err
 	}
-	s.cacheTable(table)
+	// Cache the live DESC shape (Doris types + key casing) so Write/encode
+	// always see one dialect after create or restart.
+	s.cacheTable(schemaFromDesc(table.Database, table.Table, columns))
 	return nil
 }
 
@@ -128,7 +130,13 @@ func (s *Sink) ApplySchema(change schema.Change) error {
 		return err
 	}
 	if existing, ok := findColumn(columns, change.ColumnDef.Name); ok {
-		return validateExistingColumn(existing, *change.ColumnDef)
+		if err := validateExistingColumn(existing, *change.ColumnDef); err != nil {
+			return err
+		}
+		// Refresh cache even on the idempotent path: the in-process schema may
+		// predate an external or previously applied ADD COLUMN.
+		s.cacheTable(schemaFromDesc(table.Database, table.Table, columns))
+		return nil
 	}
 	statement, err := addColumnSQL(table.Database, table.Table, *change.ColumnDef)
 	if err != nil {
@@ -140,13 +148,17 @@ func (s *Sink) ApplySchema(change schema.Change) error {
 	if err := s.waitForColumn(table.Database, table.Table, *change.ColumnDef); err != nil {
 		return err
 	}
-	s.appendCachedColumn(table.Database, table.Table, *change.ColumnDef)
+	columns, err = s.sql.descTable(context.Background(), table.Database, table.Table)
+	if err != nil {
+		return err
+	}
+	s.cacheTable(schemaFromDesc(table.Database, table.Table, columns))
 	return nil
 }
 
 // Write groups events by routed table, coalesces repeated primary keys, and
 // submits one Stream Load per table in stable order. The first failure stops
-// later tables; the batch is not acknowledged to Runner.
+// later tables so Runner does not advance the checkpoint for that batch.
 func (s *Sink) Write(batch []event.Event) error {
 	if len(batch) == 0 {
 		return nil
@@ -312,7 +324,16 @@ func (s *Sink) tableSchema(tableID string) (schema.Table, error) {
 	if err != nil {
 		return schema.Table{}, err
 	}
-	target := schema.Table{Database: parts[0], Table: parts[1]}
+	target := schemaFromDesc(parts[0], parts[1], columns)
+	if len(target.PrimaryKeys) == 0 {
+		return schema.Table{}, fmt.Errorf("sink.doris: target %s has no UNIQUE KEY column", schema.Qualified(parts[0], parts[1]))
+	}
+	s.cacheTable(target)
+	return target, nil
+}
+
+func schemaFromDesc(database, table string, columns []descColumn) schema.Table {
+	target := schema.Table{Database: database, Table: table}
 	for _, column := range columns {
 		target.Columns = append(target.Columns, schema.Column{
 			Name: column.Name, Type: column.Type, Nullable: column.Nullable,
@@ -321,34 +342,13 @@ func (s *Sink) tableSchema(tableID string) (schema.Table, error) {
 			target.PrimaryKeys = append(target.PrimaryKeys, column.Name)
 		}
 	}
-	if len(target.PrimaryKeys) == 0 {
-		return schema.Table{}, fmt.Errorf("sink.doris: target %s has no UNIQUE KEY column", schema.Qualified(parts[0], parts[1]))
-	}
-	s.cacheTable(target)
-	return target, nil
+	return target
 }
 
 func (s *Sink) cacheTable(table schema.Table) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tables[table.Database+"."+table.Table] = table
-}
-
-func (s *Sink) appendCachedColumn(database, table string, column schema.Column) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	id := database + "." + table
-	cached, ok := s.tables[id]
-	if !ok {
-		return
-	}
-	for _, existing := range cached.Columns {
-		if existing.Name == column.Name {
-			return
-		}
-	}
-	cached.Columns = append(cached.Columns, column)
-	s.tables[id] = cached
 }
 
 func (s *Sink) withDatabase(table schema.Table) schema.Table {
@@ -386,7 +386,7 @@ func findColumn(columns []descColumn, name string) (descColumn, bool) {
 func validateEvents(batch []event.Event, table schema.Table) error {
 	known := make(map[string]struct{}, len(table.Columns))
 	for _, column := range table.Columns {
-		known[column.Name] = struct{}{}
+		known[strings.ToLower(column.Name)] = struct{}{}
 	}
 	expectedKeys := make(map[string]struct{}, len(table.PrimaryKeys))
 	for _, key := range table.PrimaryKeys {
@@ -408,7 +408,7 @@ func validateEvents(batch []event.Event, table schema.Table) error {
 		}
 		actualKeys := make(map[string]struct{}, len(item.Keys))
 		for _, key := range item.Keys {
-			if _, ok := item.After[key]; !ok {
+			if _, ok := mapValueCI(item.After, key); !ok {
 				return fmt.Errorf("sink.doris: %s has no primary key value for %s", item.SinkID(), key)
 			}
 			actualKeys[strings.ToLower(key)] = struct{}{}
@@ -424,7 +424,7 @@ func validateEvents(batch []event.Event, table schema.Table) error {
 			}
 		}
 		for _, name := range item.Columns {
-			if _, ok := known[name]; !ok {
+			if _, ok := known[strings.ToLower(name)]; !ok {
 				return fmt.Errorf("sink.doris: %s column %s is not in the target table", item.SinkID(), name)
 			}
 		}
@@ -444,7 +444,7 @@ func coalesce(batch []event.Event, table schema.Table) ([]event.Event, error) {
 	for _, item := range batch {
 		values := make([]any, 0, len(keys))
 		for _, key := range keys {
-			value, ok := item.After[key]
+			value, ok := mapValueCI(item.After, key)
 			if !ok {
 				return nil, fmt.Errorf("sink.doris: %s has no primary key value for %s", item.SinkID(), key)
 			}

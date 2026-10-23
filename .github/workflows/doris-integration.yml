@@ -132,6 +132,8 @@ jobs:
         env:
           # mysql-down / wait scripts may read this; keep MySQL project for seed host only.
           COMPOSE_PROJECT_NAME: gocdc-doris-mysql-ci
+          # Doris containers use their own project; wait-for-doris.sh reads this.
+          DORIS_COMPOSE_PROJECT: gocdc-doris-ci
         run: bash scripts/run-doris-e2e.sh
 
       - name: Capture Doris compose logs
@@ -139,8 +141,9 @@ jobs:
         env:
           COMPOSE_PROJECT_NAME: gocdc-doris-ci
         run: |
+          mkdir -p workdir
           docker compose -f docker-compose.doris.yml logs --no-color --tail=500 \
-            > workdir/doris-compose.log
+            > workdir/doris-compose.log || true
 
       - name: Upload Doris integration logs
         if: always()

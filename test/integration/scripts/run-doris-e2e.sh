@@ -28,6 +28,10 @@ export DORIS_BUCKETS="${DORIS_BUCKETS:-auto}"
 
 export CHECKPOINT_DORIS_DIR="${CHECKPOINT_DORIS_DIR:-${WORKDIR}/ckpts-doris}"
 export GO_CDC="${GO_CDC:-${WORKDIR}/go-cdc}"
+# wait-for-doris.sh dumps compose logs on timeout using COMPOSE_PROJECT_NAME.
+# In CI that variable points at the MySQL stack, so keep the Doris project
+# separate; locally it falls back to the doris-up.sh default.
+DORIS_COMPOSE_PROJECT="${DORIS_COMPOSE_PROJECT:-${COMPOSE_PROJECT_NAME:-gocdc-doris}}"
 if [ -n "${CDC_CLI:-}" ]; then
   export GO_CDC="${CDC_CLI}"
 fi
@@ -71,7 +75,7 @@ log "==> wait mysql"
 bash "${IT}/scripts/wait-for-mysql.sh"
 
 log "==> wait doris"
-bash "${IT}/scripts/wait-for-doris.sh"
+COMPOSE_PROJECT_NAME="${DORIS_COMPOSE_PROJECT}" bash "${IT}/scripts/wait-for-doris.sh"
 
 log "==> seed doris pipeline suite tables"
 mysql_as "${SRC_USER}" "${SRC_PASSWORD}" < "${IT}/fixtures/seed_doris.sql"

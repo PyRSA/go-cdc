@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/PyRSA/go-cdc/common/event"
@@ -13,11 +14,13 @@ import (
 
 // encodeBatch renders one table's events as JSON Lines. Every event must carry
 // a complete After image for its declared column set; partial rows are rejected
-// instead of being padded with NULL.
+// instead of being padded with NULL. JSON keys use the target (DESC) column
+// names; After / Columns lookups are case-insensitive so MySQL event casing
+// can differ from Doris DESC casing after a restart.
 func encodeBatch(batch []event.Event, table schema.Table) ([]byte, error) {
 	columns := make(map[string]schema.Column, len(table.Columns))
 	for _, column := range table.Columns {
-		columns[column.Name] = column
+		columns[strings.ToLower(column.Name)] = column
 	}
 	var buf bytes.Buffer
 	for _, item := range batch {
@@ -29,11 +32,11 @@ func encodeBatch(batch []event.Event, table schema.Table) ([]byte, error) {
 		}
 		row := make(map[string]any, len(item.Columns))
 		for _, name := range item.Columns {
-			value, ok := item.After[name]
+			value, ok := mapValueCI(item.After, name)
 			if !ok {
 				return nil, fmt.Errorf("sink.doris: %s event is missing column %s", item.SinkID(), name)
 			}
-			column, known := columns[name]
+			column, known := columns[strings.ToLower(name)]
 			if !known {
 				return nil, fmt.Errorf("sink.doris: target %s has no column %s", schema.Qualified(table.Database, table.Table), name)
 			}
@@ -41,7 +44,7 @@ func encodeBatch(batch []event.Event, table schema.Table) ([]byte, error) {
 			if err != nil {
 				return nil, fmt.Errorf("sink.doris: %s column %s: %w", item.SinkID(), name, err)
 			}
-			row[name] = encoded
+			row[column.Name] = encoded
 		}
 		line, err := json.Marshal(row)
 		if err != nil {
@@ -53,6 +56,24 @@ func encodeBatch(batch []event.Event, table schema.Table) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// mapValueCI looks up After/Keys values with exact match first, then
+// case-insensitive. Target schema names (from DESC) may differ in case from
+// MySQL event maps after a process restart.
+func mapValueCI(values map[string]any, name string) (any, bool) {
+	if values == nil {
+		return nil, false
+	}
+	if value, ok := values[name]; ok {
+		return value, true
+	}
+	for key, value := range values {
+		if strings.EqualFold(key, name) {
+			return value, true
+		}
+	}
+	return nil, false
+}
+
 type columnClass int
 
 const (
@@ -62,8 +83,9 @@ const (
 	classString
 )
 
-// resolveColumnType accepts both a MySQL source type (cached from CreateTable)
-// and a Doris target type (read back with DESC).
+// resolveColumnType accepts MySQL or Doris type strings. The Write path caches
+// DESC (Doris) types via schemaFromDesc; MySQL mapping remains for validation
+// and for callers that still pass source types.
 func resolveColumnType(raw string) (columnType, bool) {
 	if mapped, err := mapColumnType(raw); err == nil {
 		return mapped, true

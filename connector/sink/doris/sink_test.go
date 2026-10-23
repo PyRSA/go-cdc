@@ -538,6 +538,219 @@ func TestSinkWriteFailsWhenLabelNeverConfirms(t *testing.T) {
 	}
 }
 
+func TestSinkWriteShowLoadCancelledIsFatal(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		_, _ = io.WriteString(w, "not json")
+	}))
+	defer server.Close()
+
+	f := newFakeSQL()
+	f.load = loadState{State: existingJobCancelled, ErrorMsg: "killed"}
+	s := testSink(t, server, f, definition.Sink{Type: "doris", MaxRetries: 3})
+	s.cacheTable(validateSource())
+	err := s.Write([]event.Event{createEvent(1, "a")})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "cancel") {
+		t.Fatalf("err=%v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("CANCELLED via SHOW LOAD must not re-PUT: %d", requests)
+	}
+	if len(f.loads) != 1 {
+		t.Fatalf("expected one SHOW LOAD, got %#v", f.loads)
+	}
+}
+
+func TestSinkWriteShowLoadUnavailableIsFatal(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		_, _ = io.WriteString(w, "not json")
+	}))
+	defer server.Close()
+
+	f := newFakeSQL()
+	f.loadErr = fmt.Errorf("fe down")
+	s := testSink(t, server, f, definition.Sink{Type: "doris", MaxRetries: 3})
+	s.cacheTable(validateSource())
+	err := s.Write([]event.Event{createEvent(1, "a")})
+	if err == nil || !strings.Contains(err.Error(), "label state unavailable") {
+		t.Fatalf("err=%v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("unavailable SHOW LOAD must not re-PUT: %d", requests)
+	}
+}
+
+func TestSinkWriteHTTP503RetriesSameLabel(t *testing.T) {
+	var mu sync.Mutex
+	var labels []string
+	var codes []int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		label := r.Header.Get("label")
+		mu.Lock()
+		labels = append(labels, label)
+		n := len(labels)
+		mu.Unlock()
+		if n == 1 {
+			codes = append(codes, http.StatusServiceUnavailable)
+			http.Error(w, "backend down", http.StatusServiceUnavailable)
+			return
+		}
+		codes = append(codes, http.StatusOK)
+		_, _ = io.WriteString(w, fmt.Sprintf(
+			`{"Status":"Success","Label":%q,"NumberTotalRows":1,"NumberLoadedRows":1}`, label))
+	}))
+	defer server.Close()
+
+	f := newFakeSQL()
+	f.loadErr = errLoadNotFound
+	s := testSink(t, server, f, definition.Sink{Type: "doris", MaxRetries: 2})
+	s.cacheTable(validateSource())
+	if err := s.Write([]event.Event{createEvent(1, "a")}); err != nil {
+		t.Fatal(err)
+	}
+	if len(labels) != 2 || labels[0] != labels[1] {
+		t.Fatalf("expected same-label retry after 503, labels %#v codes %#v", labels, codes)
+	}
+}
+
+func TestSinkWriteHTTP429RetriesSameLabel(t *testing.T) {
+	var mu sync.Mutex
+	var labels []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		label := r.Header.Get("label")
+		mu.Lock()
+		labels = append(labels, label)
+		n := len(labels)
+		mu.Unlock()
+		if n == 1 {
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+			return
+		}
+		_, _ = io.WriteString(w, fmt.Sprintf(
+			`{"Status":"Success","Label":%q,"NumberTotalRows":1,"NumberLoadedRows":1}`, label))
+	}))
+	defer server.Close()
+
+	f := newFakeSQL()
+	f.loadErr = errLoadNotFound
+	s := testSink(t, server, f, definition.Sink{Type: "doris", MaxRetries: 2})
+	s.cacheTable(validateSource())
+	if err := s.Write([]event.Event{createEvent(1, "a")}); err != nil {
+		t.Fatal(err)
+	}
+	if len(labels) != 2 || labels[0] != labels[1] {
+		t.Fatalf("expected same-label retry after 429, labels %#v", labels)
+	}
+}
+
+func TestSinkWriteHTTP400IsFatalWhenLabelMissing(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.Error(w, "bad request", http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	f := newFakeSQL()
+	f.loadErr = errLoadNotFound
+	s := testSink(t, server, f, definition.Sink{Type: "doris", MaxRetries: 3})
+	s.cacheTable(validateSource())
+	err := s.Write([]event.Event{createEvent(1, "a")})
+	if err == nil || !strings.Contains(err.Error(), "400") {
+		t.Fatalf("err=%v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("4xx with missing label must not retry: %d", requests)
+	}
+}
+
+func TestSinkWritePublishTimeoutCompletesWithoutRetry(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		label := r.Header.Get("label")
+		_, _ = io.WriteString(w, fmt.Sprintf(
+			`{"Status":"Publish Timeout","Label":%q,"NumberTotalRows":1,"NumberLoadedRows":1}`, label))
+	}))
+	defer server.Close()
+
+	f := newFakeSQL()
+	s := testSink(t, server, f, definition.Sink{Type: "doris", MaxRetries: 3})
+	s.cacheTable(validateSource())
+	if err := s.Write([]event.Event{createEvent(1, "a")}); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 1 {
+		t.Fatalf("Publish Timeout must complete without re-PUT: %d", requests)
+	}
+	if len(f.loads) != 0 {
+		t.Fatalf("Publish Timeout must not query SHOW LOAD: %#v", f.loads)
+	}
+}
+
+func TestSinkWriteLabelAlreadyExistsFinishedIsSuccess(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		label := r.Header.Get("label")
+		_, _ = io.WriteString(w, fmt.Sprintf(
+			`{"Status":"Label Already Exists","Label":%q,"ExistingJobStatus":"FINISHED"}`, label))
+	}))
+	defer server.Close()
+
+	f := newFakeSQL()
+	s := testSink(t, server, f, definition.Sink{Type: "doris", MaxRetries: 3})
+	s.cacheTable(validateSource())
+	if err := s.Write([]event.Event{createEvent(1, "a")}); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 1 {
+		t.Fatalf("LAE+FINISHED must not re-PUT: %d", requests)
+	}
+	if len(f.loads) != 0 {
+		t.Fatalf("LAE+FINISHED must not query SHOW LOAD: %#v", f.loads)
+	}
+}
+
+func TestSinkWriteAcceptsCaseInsensitiveEventColumns(t *testing.T) {
+	var body string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		body = string(raw)
+		label := r.Header.Get("label")
+		_, _ = io.WriteString(w, fmt.Sprintf(
+			`{"Status":"Success","Label":%q,"NumberTotalRows":1,"NumberLoadedRows":1}`, label))
+	}))
+	defer server.Close()
+
+	f := newFakeSQL()
+	// DESC-style casing differs from the MySQL event map keys.
+	s := testSink(t, server, f, definition.Sink{Type: "doris"})
+	s.cacheTable(schema.Table{
+		Database: "db", Table: "orders",
+		Columns: []schema.Column{
+			{Name: "ID", Type: "BIGINT", Nullable: false},
+			{Name: "Name", Type: "VARCHAR(32)", Nullable: true},
+		},
+		PrimaryKeys: []string{"ID"},
+	})
+	item := event.Event{
+		Op: event.OpCreate, Database: "db", Table: "orders",
+		SourceDatabase: "db", SourceTable: "orders",
+		Columns: []string{"id", "name"}, Keys: []string{"id"},
+		After: map[string]any{"id": int64(1), "name": "alice"},
+	}
+	if err := s.Write([]event.Event{item}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(body, `"ID":1`) || !strings.Contains(body, `"Name":"alice"`) {
+		t.Fatalf("JSON keys must use DESC casing: %q", body)
+	}
+}
+
 func TestSinkApplySchemaDisabled(t *testing.T) {
 	f := newFakeSQL()
 	server := successServer(t, &[]string{})
@@ -604,6 +817,35 @@ func TestSinkApplySchemaRepeatedCompatibleIsNoop(t *testing.T) {
 	}
 	if len(f.statements()) != 0 {
 		t.Fatalf("repeated compatible ADD must not execute DDL: %#v", f.statements())
+	}
+}
+
+func TestSinkApplySchemaExistingColumnRefreshesStaleCache(t *testing.T) {
+	f := newFakeSQL()
+	f.columns["db.orders"] = append(validTarget(), descColumn{Name: "note", Type: "VARCHAR(32)", Nullable: true})
+	server := successServer(t, &[]string{})
+	s := testSink(t, server, f, definition.Sink{Type: "doris", SchemaChange: true, SchemaChangeInclude: []string{"add.column"}})
+	// In-process cache predates the column that already exists on Doris.
+	s.cacheTable(validateSource())
+
+	change := schema.Change{
+		Action: schema.ActionAddColumn, Database: "db", Table: "orders",
+		AddColumns: []string{"note"}, ColumnDef: &schema.Column{Name: "note", Type: "varchar(32)", Nullable: true},
+	}
+	if err := s.ApplySchema(change); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.statements()) != 0 {
+		t.Fatalf("idempotent ADD must not execute DDL: %#v", f.statements())
+	}
+	found := false
+	for _, column := range s.tables["db.orders"].Columns {
+		if column.Name == "note" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("stale cache must be refreshed from DESC: %#v", s.tables["db.orders"])
 	}
 }
 

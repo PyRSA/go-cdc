@@ -212,10 +212,12 @@ A `2xx` response is **not** enough. The sink checks the Doris business status:
 
 | Observation | Action |
 | --- | --- |
-| `Success` | Success only when the echoed `Label` matches, `NumberFilteredRows == 0`, `NumberTotalRows == rows sent`, and `NumberLoadedRows == NumberTotalRows` |
+| `Success` | Success when `NumberFilteredRows == 0`, `NumberTotalRows == rows sent`, and `NumberLoadedRows == NumberTotalRows`; if the response `Label` is non-empty it must match the request label |
 | `Publish Timeout` | Treated as success; the same logical batch is **not** retried with a new label |
 | `Label Already Exists` + `FINISHED` | Treated as success |
-| `Label Already Exists` + `RUNNING` (or another non-`FINISHED` status) | Retry with the **same label**; if the status never becomes confirmed, the batch fails after the bounded attempts |
+| `Label Already Exists` + `RUNNING` | Retry with the **same label**; if the status never becomes confirmed, the batch fails after the bounded attempts |
+| `Label Already Exists` + `CANCELLED` | Fatal |
+| `Label Already Exists` + other / missing `ExistingJobStatus` | Other non-empty status is fatal; missing status is treated as unknown and queries `SHOW LOAD` |
 | `Fail` | Fatal; data-quality failures are not blindly retried |
 | Unknown status, invalid body, transport error, timeout | Query `SHOW LOAD FROM <db> WHERE Label = '<label>'` first |
 
@@ -231,9 +233,18 @@ within a process, reused across retries of one sub-batch, and **not** reproduced
 after a restart. Label retention depends on Doris configuration.
 
 FE redirects (for example `307` to a BE) are followed at most twice, and only
-to `http`/`https` locations. Basic-auth credentials are re-attached to the
-redirect target, so the FE response must be trusted. Only a plain-HTTP FE
-endpoint is supported; HTTPS URLs are not configurable.
+to `http`/`https` locations. Credentials are re-attached only when the redirect
+host is allowlisted; otherwise the **redirect is refused** and the Stream Load
+fails (credentials are never forwarded to a disallowed host):
+
+- the same hostname as the configured FE, or
+- a loopback / private / link-local **IP** (for example `127.0.0.1`, `10.x`,
+  `192.168.x`)
+
+Hostname-only BE addresses (for example `doris-be-0`) are **not** allowlisted.
+Prefer FE configurations that advertise BE IPs, or run with host networking so
+redirects stay on loopback. Only a plain-HTTP FE endpoint is supported; HTTPS
+URLs are not configurable.
 
 ## Schema evolution
 

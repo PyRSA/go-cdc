@@ -8,9 +8,9 @@ import (
 	"github.com/PyRSA/go-cdc/common/schema"
 )
 
-// tableOptions carries the DDL attributes that are configurable. C2 in the
-// design document is still open, so replication_num is omitted unless set and
-// the merge-on-write property is left at the cluster default.
+// tableOptions carries configurable CREATE TABLE attributes. Buckets defaults
+// to auto; replication_num is omitted unless set; merge-on-write stays at the
+// cluster default.
 type tableOptions struct {
 	Buckets        string
 	ReplicationNum int

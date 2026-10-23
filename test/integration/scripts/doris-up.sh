@@ -50,18 +50,26 @@ ensure_sysctl() {
   return 1
 }
 
+# Create workdir early so failure-path log capture always has a place to write.
+mkdir -p "${ROOT}/workdir/doris/fe/doris-meta" "${ROOT}/workdir/doris/fe/log" \
+  "${ROOT}/workdir/doris/be/storage" "${ROOT}/workdir/doris/be/log"
+
 # Collect all missing kernel knobs up front so one sudo batch can unblock FE+BE.
-need_fixctl=0
+# Always initialize under `set -u`: if every ensure_sysctl succeeds we never
+# assign in the `then` branches, which previously left need_sysctl unbound.
+need_sysctl=0
 if ! ensure_sysctl fs.inotify.max_user_watches 65536 1048576; then
   need_sysctl=1
 fi
 # Instances are only a warning: FE usually needs a few dozen, but a busy
 # desktop can exhaust 128 before Doris even starts.
-ensure_sysctl fs.inotify.max_user_instances 1024 8192 || true
+if ! ensure_sysctl fs.inotify.max_user_instances 1024 8192; then
+  log "warning: fs.inotify.max_user_instances still low; continuing." >&2
+fi
 if ! ensure_sysctl vm.max_map_count 2000000 2000000; then
   need_sysctl=1
 fi
-if [ "${need_sysctl}" -ne 0 ]; then
+if [ "${need_sysctl:-0}" -ne 0 ]; then
   log "Doris FE/BE cannot start until kernel limits are raised (needs passwordless sudo or a one-shot sudo)." >&2
   log "  sudo sysctl -w fs.inotify.max_user_watches=1048576" >&2
   log "  sudo sysctl -w fs.inotify.max_user_instances=8192" >&2
@@ -69,9 +77,6 @@ if [ "${need_sysctl}" -ne 0 ]; then
   log "Then re-run: make integration-doris-up" >&2
   exit 1
 fi
-
-mkdir -p "${ROOT}/workdir/doris/fe/doris-meta" "${ROOT}/workdir/doris/fe/log" \
-  "${ROOT}/workdir/doris/be/storage" "${ROOT}/workdir/doris/be/log"
 
 log "==> Doris ${DORIS_VERSION} FE+BE (host network, project=${COMPOSE_PROJECT_NAME})"
 # A stale FE meta image from an interrupted run can advertise an unreachable

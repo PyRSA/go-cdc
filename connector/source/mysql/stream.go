@@ -331,7 +331,9 @@ func (h *handler) OnDDL(header *replication.EventHeader, _ mysql.Position, query
 	if change.Action == schema.ActionAddColumn {
 		// The column definition must come from catalog metadata: DDL text alone
 		// cannot express type, nullability, or defaults reliably.
-		h.fillAddColumn(database, &change)
+		if err := h.fillAddColumn(database, &change); err != nil {
+			return err
+		}
 		commit.Event.Change = &change
 	}
 	if change.Action == schema.ActionCreate && h.canal != nil {
@@ -350,10 +352,18 @@ func (h *handler) OnDDL(header *replication.EventHeader, _ mysql.Position, query
 	return nil
 }
 
-func (h *handler) fillAddColumn(database string, change *schema.Change) {
+// fillAddColumn attaches catalog-backed ColumnDef for a single-column ADD.
+// Multi-column ADD leaves ColumnDef nil (sinks reject it). Catalog failures
+// return an error so OnDDL does not emit a Change that only fails later as
+// "no structured column metadata".
+func (h *handler) fillAddColumn(database string, change *schema.Change) error {
 	change.AddColumns = schema.AddColumns(change.DDL)
-	if len(change.AddColumns) != 1 || h.db == nil {
-		return
+	if len(change.AddColumns) != 1 {
+		return nil
+	}
+	if h.db == nil {
+		return fmt.Errorf("source.mysql: cannot load column metadata for ADD COLUMN on %s.%s: no catalog connection",
+			database, change.Table)
 	}
 	ctx := h.ctx
 	if ctx == nil {
@@ -361,15 +371,17 @@ func (h *handler) fillAddColumn(database string, change *schema.Change) {
 	}
 	table, err := h.db.DescribeTable(ctx, database, change.Table)
 	if err != nil {
-		return
+		return fmt.Errorf("source.mysql: describe %s.%s for ADD COLUMN: %w", database, change.Table, err)
 	}
 	for i := range table.Columns {
 		if strings.EqualFold(table.Columns[i].Name, change.AddColumns[0]) {
 			column := table.Columns[i]
 			change.ColumnDef = &column
-			return
+			return nil
 		}
 	}
+	return fmt.Errorf("source.mysql: column %s not found in %s.%s after ADD COLUMN",
+		change.AddColumns[0], database, change.Table)
 }
 
 func (h *handler) dropEvent() bool {
