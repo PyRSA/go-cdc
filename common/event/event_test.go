@@ -1,6 +1,10 @@
 package event
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/PyRSA/go-cdc/common/schema"
+)
 
 func TestCloneDoesNotShareRows(t *testing.T) {
 	original := Event{
@@ -22,5 +26,35 @@ func TestCloneDoesNotShareRows(t *testing.T) {
 	}
 	if original.SourceID() != "db.users" || original.SinkID() != "db.users" {
 		t.Fatalf("ids: %s %s", original.SourceID(), original.SinkID())
+	}
+}
+
+func TestCloneCopiesSchemaChangeMetadata(t *testing.T) {
+	original := Event{
+		Op: OpDDL, Database: "db", Table: "users",
+		SourceDatabase: "db", SourceTable: "users",
+		Change: &schema.Change{
+			Action: schema.ActionAddColumn, AddColumns: []string{"note"},
+			ColumnDef: &schema.Column{Name: "note", Type: "varchar(32)", Nullable: true},
+		},
+	}
+	copied := original.Clone()
+	if copied.Change == nil || original.Change == nil || copied.Change == original.Change {
+		t.Fatalf("change pointer not copied: %#v", copied.Change)
+	}
+	copied.Change.AddColumns[0] = "other"
+	copied.Change.ColumnDef.Name = "other"
+	if original.Change.AddColumns[0] != "note" {
+		t.Fatalf("clone shares AddColumns: %#v", original.Change.AddColumns)
+	}
+	if original.Change.ColumnDef.Name != "note" {
+		t.Fatalf("clone shares ColumnDef: %#v", original.Change.ColumnDef)
+	}
+}
+
+func TestCloneKeepsNilChange(t *testing.T) {
+	copied := (Event{Op: OpCreate}).Clone()
+	if copied.Change != nil {
+		t.Fatalf("nil change became %#v", copied.Change)
 	}
 }

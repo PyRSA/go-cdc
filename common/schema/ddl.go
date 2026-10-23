@@ -201,6 +201,94 @@ func readQualified(s string) (db, table string, consumed int) {
 	return "", first, n
 }
 
+// AddColumns returns the column names of every ADD clause in one ALTER TABLE
+// statement, in statement order. Index-only ADD clauses (INDEX/KEY/PRIMARY/
+// UNIQUE/FULLTEXT/SPATIAL/CONSTRAINT/FOREIGN/CHECK/PARTITION) are skipped.
+// An empty result means the statement adds no column.
+func AddColumns(sql string) []string {
+	text := stripComments(strings.TrimSpace(sql))
+	if !strings.HasPrefix(strings.ToUpper(text), "ALTER TABLE") {
+		return nil
+	}
+	var out []string
+	for _, clause := range splitClauses(afterTableRef(text, "ALTER TABLE")) {
+		clause = strings.TrimSpace(clause)
+		if !startsWithWord(clause, "ADD") {
+			continue
+		}
+		body := strings.TrimSpace(clause[len("ADD"):])
+		if startsWithWord(body, "COLUMN") {
+			body = strings.TrimSpace(body[len("COLUMN"):])
+		}
+		if isIndexClause(body) {
+			continue
+		}
+		if name, _ := readIdent(body); name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func isIndexClause(body string) bool {
+	for _, keyword := range []string{"INDEX", "KEY", "PRIMARY", "UNIQUE", "FULLTEXT", "SPATIAL", "CONSTRAINT", "FOREIGN", "CHECK", "PARTITION"} {
+		if startsWithWord(body, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+// startsWithWord reports whether s begins with word followed by a non-identifier
+// byte, so a column named KEYED is not mistaken for the KEY keyword.
+func startsWithWord(s, word string) bool {
+	if len(s) < len(word) || !strings.EqualFold(s[:len(word)], word) {
+		return false
+	}
+	if len(s) == len(word) {
+		return true
+	}
+	next := rune(s[len(word)])
+	return !unicode.IsLetter(next) && !unicode.IsDigit(next) && next != '_' && next != '$'
+}
+
+// splitClauses splits on commas outside parentheses, strings, and identifiers.
+func splitClauses(s string) []string {
+	var out []string
+	depth, start := 0, 0
+	inSingle, inDouble, inBack := false, false, false
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\'':
+			if !inDouble && !inBack {
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle && !inBack {
+				inDouble = !inDouble
+			}
+		case '`':
+			if !inSingle && !inDouble {
+				inBack = !inBack
+			}
+		case '(':
+			if !inSingle && !inDouble && !inBack {
+				depth++
+			}
+		case ')':
+			if !inSingle && !inDouble && !inBack && depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 && !inSingle && !inDouble && !inBack {
+				out = append(out, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(out, s[start:])
+}
+
 func readIdent(s string) (string, int) {
 	if s == "" {
 		return "", 0

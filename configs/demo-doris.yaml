@@ -1,0 +1,39 @@
+# Quick start: MySQL → Doris 2.1.x (UNIQUE KEY Stream Load, at-least-once)
+# Edit source / sink / route, then:
+#   ./bin/go-cdc configs/demo-doris.yaml
+#
+# FE HTTP (Stream Load) defaults to port 8030; SQL (MySQL protocol) to 9030.
+
+source:
+  type: mysql
+  hostname: 127.0.0.1
+  port: 3306
+  username: root
+  password: secret
+  tables: demo_db\.orders
+  server-id: 5404
+  server-time-zone: Asia/Shanghai
+  scan.startup.mode: initial
+
+sink:
+  type: doris
+  hostname: 127.0.0.1
+  port: 8030
+  sql-port: 9030
+  username: root
+  password: ""
+  auto-create-table: true
+  replication-num: 1
+  # schema.change.enabled: true   # optional ADD COLUMN
+
+route:
+  - source-table: demo_db\.orders
+    sink-table: demo_sink.orders
+
+pipeline:
+  name: demo-doris
+
+checkpoint:
+  storage: file
+  interval: 10s
+  file-path: ./checkpoints

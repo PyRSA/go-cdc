@@ -3,6 +3,7 @@ package composer
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/PyRSA/go-cdc/common/event"
@@ -168,6 +169,24 @@ func applyCatalog(pipe *definition.Pipeline, rules *transform.Set, routes *route
 	if err := rules.Validate(table.Database, table.Table, names); err != nil {
 		return err
 	}
+	if pipe.Sink.Type == "doris" {
+		// Doris must validate every routed table before it becomes writable.
+		// Unlike the MySQL branch below, a failure stops the job.
+		projected := rules.ProjectTable(table)
+		routed := routes.Apply(event.Event{
+			Database: table.Database, Table: table.Table,
+			SourceDatabase: table.Database, SourceTable: table.Table,
+		})
+		for _, dst := range routed {
+			sinkTable := projected
+			sinkTable.Database = dst.Database
+			sinkTable.Table = dst.Table
+			if err := sk.CreateTable(sinkTable); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	if pipe.Sink.Type != "mysql" || !pipe.Sink.AutoCreate {
 		return nil
 	}
@@ -196,6 +215,12 @@ func applyDDL(pipe *definition.Pipeline, rules *transform.Set, routes *route.Set
 		change.Database = dst.Database
 		change.Table = dst.Table
 		change.DDL = schemaevol.RewriteTable(dst.DDL, dst.Database, dst.Table)
+		if item.Change != nil {
+			// Structured metadata recovered by the source. The sink must not
+			// re-infer column type/nullability/default from DDL text.
+			change.AddColumns = item.Change.AddColumns
+			change.ColumnDef = item.Change.ColumnDef
+		}
 		if pipe.Sink.Type == "stdout" || pipe.Sink.Type == "kafka" {
 			// Keep Database/Table as the routed sink id (topic = DML). Envelope source.*
 			// uses SourceDatabase/SourceTable from the capturing table.
@@ -204,6 +229,12 @@ func applyDDL(pipe *definition.Pipeline, rules *transform.Set, routes *route.Set
 			change.SourceDatabase = dst.SourceDatabase
 			change.SourceTable = dst.SourceTable
 			if err := sk.ApplySchema(change); err != nil {
+				return err
+			}
+			continue
+		}
+		if pipe.Sink.Type == "doris" {
+			if err := applyDorisDDL(sk, state, dst, decision, change, catalogApplied); err != nil {
 				return err
 			}
 			continue
@@ -238,4 +269,27 @@ func columnsOf(item event.Event) []schema.Column {
 		cols = append(cols, schema.Column{Name: name, Type: "text", Nullable: true})
 	}
 	return cols
+}
+
+// applyDorisDDL keeps Doris DDL failures fatal. CREATE was already executed and
+// validated by applyCatalog, so the table only becomes capturable afterwards.
+func applyDorisDDL(sk sink.Sink, state *checkpoint.State, dst event.Event, decision schemaevol.Decision, change schema.Change, catalogApplied bool) error {
+	switch decision.Change.Action {
+	case schema.ActionCreate:
+		if !catalogApplied {
+			return fmt.Errorf("sink.doris: CREATE for %s arrived without a source table definition", dst.SourceID())
+		}
+		state.AddCaptured(dst.SourceID())
+		return nil
+	case schema.ActionAddColumn, schema.ActionDropColumn, schema.ActionRenameColumn, schema.ActionModifyColumn:
+		if !decision.Execute {
+			return nil
+		}
+		return sk.ApplySchema(change)
+	default:
+		if decision.Execute {
+			return fmt.Errorf("sink.doris: schema change %s on %s is not supported in v1", decision.Change.Action, dst.SinkID())
+		}
+		return nil
+	}
 }

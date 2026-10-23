@@ -53,3 +53,34 @@ func TestClassifyIndexAddDoesNotLookLikeColumn(t *testing.T) {
 		t.Fatalf("table %s.%s", got.Database, got.Table)
 	}
 }
+
+func TestAddColumns(t *testing.T) {
+	cases := []struct {
+		sql  string
+		want []string
+	}{
+		{"ALTER TABLE db.t ADD COLUMN note varchar(32)", []string{"note"}},
+		{"ALTER TABLE db.t ADD name varchar(32)", []string{"name"}},
+		{"ALTER TABLE `db`.`t` ADD COLUMN `note` varchar(32) NULL", []string{"note"}},
+		{"ALTER TABLE db.t ADD COLUMN a int, ADD COLUMN b varchar(8)", []string{"a", "b"}},
+		{"ALTER TABLE db.t ADD COLUMN a int, ADD INDEX idx_a (a), ADD b int", []string{"a", "b"}},
+		{"ALTER TABLE db.t ADD COLUMN amount decimal(10,2) NOT NULL DEFAULT 0", []string{"amount"}},
+		{"ALTER TABLE db.t ADD COLUMN keyed int", []string{"keyed"}},
+		{"ALTER TABLE db.t ADD INDEX idx_name (name)", nil},
+		{"ALTER TABLE db.t ADD UNIQUE KEY uk_name (name)", nil},
+		{"ALTER TABLE db.t ADD CONSTRAINT fk FOREIGN KEY (id) REFERENCES p(id)", nil},
+		{"CREATE TABLE db.t (id int)", nil},
+		{"ALTER TABLE db.t DROP COLUMN note", nil},
+	}
+	for _, tc := range cases {
+		got := AddColumns(tc.sql)
+		if len(got) != len(tc.want) {
+			t.Fatalf("%s: got %#v want %#v", tc.sql, got, tc.want)
+		}
+		for i := range tc.want {
+			if got[i] != tc.want[i] {
+				t.Fatalf("%s: got %#v want %#v", tc.sql, got, tc.want)
+			}
+		}
+	}
+}

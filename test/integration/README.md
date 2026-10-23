@@ -6,7 +6,8 @@ Local runs and GitHub Actions both start a binlog-enabled MySQL via **Docker Com
 2. **Types / timezone** TP-D01..TP-D04 (`harness/types_it.py`)
 3. **Load / peak** TP-L01..TP-L04 (`harness/load_it.py`, tier A)
 4. **Scale** multi-DB/table E2E (`scale/scale_it.py`, profiles `normal` / `heavy`) — run separately via [`scale/run-scale.sh`](scale/run-scale.sh); creates scale DBs at runtime as MySQL root (see [`scale/README.md`](scale/README.md))
-5. **Kafka sink** TP-K01..TP-K04 (`harness/kafka_it.py`) — run via [`scripts/run-kafka-e2e.sh`](scripts/run-kafka-e2e.sh) after MySQL + Kafka are up
+5. **Kafka sink** TP-K01..TP-K08 (`harness/kafka_it.py`) — run via [`scripts/run-kafka-e2e.sh`](scripts/run-kafka-e2e.sh) after MySQL + Kafka are up
+6. **Doris sink** MySQL→Doris pipeline TP-DR01..DR04 (`harness/doris_it.py`) plus sink-level Go suite (`doris/`, tag `doris_integration`) — run via [`scripts/run-doris-e2e.sh`](scripts/run-doris-e2e.sh) after MySQL + Doris are up
 
 Generated Markdown reports (English) land in `docs/test/reports/`:
 
@@ -17,6 +18,7 @@ Generated Markdown reports (English) land in `docs/test/reports/`:
 | Load | `docs/test/reports/mysql-mysql-load.md` |
 | Scale | `docs/test/reports/mysql-mysql-scale-{normal\|heavy}.md` |
 | Kafka | `docs/test/reports/mysql-kafka.md` |
+| Doris | `docs/test/reports/mysql-doris.md` (+ `workdir/doris-integration.log` for Go suite) |
 
 Static notes: [`docs/test/TYPES.md`](../../docs/test/TYPES.md) (not a run report).
 
@@ -40,9 +42,11 @@ Default credentials: `mysql/init/01-databases.sql` (overridable via env).
 ```text
 test/integration/
 ├── docker-compose.yml
+├── docker-compose.doris.yml
+├── doris/                    # sink-level Go suite (doris_integration tag)
 ├── mysql/init/01-databases.sql
-├── fixtures/
-├── harness/
+├── fixtures/                 # includes pipeline.doris.yaml.tpl, seed_doris.sql
+├── harness/                  # run_it / kafka_it / doris_it / …
 ├── scale/
 ├── scripts/
 └── workdir/
@@ -96,8 +100,9 @@ Jobs:
 | Job | When / matrix | What |
 | --- | --- | --- |
 | `go-check` | always | `gofmt`, `golangci-lint`, `make test`, build, **scale unit tests** (`pytest scale/test_*.py`) |
-| `mysql-mysql-e2e` | MySQL **5.7** + **8.0** | functional + types + load; **8.0 also runs Kafka sink** TP-K01..K04 |
+| `mysql-mysql-e2e` | MySQL **5.7** + **8.0** | functional + types + load; **8.0 also runs Kafka sink** TP-K01..K08 |
 | `mysql-scale-e2e` | MySQL **8.0 only** | scale `normal` or `heavy` (separate compose project / host port `13307`) |
+| `doris-e2e` | MySQL **8.0** + Doris **2.1.8** | MySQL→Doris pipeline TP-DR01..DR04 + sink Go suite ([`doris-integration.yml`](../../.github/workflows/doris-integration.yml)) |
 
 **Load tier** (`LOAD_ROWS_PER_TABLE`):
 
@@ -142,3 +147,44 @@ bash test/integration/scripts/run-kafka-e2e.sh
 | K08 | mega LONGBLOB/LONGTEXT (JPEG magic + length) |
 
 CI runs this on the **MySQL 8.0** matrix job after mysql→mysql e2e, with the same `LOAD_ROWS_PER_TABLE` / peak knobs.
+
+## Doris sink suite
+
+Requires Linux, Docker Compose, host networking, a mysql client, and kernel
+limits for FE/BE:
+
+```bash
+sudo sysctl -w fs.inotify.max_user_watches=1048576
+sudo sysctl -w fs.inotify.max_user_instances=8192
+sudo sysctl -w vm.max_map_count=2000000
+```
+
+`doris-up.sh` refuses to start when these are too low (passwordless sudo raises
+them automatically in CI). The Go sink suite is skipped unless `DORIS_HOST` is
+set, so normal `go test ./...` never starts Doris.
+
+```bash
+# make integration-doris-up  # mysql-up + doris-up
+bash test/integration/scripts/mysql-up.sh
+bash test/integration/scripts/doris-up.sh
+bash test/integration/scripts/run-doris-e2e.sh
+# report: docs/test/reports/mysql-doris.md
+# Go sink log: test/integration/workdir/doris-integration.log
+```
+
+| TP | Coverage |
+| --- | --- |
+| DR01 | snapshot: route + projection + `city='hz'` filter → Doris UNIQUE KEY rows |
+| DR02 | incremental insert + update; filtered `city=sh` insert absent (no DELETE; v1 rejects it) |
+| DR03 | `tpds01_evolve` (no projection): source `ADD COLUMN` → Doris DESC + row with new col |
+| DR04 | restart keeping checkpoint; post-restart upsert converges (ALO) |
+
+The same `run-doris-e2e.sh` then runs the sink-level Go suite (`doris_integration`):
+auto-create / UNIQUE KEY, same-batch duplicate keys, empty Schema cache restart,
+extra columns, type rejection / round-trips, Label + `SHOW LOAD`, multi-table
+first-failure. Forced `Publish Timeout` / `CANCELLED` / 5xx injection stays with
+unit/`httptest` coverage.
+
+The separate [`doris-integration.yml`](../../.github/workflows/doris-integration.yml)
+workflow starts MySQL + Doris `2.1.8` FE+BE, raises kernel limits, runs the suite,
+and uploads the Markdown report plus compose logs.

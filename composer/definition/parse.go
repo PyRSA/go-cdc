@@ -3,6 +3,7 @@ package definition
 import (
 	"crypto/md5"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,6 +24,10 @@ const (
 	minProducerBatchMaxBytes = 512
 	maxProducerBatchMaxBytes = 100 << 20 // 104857600
 	defaultFlushTimeout      = 30 * time.Second
+	defaultDorisHTTPPort     = 8030
+	defaultDorisSQLPort      = 9030
+	defaultDorisTimeout      = 30 * time.Second
+	defaultDorisBuckets      = "auto"
 )
 
 var startupModes = map[string]struct{}{
@@ -293,6 +298,15 @@ func parseSink(raw map[string]any) (Sink, error) {
 		ProducerBatchMaxBytes: defaultProducerBatchMaxBytes,
 		FlushTimeout:          defaultFlushTimeout,
 	}
+	if strings.EqualFold(fmt.Sprint(raw["type"]), "doris") {
+		// Doris separates the FE HTTP port (Stream Load) from the SQL port.
+		// Keep defaultPort=3306 untouched for MySQL and the shared source.
+		out.Port = defaultDorisHTTPPort
+		out.SQLPort = defaultDorisSQLPort
+		out.RequestTimeout = defaultDorisTimeout
+		out.Buckets = defaultDorisBuckets
+		out.SchemaChangeInclude = []string{"add.column"}
+	}
 	for key, value := range raw {
 		switch key {
 		case "type":
@@ -375,6 +389,52 @@ func parseSink(raw map[string]any) (Sink, error) {
 				return Sink{}, configErr("sink.flush-timeout", "must be a positive duration")
 			}
 			out.FlushTimeout = d
+		case "sql-port":
+			n, err := asInt(value)
+			if err != nil || n < 1 || n > 65535 {
+				return Sink{}, configErr("sink.sql-port", "must be an integer in 1..65535")
+			}
+			out.SQLPort = n
+		case "database":
+			out.Database = strings.TrimSpace(fmt.Sprint(value))
+		case "request-timeout":
+			d, err := asDuration(value)
+			if err != nil || d <= 0 {
+				return Sink{}, configErr("sink.request-timeout", "must be a positive duration")
+			}
+			out.RequestTimeout = d
+		case "schema.change.enabled":
+			b, err := asBool(value)
+			if err != nil {
+				return Sink{}, configf("sink.schema.change.enabled", "%v", err)
+			}
+			out.SchemaChange = b
+		case "schema.change.include":
+			list, err := asStringList(value)
+			if err != nil {
+				return Sink{}, configf("sink.schema.change.include", "%v", err)
+			}
+			out.SchemaChangeInclude = list
+		case "partial-update.enabled":
+			b, err := asBool(value)
+			if err != nil {
+				return Sink{}, configf("sink.partial-update.enabled", "%v", err)
+			}
+			out.PartialUpdate = b
+		case "delete.enabled":
+			b, err := asBool(value)
+			if err != nil {
+				return Sink{}, configf("sink.delete.enabled", "%v", err)
+			}
+			out.DeleteEnabled = b
+		case "buckets":
+			out.Buckets = strings.ToLower(strings.TrimSpace(fmt.Sprint(value)))
+		case "replication-num":
+			n, err := asInt(value)
+			if err != nil || n < 0 {
+				return Sink{}, configErr("sink.replication-num", "must be >= 0")
+			}
+			out.ReplicationNum = n
 		default:
 			return Sink{}, configErr("sink."+key, "unknown field")
 		}
@@ -406,7 +466,46 @@ func parseSink(raw map[string]any) (Sink, error) {
 		if strings.ContainsAny(out.Topic, " \t\n") {
 			return Sink{}, configErr("sink.topic", "must not contain whitespace")
 		}
-	case "doris", "elasticsearch":
+	case "doris":
+		if out.Hostname == "" {
+			return Sink{}, configErr("sink.hostname", "required")
+		}
+		if strings.Contains(out.Hostname, "://") || strings.ContainsAny(out.Hostname, "/?#") {
+			return Sink{}, configErr("sink.hostname", "must be a host name without scheme or path")
+		}
+		if out.Port < 1 || out.Port > 65535 {
+			return Sink{}, configErr("sink.port", "must be an integer in 1..65535")
+		}
+		if out.SQLPort < 1 || out.SQLPort > 65535 {
+			return Sink{}, configErr("sink.sql-port", "must be an integer in 1..65535")
+		}
+		if out.Username == "" {
+			return Sink{}, configErr("sink.username", "required")
+		}
+		if out.PartialUpdate {
+			return Sink{}, configErr("sink.partial-update.enabled", "partial column updates are not implemented in v1")
+		}
+		if out.DeleteEnabled {
+			return Sink{}, configErr("sink.delete.enabled", "DELETE is not implemented in v1")
+		}
+		if out.DropTruncate {
+			return Sink{}, configErr("sink.schema.change.drop-truncate.enabled", "drop/truncate is not implemented for doris in v1")
+		}
+		for _, item := range out.SchemaChangeInclude {
+			if item != "add.column" {
+				return Sink{}, configf("sink.schema.change.include", "unsupported schema change %q; v1 supports only add.column", item)
+			}
+		}
+		if out.Buckets == "" {
+			out.Buckets = defaultDorisBuckets
+		}
+		if out.Buckets != "auto" {
+			n, err := strconv.Atoi(out.Buckets)
+			if err != nil || n < 1 {
+				return Sink{}, configErr("sink.buckets", "must be auto or a positive integer")
+			}
+		}
+	case "elasticsearch":
 		return Sink{}, configf("sink.type", "%s is not implemented in this release", out.Type)
 	default:
 		if out.Type == "" {

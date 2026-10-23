@@ -6,6 +6,7 @@ GOLANGCI_LINT_VERSION ?= v2.1.6
 .PHONY: all build test unit fmt fmt-check lint clean \
 	integration-up integration-test integration-down \
 	integration-kafka-up integration-kafka-test \
+	integration-doris-up integration-doris-test integration-doris-down \
 	integration-scale-normal integration-scale-heavy
 
 build:
@@ -53,6 +54,18 @@ integration-kafka-up: integration-up
 
 integration-kafka-test:
 	bash test/integration/scripts/run-kafka-e2e.sh
+
+# MySQL → Doris pipeline + sink Go IT (Linux host network; see test/integration/README.md).
+# Requires kernel knobs (inotify watches + vm.max_map_count); doris-up.sh prints the sudo lines.
+integration-doris-up: integration-up
+	bash test/integration/scripts/doris-up.sh
+
+integration-doris-test:
+	bash test/integration/scripts/run-doris-e2e.sh
+
+integration-doris-down:
+	bash test/integration/scripts/doris-down.sh
+	bash test/integration/scripts/mysql-down.sh
 
 integration-scale-normal:
 	bash test/integration/scale/run-scale.sh normal

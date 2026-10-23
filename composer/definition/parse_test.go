@@ -2,6 +2,7 @@ package definition
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -451,4 +452,156 @@ func indexOf(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+const dorisSource = `
+source:
+  hostname: 127.0.0.1
+  username: root
+  password: secret
+  tables: db\..*
+sink:
+  type: doris
+`
+
+func TestParseDorisDefaults(t *testing.T) {
+	pipe, err := Parse([]byte(dorisSource + `
+  hostname: fe.internal
+  username: root
+  password: secret
+pipeline:
+  name: demo
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := pipe.Sink
+	if sink.Port != 8030 || sink.SQLPort != 9030 {
+		t.Fatalf("ports http=%d sql=%d", sink.Port, sink.SQLPort)
+	}
+	if sink.RequestTimeout != 30*time.Second || sink.Buckets != "auto" {
+		t.Fatalf("timeout=%s buckets=%s", sink.RequestTimeout, sink.Buckets)
+	}
+	if sink.SchemaChange || sink.PartialUpdate || sink.DeleteEnabled || sink.DropTruncate {
+		t.Fatalf("v1 switches must default off: %+v", sink)
+	}
+	if len(sink.SchemaChangeInclude) != 1 || sink.SchemaChangeInclude[0] != "add.column" {
+		t.Fatalf("include %#v", sink.SchemaChangeInclude)
+	}
+	if sink.ReplicationNum != 0 {
+		t.Fatalf("replication-num default %d", sink.ReplicationNum)
+	}
+	if sink.Database != "" {
+		t.Fatalf("database default %q", sink.Database)
+	}
+}
+
+func TestParseDorisExplicitOptions(t *testing.T) {
+	pipe, err := Parse([]byte(dorisSource + `
+  hostname: fe.internal
+  port: 8031
+  sql-port: 9031
+  username: cdc
+  password: secret
+  database: analytics
+  request-timeout: 45s
+  auto-create-table: false
+  schema.change.enabled: true
+  schema.change.include: add.column
+  buckets: 16
+  replication-num: 3
+  max-retries: 5
+pipeline:
+  name: demo
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := pipe.Sink
+	if sink.Hostname != "fe.internal" || sink.Port != 8031 || sink.SQLPort != 9031 {
+		t.Fatalf("endpoint %+v", sink)
+	}
+	if sink.Username != "cdc" || sink.Database != "analytics" || sink.RequestTimeout != 45*time.Second {
+		t.Fatalf("auth/database/timeout %+v", sink)
+	}
+	if sink.AutoCreate || !sink.SchemaChange || sink.Buckets != "16" || sink.ReplicationNum != 3 {
+		t.Fatalf("switches %+v", sink)
+	}
+}
+
+func TestParseDorisRejectsUnsupportedV1Options(t *testing.T) {
+	cases := []struct {
+		name  string
+		body  string
+		field string
+	}{
+		{"missing hostname", "  username: root\n  password: secret\n", "sink.hostname"},
+		{"hostname scheme", "  hostname: http://fe:8030\n  username: root\n  password: secret\n", "sink.hostname"},
+		{"hostname path", "  hostname: fe/api\n  username: root\n  password: secret\n", "sink.hostname"},
+		{"http port zero", "  hostname: fe\n  port: 0\n  username: root\n  password: secret\n", "sink.port"},
+		{"http port too large", "  hostname: fe\n  port: 70000\n  username: root\n  password: secret\n", "sink.port"},
+		{"sql port zero", "  hostname: fe\n  sql-port: 0\n  username: root\n  password: secret\n", "sink.sql-port"},
+		{"missing username", "  hostname: fe\n  password: secret\n", "sink.username"},
+		{"partial update", "  hostname: fe\n  username: root\n  password: secret\n  partial-update.enabled: true\n", "sink.partial-update.enabled"},
+		{"delete", "  hostname: fe\n  username: root\n  password: secret\n  delete.enabled: true\n", "sink.delete.enabled"},
+		{"drop truncate", "  hostname: fe\n  username: root\n  password: secret\n  schema.change.drop-truncate.enabled: true\n", "sink.schema.change.drop-truncate.enabled"},
+		{"unsupported include", "  hostname: fe\n  username: root\n  password: secret\n  schema.change.include: add.column,drop.column\n", "sink.schema.change.include"},
+		{"buckets text", "  hostname: fe\n  username: root\n  password: secret\n  buckets: many\n", "sink.buckets"},
+		{"buckets zero", "  hostname: fe\n  username: root\n  password: secret\n  buckets: 0\n", "sink.buckets"},
+		{"negative replication", "  hostname: fe\n  username: root\n  password: secret\n  replication-num: -1\n", "sink.replication-num"},
+		{"unknown field", "  hostname: fe\n  username: root\n  password: secret\n  stream-load.enabled: true\n", "sink.stream-load.enabled"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse([]byte(dorisSource + tc.body + "pipeline:\n  name: demo\n"))
+			cfg, ok := err.(*ConfigError)
+			if !ok || cfg.Field != tc.field {
+				t.Fatalf("got %v, want field %s", err, tc.field)
+			}
+		})
+	}
+}
+
+func TestParseDemoDorisConfig(t *testing.T) {
+	body, err := os.ReadFile("../../configs/demo-doris.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pipe, err := Parse(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := pipe.Sink
+	if sink.Type != "doris" || sink.Port != 8030 || sink.SQLPort != 9030 {
+		t.Fatalf("demo endpoints %+v", sink)
+	}
+	if !sink.AutoCreate || sink.Buckets != "auto" || sink.ReplicationNum != 1 {
+		t.Fatalf("demo options %+v", sink)
+	}
+	if sink.SchemaChange || sink.PartialUpdate || sink.DeleteEnabled || sink.DropTruncate {
+		t.Fatalf("demo must keep v1 switches off: %+v", sink)
+	}
+}
+
+func TestParseMySQLSinkKeepsMySQLDefaults(t *testing.T) {
+	pipe, err := Parse([]byte(`
+source:
+  hostname: 127.0.0.1
+  username: root
+  password: secret
+  tables: db\..*
+sink:
+  type: mysql
+  hostname: 127.0.0.1
+  username: root
+  password: secret
+pipeline:
+  name: demo
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pipe.Sink.Port != 3306 || pipe.Sink.SQLPort != 0 || pipe.Sink.RequestTimeout != 0 || pipe.Sink.Buckets != "" {
+		t.Fatalf("Doris defaults leaked into mysql: %+v", pipe.Sink)
+	}
 }

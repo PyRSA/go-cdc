@@ -1,5 +1,5 @@
 // Command go-cdc runs one YAML pipeline.
-// sink.type selects stdout, mysql, or kafka. Doris and Elasticsearch are rejected at startup.
+// sink.type selects stdout, mysql, kafka, or doris. Elasticsearch is rejected at startup.
 package main
 
 import (
@@ -15,6 +15,7 @@ import (
 	"github.com/PyRSA/go-cdc/composer"
 	"github.com/PyRSA/go-cdc/composer/definition"
 	"github.com/PyRSA/go-cdc/connector/sink"
+	dorissink "github.com/PyRSA/go-cdc/connector/sink/doris"
 	kafkasink "github.com/PyRSA/go-cdc/connector/sink/kafka"
 	mysqlsink "github.com/PyRSA/go-cdc/connector/sink/mysql"
 	"github.com/PyRSA/go-cdc/connector/sink/stdout"
@@ -35,7 +36,7 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: go-cdc <pipeline.yaml>")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Run one YAML pipeline (source → transform/route → sink).")
-		fmt.Fprintln(os.Stderr, "Supported sinks in this release: stdout, mysql, kafka.")
+		fmt.Fprintln(os.Stderr, "Supported sinks in this release: stdout, mysql, kafka, doris.")
 		return 0
 	}
 	if len(args) != 1 {
@@ -76,7 +77,7 @@ func run(args []string) int {
 		logger.Warn(msg, args...)
 	})
 	pipe.Source.ServerID = db.ServerID()
-	stream, err := mysqlsrc.OpenStream(pipe.Source)
+	stream, err := mysqlsrc.OpenStream(pipe.Source, db)
 	if err != nil {
 		_ = db.Close()
 		logger.Error("open binlog stream", "err", err)
@@ -159,6 +160,15 @@ func openSink(pipe *definition.Pipeline) (sink.Sink, error) {
 		return sk, nil
 	case "kafka":
 		sk, err := kafkasink.Open(pipe.Sink, pipe.Runtime.Name)
+		if err != nil {
+			return nil, err
+		}
+		if err := sk.Open(context.Background()); err != nil {
+			return nil, err
+		}
+		return sk, nil
+	case "doris":
+		sk, err := dorissink.Open(pipe.Sink)
 		if err != nil {
 			return nil, err
 		}

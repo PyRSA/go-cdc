@@ -34,8 +34,11 @@ Writes results. Supported types:
 | `stdout` | [connectors/stdout-sink.md](connectors/stdout-sink.md) |
 | `mysql` | [connectors/mysql-sink.md](connectors/mysql-sink.md) |
 | `kafka` | [connectors/kafka-sink.md](connectors/kafka-sink.md) |
+| `doris` | [connectors/doris-sink.md](connectors/doris-sink.md) |
 
-`doris` and `elasticsearch` are **not** available in this release (startup fails if configured).
+`elasticsearch` is **not** available in this release (startup fails if configured).
+Doris v1 targets **2.1.x** with `UNIQUE KEY` tables and Stream Load JSON Lines;
+DELETE, partial-column updates, and DROP/TRUNCATE are rejected.
 
 ---
 
@@ -125,7 +128,9 @@ DDL comes from the source when `source.schema-change.enabled` is `true` (default
 | Location | Option | Default | Description |
 | --- | --- | --- | --- |
 | `source` | `schema-change.enabled` | `true` | Capture DDL when `true` |
-| `sink` | `schema.change.drop-truncate.enabled` | `false` | Allow DROP TABLE / TRUNCATE on MySQL sink when `true` |
+| `sink` | `schema.change.drop-truncate.enabled` | `false` | Allow DROP TABLE / TRUNCATE on MySQL sink when `true`; rejected for Doris |
+| `sink` | `schema.change.enabled` | `false` | Doris: apply whitelisted `ADD COLUMN` when `true` |
+| `sink` | `schema.change.include` | `["add.column"]` | Doris: v1 accepts only `add.column` |
 
 ### Behavior summary
 
@@ -145,7 +150,17 @@ DDL comes from the source when `source.schema-change.enabled` is `true` (default
 | Stdout | Always prints `"op":"ddl"` when source emits DDL |
 | Kafka | Emits `"op":"ddl"` only when `schema.change.emit.enabled: true`; topic follows the same route rules as DML (see [Kafka Sink](connectors/kafka-sink.md)) |
 
-Details: [MySQL Source](connectors/mysql-source.md), [MySQL Sink](connectors/mysql-sink.md), [Stdout Sink](connectors/stdout-sink.md), [Kafka Sink](connectors/kafka-sink.md).
+**Doris** only applies whitelisted column additions, and only when enabled:
+
+| DDL kind | Doris sink |
+| --- | --- |
+| `ADD COLUMN` (one column) | `ALTER TABLE ... ADD COLUMN` when `schema.change.enabled: true` and `schema.change.include` contains `add.column`; otherwise the job fails when the column is projected |
+| Drop / modify / rename column | Rejected (job fails) when the column is projected |
+| DROP TABLE / TRUNCATE | Not supported; enabling `schema.change.drop-truncate.enabled` for Doris is a config error |
+| CREATE TABLE | Applied through `auto-create-table` / the inferred schema, then validated |
+| Other / unprojected columns | Ignored when no Doris action is required |
+
+Details: [MySQL Source](connectors/mysql-source.md), [MySQL Sink](connectors/mysql-sink.md), [Stdout Sink](connectors/stdout-sink.md), [Kafka Sink](connectors/kafka-sink.md), [Doris Sink](connectors/doris-sink.md).
 
 ---
 
@@ -175,7 +190,7 @@ source:
   type: mysql
   # … see mysql-source.md
 sink:
-  type: mysql   # or stdout / kafka — see sink docs
+  type: mysql   # or stdout / kafka / doris — see sink docs
   # …
 transform:
   - source-table: demo_db\.orders
@@ -204,3 +219,4 @@ checkpoint:
   - [MySQL Sink](connectors/mysql-sink.md)
   - [Stdout Sink](connectors/stdout-sink.md)
   - [Kafka Sink](connectors/kafka-sink.md)
+  - [Doris Sink](connectors/doris-sink.md)

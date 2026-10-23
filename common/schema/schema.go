@@ -77,4 +77,22 @@ type Change struct {
 	// SourceTSMs is the binlog event time in Unix milliseconds when known (same as event.SourceTSMs).
 	// Zero means unavailable → JSON source.ts_ms is null. Stdout/Kafka copy it into DDL envelopes.
 	SourceTSMs int64
+	// AddColumns lists every column name added by one ADD COLUMN statement.
+	// v1 sink implementations must reject more than one entry instead of
+	// applying a partial change.
+	AddColumns []string
+	// ColumnDef is the structured definition of the added column, filled by the
+	// source from catalog metadata. Nil means the definition is unavailable and
+	// schema evolution must fail rather than infer it from DDL text.
+	ColumnDef *Column
+}
+
+// Clone copies the change so routing cannot share slices or column pointers.
+func (c Change) Clone() Change {
+	c.AddColumns = append([]string(nil), c.AddColumns...)
+	if c.ColumnDef != nil {
+		column := *c.ColumnDef
+		c.ColumnDef = &column
+	}
+	return c
 }

@@ -52,7 +52,7 @@ type Source struct {
 	JDBCProperties        map[string]string
 }
 
-// Sink is stdout, MySQL, or Kafka for this release.
+// Sink is stdout, MySQL, Kafka, or Doris for this release.
 type Sink struct {
 	Type            string
 	Hostname        string
@@ -73,6 +73,16 @@ type Sink struct {
 	AllowAutoCreateTopics bool          // allow.auto.create.topics; default true via parseSink
 	ProducerBatchMaxBytes int           // producer-batch-max-bytes; bytes; default via parseSink
 	FlushTimeout          time.Duration // flush-timeout; default 30s via parseSink
+	// Doris
+	SQLPort             int           // sql-port; FE MySQL protocol; default 9030 via parseSink
+	Database            string        // database; optional default target database
+	RequestTimeout      time.Duration // request-timeout; Stream Load HTTP timeout
+	SchemaChange        bool          // schema.change.enabled; default false
+	SchemaChangeInclude []string      // schema.change.include; v1 allows only add.column
+	PartialUpdate       bool          // partial-update.enabled; v1 must stay false
+	DeleteEnabled       bool          // delete.enabled; v1 must stay false
+	Buckets             string        // buckets; "auto" or a positive integer
+	ReplicationNum      int           // replication-num; 0 omits PROPERTIES
 }
 
 // Route sends one source table pattern to a sink table.
