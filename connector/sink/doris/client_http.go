@@ -19,6 +19,13 @@ import (
 
 const maxResponseBytes = 1 << 20
 
+// loadTimeoutGrace keeps the HTTP client deadline strictly above the Doris-side
+// Stream Load `timeout` header. Doris answers only after that budget expires, so
+// an equal client deadline cancels the request exactly when the result is being
+// written; every timeout would then surface as an unknown result and cost a
+// SHOW LOAD round trip plus a full body retry.
+const loadTimeoutGrace = 30 * time.Second
+
 // loadResponse is the subset of the Doris Stream Load JSON response that the
 // state machine uses. Unknown Status / missing ExistingJobStatus go through
 // SHOW LOAD; a Success response with bad row counts is fatal, not unknown.
@@ -54,17 +61,19 @@ func (e *unknownResultError) Unwrap() error { return e.Err }
 
 // httpClient sends Stream Load requests with bounded redirects and timeouts.
 type httpClient struct {
-	client  *http.Client
-	base    *url.URL
-	user    string
-	pass    string
+	client *http.Client
+	base   *url.URL
+	user   string
+	pass   string
+	// timeout is the Doris-side Stream Load budget sent as the `timeout`
+	// header. client.Timeout is deliberately larger; see loadTimeoutGrace.
 	timeout time.Duration
 }
 
 func newHTTPClient(cfg definition.Sink) (*httpClient, error) {
 	base := &url.URL{Scheme: "http", Host: net.JoinHostPort(cfg.Hostname, strconv.Itoa(cfg.Port))}
 	feHost := strings.ToLower(cfg.Hostname)
-	client := &http.Client{Timeout: cfg.RequestTimeout}
+	client := &http.Client{Timeout: cfg.RequestTimeout + loadTimeoutGrace}
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 3 {
 			return errors.New("too many redirects")
@@ -134,7 +143,9 @@ func (c *httpClient) streamLoad(ctx context.Context, database, table, label stri
 	req.Header.Set("max_filter_ratio", "0")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Expect", "100-continue")
-	req.Header.Set("timeout", strconv.Itoa(int(c.timeout.Seconds())))
+	// The client deadline is request-timeout plus loadTimeoutGrace, so Doris
+	// always gets to report its own verdict before the request is cancelled.
+	req.Header.Set("timeout", strconv.Itoa(secondsRoundedUp(c.timeout)))
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return nil, &unknownResultError{Err: err}
@@ -154,6 +165,17 @@ func (c *httpClient) streamLoad(ctx context.Context, database, table, label stri
 		return nil, &unknownResultError{Err: fmt.Errorf("invalid response: %w", err)}
 	}
 	return &out, nil
+}
+
+// secondsRoundedUp converts a duration to whole seconds for the Doris `timeout`
+// header. Sub-second budgets round up: truncating would send 0, which Doris
+// rejects before running the load at all.
+func secondsRoundedUp(d time.Duration) int {
+	seconds := int((d + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
 }
 
 func truncate(value string, limit int) string {

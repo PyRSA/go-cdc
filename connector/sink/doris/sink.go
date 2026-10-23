@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -16,10 +17,8 @@ import (
 	"github.com/PyRSA/go-cdc/connector/sink"
 )
 
-const schemaChangeWaitLimit = 10
-
-// schemaChangePollInterval is short in tests; production waits 500ms between
-// structure re-reads after ADD COLUMN (Doris applies the change asynchronously).
+// schemaChangePollInterval is the delay between structure re-reads; tests
+// shorten it. The default budget is 5s, checked every 500ms.
 var schemaChangePollInterval = 500 * time.Millisecond
 
 // sqlAPI is the SQL surface the sink needs. *sqlClient implements it; tests
@@ -28,6 +27,7 @@ type sqlAPI interface {
 	Ping(ctx context.Context) error
 	Exec(ctx context.Context, statement string) error
 	descTable(ctx context.Context, database, table string) ([]descColumn, error)
+	showCreateTable(ctx context.Context, database, table string) (string, error)
 	showLoad(ctx context.Context, database, label string) (loadState, error)
 	Close() error
 }
@@ -38,6 +38,7 @@ type Sink struct {
 	sql    sqlAPI
 	http   *httpClient
 	labels labelSequence
+	log    *slog.Logger
 
 	mu     sync.RWMutex
 	tables map[string]schema.Table
@@ -55,7 +56,19 @@ func Open(cfg definition.Sink) (*Sink, error) {
 		_ = sqlClient.Close()
 		return nil, err
 	}
-	return &Sink{cfg: cfg, sql: sqlClient, http: httpClient, tables: map[string]schema.Table{}}, nil
+	return &Sink{
+		cfg: cfg, sql: sqlClient, http: httpClient,
+		log: slog.Default(), tables: map[string]schema.Table{},
+	}, nil
+}
+
+// logger returns the sink logger. A Sink built without one still reports
+// through the process logger installed by main.
+func (s *Sink) logger() *slog.Logger {
+	if s.log != nil {
+		return s.log
+	}
+	return slog.Default()
 }
 
 // Open verifies the Doris SQL endpoint. Stream Load is attempted per batch.
@@ -69,8 +82,28 @@ func (s *Sink) Open(ctx context.Context) error {
 // CreateTable creates a missing database/table when auto-create-table is on,
 // then always validates the live structure. A failure is returned to Runner and
 // the table is not cached as writable.
-func (s *Sink) CreateTable(table schema.Table) error {
+func (s *Sink) CreateTable(table schema.Table) (err error) {
 	table = s.withDatabase(table)
+	var live schema.Table
+	var pendingColumns []string
+	defer func() {
+		if err != nil {
+			// A rejected target is never cached as writable, so this is the only
+			// structured record of why it cannot be written to.
+			s.logger().Warn("doris: target table rejected",
+				"database", table.Database, "table", table.Table, "error", err)
+			return
+		}
+		if len(pendingColumns) > 0 {
+			s.logger().Warn("doris: target table accepted with pending source columns; a replayed ADD COLUMN must create them before the first row",
+				"database", live.Database, "table", live.Table, "columns", pendingColumns)
+			return
+		}
+		s.logger().Info("doris: target table validated",
+			"database", live.Database, "table", live.Table,
+			"columns", len(live.Columns), "key_columns", live.PrimaryKeys,
+			"auto_create", s.cfg.AutoCreate)
+	}()
 	if table.Database == "" || table.Table == "" {
 		return fmt.Errorf("sink.doris: database and table are required")
 	}
@@ -85,6 +118,8 @@ func (s *Sink) CreateTable(table schema.Table) error {
 		if err != nil {
 			return err
 		}
+		s.logger().Debug("doris: create table statement",
+			"database", table.Database, "table", table.Table, "statement", statement)
 		if err := s.sql.Exec(context.Background(), statement); err != nil {
 			return err
 		}
@@ -93,12 +128,32 @@ func (s *Sink) CreateTable(table schema.Table) error {
 	if err != nil {
 		return err
 	}
-	if err := validateTarget(table, columns); err != nil {
+	create, err := s.sql.showCreateTable(context.Background(), table.Database, table.Table)
+	if err != nil {
 		return err
+	}
+	model, err := parseTableModel(create)
+	if err != nil {
+		return err
+	}
+	if err := validateTableModel(table, model); err != nil {
+		return err
+	}
+	if err := validateTarget(table, columns); err != nil {
+		var missing *missingColumnsError
+		if !errors.As(err, &missing) {
+			return err
+		}
+		// A column added while the job was down is still ahead in the binlog:
+		// the pending ADD COLUMN creates it before any row that carries it.
+		// Failing here would make every restart hit the same wall, so accept
+		// the table and let validateEvents enforce the invariant on real rows.
+		pendingColumns = missing.Columns
 	}
 	// Cache the live DESC shape (Doris types + key casing) so Write/encode
 	// always see one dialect after create or restart.
-	s.cacheTable(schemaFromDesc(table.Database, table.Table, columns))
+	live = schemaFromDesc(table.Database, table.Table, columns)
+	s.cacheTable(live)
 	return nil
 }
 
@@ -135,6 +190,9 @@ func (s *Sink) ApplySchema(change schema.Change) error {
 		}
 		// Refresh cache even on the idempotent path: the in-process schema may
 		// predate an external or previously applied ADD COLUMN.
+		s.logger().Debug("doris: schema change already present",
+			"database", table.Database, "table", table.Table,
+			"action", string(change.Action), "column", change.ColumnDef.Name)
 		s.cacheTable(schemaFromDesc(table.Database, table.Table, columns))
 		return nil
 	}
@@ -142,16 +200,30 @@ func (s *Sink) ApplySchema(change schema.Change) error {
 	if err != nil {
 		return err
 	}
+	s.logger().Info("doris: sending schema change",
+		"database", table.Database, "table", table.Table,
+		"action", string(change.Action), "column", change.ColumnDef.Name, "statement", statement)
 	if err := s.sql.Exec(context.Background(), statement); err != nil {
+		s.logger().Error("doris: schema change failed",
+			"database", table.Database, "table", table.Table,
+			"action", string(change.Action), "column", change.ColumnDef.Name, "error", err)
 		return err
 	}
+	started := time.Now()
 	if err := s.waitForColumn(table.Database, table.Table, *change.ColumnDef); err != nil {
+		s.logger().Error("doris: schema change not confirmed",
+			"database", table.Database, "table", table.Table, "column", change.ColumnDef.Name,
+			"wait_timeout", s.schemaChangeWait(), "error", err)
 		return err
 	}
 	columns, err = s.sql.descTable(context.Background(), table.Database, table.Table)
 	if err != nil {
 		return err
 	}
+	s.logger().Info("doris: schema change applied",
+		"database", table.Database, "table", table.Table,
+		"action", string(change.Action), "column", change.ColumnDef.Name,
+		"elapsed", time.Since(started))
 	s.cacheTable(schemaFromDesc(table.Database, table.Table, columns))
 	return nil
 }
@@ -227,19 +299,32 @@ func (s *Sink) load(tableID, label string, body []byte, wantRows int) error {
 	database, table := parts[0], parts[1]
 	attempts := labelAttempts(s.cfg.MaxRetries)
 	for attempt := 1; attempt <= attempts; attempt++ {
+		started := time.Now()
 		outcome, err := s.attempt(database, table, label, body, wantRows)
 		switch outcome {
 		case outcomeSuccess:
+			s.logger().Info("doris: stream load succeeded",
+				"database", database, "table", table, "label", label,
+				"rows", wantRows, "attempt", attempt, "elapsed", time.Since(started))
 			return nil
 		case outcomeFatal:
+			s.logger().Error("doris: stream load failed",
+				"database", database, "table", table, "label", label, "rows", wantRows,
+				"attempt", attempt, "outcome", outcome.String(), "error", err)
 			return fmt.Errorf("sink.doris: %s label %s: %w", tableID, label, err)
 		case outcomeRetryable, outcomeUnknown, outcomeLabelExists:
 			if attempt == attempts {
 				if err == nil {
 					err = fmt.Errorf("load state was not confirmed")
 				}
+				s.logger().Error("doris: stream load was never confirmed",
+					"database", database, "table", table, "label", label, "rows", wantRows,
+					"attempts", attempts, "outcome", outcome.String(), "error", err)
 				return fmt.Errorf("sink.doris: %s label %s not confirmed after %d attempts: %w", tableID, label, attempts, err)
 			}
+			s.logger().Warn("doris: stream load not confirmed; retrying",
+				"database", database, "table", table, "label", label, "rows", wantRows,
+				"attempt", attempt, "attempts", attempts, "outcome", outcome.String(), "error", err)
 			time.Sleep(backoff(attempt))
 		default:
 			return fmt.Errorf("sink.doris: %s label %s: unexpected outcome", tableID, label)
@@ -273,6 +358,8 @@ func (s *Sink) resolveError(database, label string, err error) (loadOutcome, err
 	state, stateErr := s.sql.showLoad(context.Background(), database, label)
 	if stateErr == nil {
 		outcome, stateOutcomeErr := classifyLoadState(state)
+		s.logger().Debug("doris: stream load state resolved from SHOW LOAD",
+			"database", database, "label", label, "state", state.State, "outcome", outcome.String())
 		if stateOutcomeErr != nil {
 			return outcome, fmt.Errorf("%w (%v)", err, stateOutcomeErr)
 		}
@@ -291,9 +378,25 @@ func (s *Sink) resolveError(database, label string, err error) (loadOutcome, err
 	return outcomeRetryable, err
 }
 
+// schemaChangeWait is the configured ADD COLUMN visibility budget.
+func (s *Sink) schemaChangeWait() time.Duration {
+	if s.cfg.SchemaChangeWait > 0 {
+		return s.cfg.SchemaChangeWait
+	}
+	return definition.DefaultDorisSchemaChangeWait
+}
+
 func (s *Sink) waitForColumn(database, table string, column schema.Column) error {
+	timeout := s.schemaChangeWait()
+	interval := schemaChangePollInterval
+	if interval <= 0 {
+		interval = 500 * time.Millisecond
+	}
+	deadline := time.Now().Add(timeout)
+	polls := 0
 	var last error
-	for i := 0; i < schemaChangeWaitLimit; i++ {
+	for {
+		polls++
 		columns, err := s.sql.descTable(context.Background(), database, table)
 		if err == nil {
 			if existing, ok := findColumn(columns, column.Name); ok {
@@ -303,10 +406,19 @@ func (s *Sink) waitForColumn(database, table string, column schema.Column) error
 		} else {
 			last = err
 		}
-		time.Sleep(schemaChangePollInterval)
+		// Sleep up to the deadline instead of stopping one interval early: a
+		// wait-timeout below one interval must still give Doris that full budget.
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		if remaining > interval {
+			remaining = interval
+		}
+		time.Sleep(remaining)
 	}
-	return fmt.Errorf("sink.doris: add column %s.%s.%s was not confirmed: %w",
-		database, table, column.Name, last)
+	return fmt.Errorf("sink.doris: add column %s.%s.%s was not confirmed within %s (%d polls): %w",
+		database, table, column.Name, timeout, polls, last)
 }
 
 func (s *Sink) tableSchema(tableID string) (schema.Table, error) {
@@ -324,10 +436,27 @@ func (s *Sink) tableSchema(tableID string) (schema.Table, error) {
 	if err != nil {
 		return schema.Table{}, err
 	}
+	// Fallback when no catalogue was applied for this table (sink used without
+	// a source, or the source table is gone): only the target model can be
+	// checked here. A non-UNIQUE table must never be written to.
+	create, err := s.sql.showCreateTable(context.Background(), parts[0], parts[1])
+	if err != nil {
+		return schema.Table{}, err
+	}
+	model, err := parseTableModel(create)
+	if err != nil {
+		return schema.Table{}, err
+	}
+	if !model.UniqueKey {
+		return schema.Table{}, fmt.Errorf("sink.doris: target %s is not a UNIQUE KEY table", schema.Qualified(parts[0], parts[1]))
+	}
 	target := schemaFromDesc(parts[0], parts[1], columns)
 	if len(target.PrimaryKeys) == 0 {
 		return schema.Table{}, fmt.Errorf("sink.doris: target %s has no UNIQUE KEY column", schema.Qualified(parts[0], parts[1]))
 	}
+	s.logger().Debug("doris: target table loaded from DESC",
+		"database", target.Database, "table", target.Table,
+		"columns", len(target.Columns), "key_columns", target.PrimaryKeys)
 	s.cacheTable(target)
 	return target, nil
 }

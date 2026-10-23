@@ -28,6 +28,17 @@ make integration-scale-heavy
 
 Profile can also be selected with `SCALE_PROFILE=heavy bash test/integration/scale/run-scale.sh`.
 
+## Doris variant
+
+Same profiles, same allocation, Doris as the sink (`scale/doris_scale_it.py`). Requires Doris FE/BE up in addition to MySQL:
+
+```bash
+bash test/integration/scripts/doris-up.sh
+bash test/integration/scripts/run-doris-scale.sh normal   # make integration-doris-scale-normal
+```
+
+It uses its own databases (`db_tp_dscale_src_NN` / `db_tp_dscale_snk_NN`) so the two scale suites never touch each other's tables. `delete` event groups are remapped to `insert_update` and the `wide` / `large` templates drop the types Doris v1 rejects; see the [Doris variant notes](../README.md#doris-variant) in the integration README.
+
 ## Bootstrap and privileges
 
 Scale databases (`db_tp_scale_src_NN`, `db_tp_scale_snk_NN`) are **not** listed in `mysql/init/01-databases.sql`. The orchestrator (`scale_it.py`) creates them at runtime using the compose **root** account (defaults: `ROOT_USER=root`, `ROOT_PASSWORD=rootpass`), then `GRANT`s the usual anonymous IT users:

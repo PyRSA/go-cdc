@@ -110,11 +110,12 @@ Route mode under `pipeline`:
 | --- | --- | --- |
 | `pipeline.route-mode` | `ALL_MATCH` | `ALL_MATCH` or `FIRST_MATCH` |
 
-Other `pipeline` options:
+The `pipeline:` block itself is **required** and must contain at least one key
+(an empty `pipeline: {}` is rejected). Other `pipeline` options:
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
-| `name` | yes | `cdc` | Job name (used in checkpoint path) |
+| `name` | no | `cdc` | Job name (used in checkpoint path). Omitting it uses `cdc`; an explicit empty string is rejected |
 | `parallelism` | no | `1` | Snapshot parallelism (≥ 1) |
 
 ---
@@ -129,8 +130,8 @@ DDL comes from the source when `source.schema-change.enabled` is `true` (default
 | --- | --- | --- | --- |
 | `source` | `schema-change.enabled` | `true` | Capture DDL when `true` |
 | `sink` | `schema.change.drop-truncate.enabled` | `false` | Allow DROP TABLE / TRUNCATE on MySQL sink when `true`; rejected for Doris |
-| `sink` | `schema.change.enabled` | `false` | Doris: apply whitelisted `ADD COLUMN` when `true` |
-| `sink` | `schema.change.include` | `["add.column"]` | Doris: v1 accepts only `add.column` |
+| `sink` | `schema.change.enabled` | `false` | **Doris only** (rejected for mysql / kafka / stdout): apply whitelisted `ADD COLUMN` when `true` |
+| `sink` | `schema.change.include` | `["add.column"]` | **Doris only** (rejected for mysql / kafka / stdout): v1 accepts only `add.column` |
 
 ### Behavior summary
 

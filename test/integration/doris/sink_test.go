@@ -117,9 +117,11 @@ func TestIntegrationExtraColumnAndSchemaEvolution(t *testing.T) {
 	database := uniqueName("go_cdc_it")
 	createDatabase(t, db, database)
 	target := "evolving"
+	// varchar(32) needs 96 bytes in Doris; a VARCHAR(32) target would reject
+	// any CJK payload, so the fixture follows the byte-capacity rule.
 	execSQL(t, db, "CREATE TABLE "+schema.Qualified(database, target)+" ("+
 		"`id` BIGINT NOT NULL, "+
-		"`name` VARCHAR(32) NULL, "+
+		"`name` VARCHAR(96) NULL, "+
 		"`legacy` VARCHAR(16) NULL DEFAULT 'legacy'"+
 		") UNIQUE KEY(`id`) DISTRIBUTED BY HASH(`id`) BUCKETS 1 "+
 		`PROPERTIES ("replication_num" = "1")`)

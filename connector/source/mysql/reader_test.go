@@ -365,7 +365,7 @@ func (m *memDB) DescribeTable(_ context.Context, database, table string) (schema
 			return item, nil
 		}
 	}
-	return schema.Table{}, fmt.Errorf("memdb: %s.%s not found", database, table)
+	return schema.Table{}, fmt.Errorf("%w: %s.%s", ErrTableNotFound, database, table)
 }
 
 func (m *memDB) SplitKeys(_ context.Context, _, table, _ string, low *string, limit int) ([]string, error) {
@@ -722,7 +722,15 @@ func TestDescribeTableFailureFallsBackWithWarning(t *testing.T) {
 	if !sawSchema {
 		t.Fatal("expected binlog schema fallback")
 	}
-	if len(warns) != 1 || !strings.Contains(warns[0], "describe table failed") {
+	// A failed JDBC read must not lose the CREATE: the binlog schema is used and
+	// the fallback is reported.
+	var sawFallback bool
+	for _, warn := range warns {
+		if strings.Contains(warn, "describe table failed") {
+			sawFallback = true
+		}
+	}
+	if !sawFallback {
 		t.Fatalf("warns %#v", warns)
 	}
 }
@@ -777,6 +785,142 @@ func TestDescribeTableSuccessReplacesBinlogSchema(t *testing.T) {
 		}
 	}
 	t.Fatal("missing schema message")
+}
+
+func TestResumeReemitsCapturedTableSchema(t *testing.T) {
+	// A resumed job must reload the source catalogue for captured tables so the
+	// sink can revalidate the target before its first write.
+	db := newMemDB([]string{"1"})
+	db.tables = []schema.Table{{
+		Database: "db", Table: "user",
+		Columns: []schema.Column{
+			{Name: "id", Type: "int"},
+			{Name: "name", Type: "varchar(32)", Default: "x", HasDefault: true},
+		},
+		PrimaryKeys: []string{"id"},
+	}}
+	sel, err := definition.CompileSelector(`db\..*`, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := &memStream{events: []Commit{
+		{Position: &checkpoint.Position{File: "mysql-bin.000001", Pos: 500}},
+	}}
+	cap := &Capture{
+		Config: definition.Source{StartupMode: definition.StartupInitial, Tables: sel},
+		State: checkpoint.State{
+			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
+			CapturedTables: []string{"db.user"},
+		},
+		DB: db, Stream: stream, Spill: OpenSpill(t.TempDir()),
+		ReemitCapturedSchemas: true,
+	}
+	msgs := collect(t, cap)
+	for _, msg := range msgs {
+		if msg.Err != nil {
+			t.Fatal(msg.Err)
+		}
+		if msg.Schema != nil && msg.Schema.Table == "user" {
+			if len(msg.Schema.Columns) != 2 || msg.Schema.Columns[1].Default != "x" {
+				t.Fatalf("resumed schema %#v", msg.Schema)
+			}
+			return
+		}
+	}
+	t.Fatal("captured table schema was not re-read on resume")
+}
+
+func TestResumeSchemaReemitFailsOnCatalogueError(t *testing.T) {
+	// Only a missing table is a skippable catalogue error. A failing JDBC read
+	// must stop the job: continuing would silently skip the compatibility check.
+	db := newMemDB([]string{"1"})
+	db.describeErr = errors.New("jdbc down")
+	cap := &Capture{
+		Config: definition.Source{StartupMode: definition.StartupInitial, Tables: mustSelector(t)},
+		State: checkpoint.State{
+			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
+			CapturedTables: []string{"db.t"},
+		},
+		DB: db, Stream: &memStream{}, Spill: OpenSpill(t.TempDir()),
+		ReemitCapturedSchemas: true,
+	}
+	got := captureErr(t, cap)
+	if !strings.Contains(got, "resume schema for db.t") || !strings.Contains(got, "jdbc down") {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestResumeSchemaReemitSkipsDroppedTable(t *testing.T) {
+	db := newMemDB([]string{"1"})
+	db.tables = []schema.Table{{
+		Database: "db", Table: "t",
+		Columns:     []schema.Column{{Name: "id", Type: "int"}},
+		PrimaryKeys: []string{"id"},
+	}}
+	var warns []string
+	cap := &Capture{
+		Config: definition.Source{StartupMode: definition.StartupInitial, Tables: mustSelector(t)},
+		State: checkpoint.State{
+			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
+			CapturedTables: []string{"db.gone", "db.t"},
+		},
+		DB: db, Stream: &memStream{}, Spill: OpenSpill(t.TempDir()),
+		ReemitCapturedSchemas: true,
+		Warn:                  func(msg string, _ ...any) { warns = append(warns, msg) },
+	}
+	msgs := collect(t, cap)
+	var keptSchema bool
+	for _, msg := range msgs {
+		if msg.Err != nil {
+			t.Fatal(msg.Err)
+		}
+		if msg.Schema != nil && msg.Schema.Table == "t" {
+			keptSchema = true
+		}
+	}
+	if !keptSchema {
+		t.Fatal("remaining captured table was not re-read")
+	}
+	var dropped bool
+	for _, warn := range warns {
+		if strings.Contains(warn, "no longer exists") {
+			dropped = true
+		}
+	}
+	if !dropped {
+		t.Fatalf("dropped table was not warned about: %#v", warns)
+	}
+}
+
+func TestLatestResumeReemitsCapturedTableSchema(t *testing.T) {
+	// latest/earliest/timestamp resume from acked_offset too, so the catalogue
+	// revalidation must not depend on startup.mode=initial.
+	db := newMemDB([]string{"1"})
+	stream := &memStream{events: []Commit{
+		{Position: &checkpoint.Position{File: "mysql-bin.000001", Pos: 500}},
+	}}
+	cap := &Capture{
+		Config: definition.Source{StartupMode: definition.StartupLatest, Tables: mustSelector(t)},
+		State: checkpoint.State{
+			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
+			CapturedTables: []string{"db.t"},
+		},
+		DB: db, Stream: stream,
+		ReemitCapturedSchemas: true,
+	}
+	msgs := collect(t, cap)
+	for _, msg := range msgs {
+		if msg.Err != nil {
+			t.Fatal(msg.Err)
+		}
+		if msg.Schema != nil && msg.Schema.Table == "t" {
+			if stream.got.Pos != 400 {
+				t.Fatalf("binlog must replay from the checkpoint, got %d", stream.got.Pos)
+			}
+			return
+		}
+	}
+	t.Fatal("captured table schema was not re-read on a latest resume")
 }
 
 func TestNewlyAddedFalseBinlogFlagIgnoresDiffFollowsCreate(t *testing.T) {

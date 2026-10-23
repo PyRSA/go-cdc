@@ -28,6 +28,11 @@ const (
 	defaultDorisSQLPort      = 9030
 	defaultDorisTimeout      = 30 * time.Second
 	defaultDorisBuckets      = "auto"
+	// DefaultDorisSchemaChangeWait is the ADD COLUMN visibility budget. Doris
+	// applies ALTER TABLE asynchronously, so the sink re-reads DESC until the
+	// new column appears or the budget runs out. Exported because the sink also
+	// defaults a directly constructed definition.Sink.
+	DefaultDorisSchemaChangeWait = 5 * time.Second
 )
 
 var startupModes = map[string]struct{}{
@@ -45,6 +50,29 @@ var rejectedExact = map[string]struct{}{
 	"metadata.list":                     {},
 	"treat-tinyint1-as-boolean.enabled": {},
 	"use.legacy.json.format":            {},
+}
+
+// dorisOnlySinkKeys are parsed for every sink type but only meaningful for
+// Doris. mysql / kafka / stdout reject them so a typo cannot silently no-op.
+var dorisOnlySinkKeys = []string{
+	"sql-port",
+	"request-timeout",
+	"buckets",
+	"replication-num",
+	"schema.change.enabled",
+	"schema.change.include",
+	"schema.change.wait-timeout",
+	"partial-update.enabled",
+	"delete.enabled",
+}
+
+func rejectKeysForSinkType(sinkType string, seen map[string]struct{}, keys []string) error {
+	for _, key := range keys {
+		if _, ok := seen[key]; ok {
+			return configf("sink."+key, "not supported for sink.type %s", sinkType)
+		}
+	}
+	return nil
 }
 
 // Parse decodes a pipeline YAML document and applies defaults.
@@ -306,8 +334,11 @@ func parseSink(raw map[string]any) (Sink, error) {
 		out.RequestTimeout = defaultDorisTimeout
 		out.Buckets = defaultDorisBuckets
 		out.SchemaChangeInclude = []string{"add.column"}
+		out.SchemaChangeWait = DefaultDorisSchemaChangeWait
 	}
+	seen := make(map[string]struct{}, len(raw))
 	for key, value := range raw {
+		seen[key] = struct{}{}
 		switch key {
 		case "type":
 			out.Type = fmt.Sprint(value)
@@ -415,6 +446,12 @@ func parseSink(raw map[string]any) (Sink, error) {
 				return Sink{}, configf("sink.schema.change.include", "%v", err)
 			}
 			out.SchemaChangeInclude = list
+		case "schema.change.wait-timeout":
+			d, err := asDuration(value)
+			if err != nil || d <= 0 {
+				return Sink{}, configErr("sink.schema.change.wait-timeout", "must be a positive duration")
+			}
+			out.SchemaChangeWait = d
 		case "partial-update.enabled":
 			b, err := asBool(value)
 			if err != nil {
@@ -441,7 +478,13 @@ func parseSink(raw map[string]any) (Sink, error) {
 	}
 	switch out.Type {
 	case "stdout":
+		if err := rejectKeysForSinkType(out.Type, seen, dorisOnlySinkKeys); err != nil {
+			return Sink{}, err
+		}
 	case "mysql":
+		if err := rejectKeysForSinkType(out.Type, seen, dorisOnlySinkKeys); err != nil {
+			return Sink{}, err
+		}
 		if out.Hostname == "" {
 			return Sink{}, configErr("sink.hostname", "required")
 		}
@@ -452,6 +495,9 @@ func parseSink(raw map[string]any) (Sink, error) {
 			return Sink{}, configErr("sink.password", "required")
 		}
 	case "kafka":
+		if err := rejectKeysForSinkType(out.Type, seen, dorisOnlySinkKeys); err != nil {
+			return Sink{}, err
+		}
 		if len(out.Brokers) == 0 {
 			return Sink{}, configErr("sink.brokers", "required")
 		}
@@ -498,6 +544,9 @@ func parseSink(raw map[string]any) (Sink, error) {
 		}
 		if out.Buckets == "" {
 			out.Buckets = defaultDorisBuckets
+		}
+		if out.SchemaChangeWait <= 0 {
+			out.SchemaChangeWait = DefaultDorisSchemaChangeWait
 		}
 		if out.Buckets != "auto" {
 			n, err := strconv.Atoi(out.Buckets)

@@ -4,6 +4,7 @@ package doris_it
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/PyRSA/go-cdc/common/event"
@@ -48,6 +49,9 @@ func TestIntegrationTypeRoundTrip(t *testing.T) {
 
 	columns := []string{"id", "tiny", "small", "medium", "normal", "big", "ubig",
 		"f", "d", "dec", "c", "vc", "txt", "day", "ts", "doc", "yr"}
+	// 40 CJK characters are 120 UTF-8 bytes: wider than the source character
+	// count and inside the widened VARCHAR(64*3) the sink must create.
+	wide := strings.Repeat("中", 40)
 	writeEvents(t, sk, makeEvent(event.OpCreate, database, table, columns, map[string]any{
 		"id":     int64(1),
 		"tiny":   int8(-8),
@@ -60,7 +64,7 @@ func TestIntegrationTypeRoundTrip(t *testing.T) {
 		"d":      float64(2.25),
 		"dec":    "1234.5678",
 		"c":      "abc",
-		"vc":     "hello",
+		"vc":     wide,
 		"txt":    "long text",
 		"day":    "2026-10-22",
 		"ts":     "2026-10-22 10:11:12.123456",
@@ -80,13 +84,13 @@ func TestIntegrationTypeRoundTrip(t *testing.T) {
 		"ubig":   "18446744073709551615",
 		"dec":    "1234.5678",
 		"c":      "abc",
-		"vc":     "hello",
 		"txt":    "long text",
 		"day":    "2026-10-22",
 		"yr":     "2026",
 	} {
 		assertText(t, row, key, want)
 	}
+	assertText(t, row, "vc", wide)
 	assertNumber(t, row, "f", "1.5")
 	assertNumber(t, row, "d", "2.25")
 	assertPrefix(t, row, "ts", "2026-10-22 10:11:12.123456")

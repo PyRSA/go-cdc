@@ -7,7 +7,8 @@
 3. **负载 / 峰值** TP-L01～TP-L04（`harness/load_it.py`，tier A）
 4. **规模** 多库多表 E2E（`scale/scale_it.py`，配置 `normal` / `heavy`）— 单独执行 [`scale/run-scale.sh`](scale/run-scale.sh)；运行时以 MySQL root 建库（见 [`scale/README.md`](scale/README.md)）
 5. **Kafka sink** TP-K01～K08（`harness/kafka_it.py`）— MySQL + Kafka 就绪后跑 [`scripts/run-kafka-e2e.sh`](scripts/run-kafka-e2e.sh)
-6. **Doris sink** MySQL→Doris 流水线 TP-DR01～DR04（`harness/doris_it.py`）+ sink 级 Go 套件（`doris/`，tag `doris_integration`）— MySQL + Doris 就绪后跑 [`scripts/run-doris-e2e.sh`](scripts/run-doris-e2e.sh)
+6. **Doris sink** MySQL→Doris 流水线 TP-DR01～DR07（功能 + 负载对齐，`harness/doris_it.py`）+ sink 级 Go 套件（`doris/`，tag `doris_integration`）— MySQL + Doris 就绪后跑 [`scripts/run-doris-e2e.sh`](scripts/run-doris-e2e.sh)
+7. **Doris 规模** 对 Doris 的多库多表压测（`scale/doris_scale_it.py`，配置 `normal` / `heavy`）— 跑 [`scripts/run-doris-scale.sh`](scripts/run-doris-scale.sh)
 
 生成报告（英文）落在 `docs/test/reports/`：
 
@@ -18,7 +19,8 @@
 | 负载 | `docs/test/reports/mysql-mysql-load.md` |
 | 规模 | `docs/test/reports/mysql-mysql-scale-{normal\|heavy}.md` |
 | Kafka | `docs/test/reports/mysql-kafka.md` |
-| Doris | `docs/test/reports/mysql-doris.md`（Go 套件日志见 `workdir/doris-integration.log`） |
+| Doris | `docs/test/reports/mysql-doris.md`（含功能 + 负载阶段；Go 套件日志见 `workdir/doris-integration.log`） |
+| Doris 规模 | `docs/test/reports/mysql-doris-scale-{normal\|heavy}.md` |
 
 说明文档：[`docs/test/TYPES.zh.md`](../../docs/test/TYPES.zh.md)（不是跑测报告）。
 
@@ -57,6 +59,32 @@ make integration-scale-heavy
 
 规模库（`db_tp_scale_src_NN` / `db_tp_scale_snk_NN`）由 `scale_it.py` 在运行时以 compose root（`ROOT_USER` / `ROOT_PASSWORD`）创建，再授权给与其他套件相同的匿名源/目标账号。
 
+### Doris 变体
+
+同一套 profile、同样的表/行分配，目标换成 Doris：
+
+```bash
+bash test/integration/scripts/mysql-up.sh
+bash test/integration/scripts/doris-up.sh
+bash test/integration/scripts/run-doris-scale.sh normal
+# 或：bash test/integration/scripts/run-doris-scale.sh heavy
+# 或：make integration-doris-scale-normal / integration-doris-scale-heavy
+```
+
+它**故意不与** MySQL→MySQL 规模套件共用库名（改用
+`db_tp_dscale_src_NN` / `db_tp_dscale_snk_NN`），两者可并行而不会互删对方表。
+三处差异由 Doris v1 语义决定，报告会逐条写明：
+
+| 差异 | 原因 |
+| --- | --- |
+| `delete` 事件组的表被重映射为 `insert_update` | Doris sink 拒绝 DELETE，`delete.enabled: true` 在解析期即报错 |
+| `wide` 去掉 `c_time TIME`；`large` 用 `payload LONGTEXT` 取代 `binary_data BLOB` | `types.go` 在 v1 中没有 TIME / 二进制类型的映射 |
+| 目标库由 `auto-create-table` 建立 | sink 自己执行 `CREATE DATABASE IF NOT EXISTS` |
+
+内容校验在启动时探测：MySQL 与 Doris 对同一固定字符串的 `CRC32` 必须相同，
+否则降级为字符长度求和（MySQL 用 `CHAR_LENGTH`，Doris 用 `LENGTH`），并在报告
+顶部标注已降级，而不是静默比较两种不同的聚合值。
+
 ## 负载 knobs
 
 | 变量 | 默认 | 说明 |
@@ -80,14 +108,16 @@ make integration-scale-heavy
 
 | Job | 矩阵 | 内容 |
 | --- | --- | --- |
-| `go-check` | — | fmt / lint / `make test` / build / **scale 单测**（`pytest scale/test_*.py`） |
+| `go-check` | — | fmt / lint / `make test` / build / **scale 单测**（`pytest scale/test_profiles.py scale/test_schemas.py scale/test_doris_schemas.py`） |
 | `mysql-mysql-e2e` | MySQL **5.7** + **8.0** | 功能 + 类型 + 负载；**8.0 另跑 Kafka sink** TP-K01..K08 |
 | `mysql-scale-e2e` | 仅 MySQL **8.0** | scale `normal` / `heavy`（独立 compose 项目，宿主机端口 `13307`） |
-| `doris-e2e` | MySQL **8.0** + Doris **2.1.8** | MySQL→Doris 流水线 TP-DR01..DR04 + sink Go 套件（[`doris-integration.yml`](../../.github/workflows/doris-integration.yml)） |
+| `doris-e2e` | MySQL **8.0** + Doris **2.1.8** | MySQL→Doris 流水线 TP-DR01..DR07（功能 + 负载）+ sink Go 套件 + Doris 规模（[`doris-integration.yml`](../../.github/workflows/doris-integration.yml)） |
 
-**负载分档**（`LOAD_ROWS_PER_TABLE`）：PR / `main` / `master` / `release-*` → **100000**（`LOAD_PROFILE=full`）；其他分支 push → **30000**（`normal`）。峰值：5.7 / 8.0 均为 **60s×4**。
+**负载分档**（`LOAD_ROWS_PER_TABLE`）：PR / `main` / `master` / `release-*` → **100000**（`LOAD_PROFILE=full`）；其他分支 push → **30000**（`normal`）。峰值：5.7 / 8.0 均为 **60s×4**。Doris `doris-e2e` 使用同一分档（5 张批量表）；`workflow_dispatch` 可显式选 `normal` / `full`。
 
 **Scale 分档**：PR / `main` / `master` / `release-*` → **heavy**（10 库 / 50 表 / ~30 万行 / w=8，含热点 burst+peak）；其他分支 push → **normal**（5 库 / 20 表 / ~5 万行 / w=4）；`workflow_dispatch` 可选 `normal`/`heavy`（默认 heavy）。`mysql-scale-e2e` job 超时 **120 分钟**。
+
+**Doris 规模分档**（在 `doris-e2e` 内）：PR / 分支 push → **normal**（5 库 / 20 表 / ~5 万行 / w=4）；`workflow_dispatch` 且 `load_profile=full` → **heavy**（10 库 / 50 表 / ~30 万行 / w=8，含热点 burst+peak）。`doris-e2e` job 超时 **150 分钟**。
 
 **Artifact**：仅在 push 到 `main` / `master` / `release-*` 时上传（PR 与其它分支不上传）；同名旧 artifact 会先删再传，只留最新一份；其余仍按仓库默认约 90 天过期。
 
@@ -119,6 +149,14 @@ bash test/integration/scripts/run-doris-e2e.sh
 | DR02 | 增量 insert + update；`city=sh` 被过滤（v1 不支持 DELETE） |
 | DR03 | `tpds01_evolve`（无 projection）：源端 `ADD COLUMN` → Doris DESC + 新列行 |
 | DR04 | 保留 checkpoint 重启；重启后 upsert 收敛（ALO） |
+| DR05 | 多表批量快照：`tpdl01_t1`–`t4` + `typed`，每表 `LOAD_ROWS_PER_TABLE` 行 |
+| DR06 | 狂写追平：`LOAD_PEAK_*` 并发 INSERT 风暴；Doris 行数收敛到 1% 以内 |
+| DR07 | 批量负载下的类型抽检（int/bigint/decimal/varchar/date/datetime/json/bool） |
+
+负载阶段（DR05–DR07）复用与 mysql→mysql / kafka 负载套件相同的 `LOAD_*` 旋钮
+与 CI 分档。Doris v1 拒绝 BLOB/ENUM/BIT/SET/TIME，因此批量表放在
+`db_tp_load_src.tpdl01_*`，只使用可映射类型；`tpl01_large` 的大字段用例没有
+Doris 对应项。
 
 同一 `run-doris-e2e.sh` 随后跑 sink 级 Go 套件（`doris_integration`）：自动建表 /
 UNIQUE KEY、同批重复主键、空 Schema 缓存重启、额外列、类型拒绝/往返、Label +
@@ -126,5 +164,6 @@ UNIQUE KEY、同批重复主键、空 Schema 缓存重启、额外列、类型�
 `httptest` 覆盖。
 
 独立 workflow [`doris-integration.yml`](../../.github/workflows/doris-integration.yml)
-会启动 MySQL + Doris `2.1.8` FE+BE、调高内核参数、执行套件并上传 Markdown 报告与
-compose 日志。
+会启动 MySQL + Doris `2.1.8` FE+BE、调高内核参数、执行套件（功能 TP-DR01..DR04，
+再跑负载 TP-DR05..DR07，最后跑 Doris 规模套件），并上传 Markdown 报告与
+`cdc-doris*.log`、compose 日志。

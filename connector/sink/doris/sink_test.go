@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -18,21 +19,23 @@ import (
 )
 
 type fakeSQL struct {
-	mu       sync.Mutex
-	pingErr  error
-	execs    []string
-	execErr  error
-	columns  map[string][]descColumn
-	descErr  error
-	loads    []string
-	load     loadState
-	loadErr  error
-	execHook func(f *fakeSQL, statement string)
-	closed   int
+	mu        sync.Mutex
+	pingErr   error
+	execs     []string
+	execErr   error
+	columns   map[string][]descColumn
+	descErr   error
+	creates   map[string]string
+	createErr error
+	loads     []string
+	load      loadState
+	loadErr   error
+	execHook  func(f *fakeSQL, statement string)
+	closed    int
 }
 
 func newFakeSQL() *fakeSQL {
-	return &fakeSQL{columns: map[string][]descColumn{}}
+	return &fakeSQL{columns: map[string][]descColumn{}, creates: map[string]string{}}
 }
 
 func (f *fakeSQL) Ping(context.Context) error { return f.pingErr }
@@ -62,6 +65,44 @@ func (f *fakeSQL) descTable(_ context.Context, database, table string) ([]descCo
 		return nil, fmt.Errorf("sink.doris: table %s does not exist or has no columns", id)
 	}
 	return append([]descColumn(nil), columns...), nil
+}
+
+func (f *fakeSQL) showCreateTable(_ context.Context, database, table string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.createErr != nil {
+		return "", f.createErr
+	}
+	id := database + "." + table
+	if ddl, ok := f.creates[id]; ok {
+		return ddl, nil
+	}
+	columns, ok := f.columns[id]
+	if !ok {
+		return "", fmt.Errorf("sink.doris: table %s does not exist or has no columns", id)
+	}
+	var keys []string
+	for _, column := range columns {
+		if column.Key {
+			keys = append(keys, column.Name)
+		}
+	}
+	return fakeCreateTable(database, table, keys), nil
+}
+
+// fakeCreateTable mirrors the two Doris layouts the sink must tell apart: a
+// UNIQUE KEY table is writable, a DUPLICATE KEY table is not.
+func fakeCreateTable(database, table string, keys []string) string {
+	quoted := make([]string, len(keys))
+	for i, key := range keys {
+		quoted[i] = schema.Quote(key)
+	}
+	model := "DUPLICATE KEY(" + schema.Quote("id") + ")"
+	if len(quoted) > 0 {
+		model = "UNIQUE KEY(" + strings.Join(quoted, ", ") + ")"
+	}
+	return "CREATE TABLE " + schema.Qualified(database, table) + " (\n  " + schema.Quote("id") +
+		" BIGINT NOT NULL\n) ENGINE=OLAP\n" + model + "\nDISTRIBUTED BY HASH(" + schema.Quote("id") + ") BUCKETS auto"
 }
 
 func (f *fakeSQL) showLoad(_ context.Context, database, label string) (loadState, error) {
@@ -103,6 +144,7 @@ func testSink(t *testing.T, server *httptest.Server, sql sqlAPI, cfg definition.
 			client: server.Client(), base: base, user: "root", pass: "secret",
 			timeout: 5 * time.Second,
 		},
+		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 		tables: map[string]schema.Table{},
 	}
 }
@@ -142,7 +184,7 @@ func TestSinkCreateTableAutoCreate(t *testing.T) {
 		if strings.Contains(statement, "CREATE TABLE") {
 			f.columns["db.orders"] = []descColumn{
 				{Name: "id", Type: "BIGINT", Nullable: false, Key: true},
-				{Name: "name", Type: "VARCHAR(32)", Nullable: true},
+				{Name: "name", Type: "VARCHAR(96)", Nullable: true},
 			}
 		}
 	}
@@ -181,6 +223,32 @@ func TestSinkCreateTableExistingTargetIsValidated(t *testing.T) {
 	}
 }
 
+func TestSinkCreateTableAcceptsPendingSourceColumn(t *testing.T) {
+	// A column added while the job was down is still ahead in the binlog: the
+	// pending ADD COLUMN creates it before any row that carries it. Failing at
+	// CREATE would make every restart hit the same wall.
+	f := newFakeSQL()
+	f.columns["db.orders"] = validTarget()
+	server := successServer(t, &[]string{})
+	s := testSink(t, server, f, definition.Sink{Type: "doris", AutoCreate: false})
+	source := validateSource()
+	source.Columns = append(source.Columns, schema.Column{Name: "note", Type: "varchar(32)", Nullable: true})
+	if err := s.CreateTable(source); err != nil {
+		t.Fatalf("a pending source column must not fail CREATE: %v", err)
+	}
+	if _, ok := s.tables["db.orders"]; !ok {
+		t.Fatal("the table must still be cached")
+	}
+	// The invariant moves to the write path: a row that carries the missing
+	// column is rejected until the ADD COLUMN is applied.
+	item := createEvent(1, "a")
+	item.Columns = append(item.Columns, "note")
+	item.After["note"] = "pending"
+	if err := s.Write([]event.Event{item}); err == nil || !strings.Contains(err.Error(), "not in the target table") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestSinkCreateTableMissingTargetFails(t *testing.T) {
 	f := newFakeSQL()
 	server := successServer(t, &[]string{})
@@ -206,6 +274,47 @@ func TestSinkCreateTableIncompatibleTargetFails(t *testing.T) {
 	}
 }
 
+func TestSinkCreateTableRejectsNonUniqueTarget(t *testing.T) {
+	// DESC reports Key=YES for DUPLICATE and AGGREGATE tables too, so the model
+	// must come from SHOW CREATE TABLE before the table becomes writable.
+	f := newFakeSQL()
+	f.columns["db.orders"] = validTarget()
+	f.creates["db.orders"] = "CREATE TABLE `db`.`orders` (`id` BIGINT NOT NULL, `name` VARCHAR(64) NULL) " +
+		"ENGINE=OLAP\nDUPLICATE KEY(`id`)\nDISTRIBUTED BY HASH(`id`) BUCKETS auto"
+	server := successServer(t, &[]string{})
+	s := testSink(t, server, f, definition.Sink{Type: "doris", AutoCreate: false})
+	err := s.CreateTable(validateSource())
+	if err == nil || !strings.Contains(err.Error(), "DUPLICATE KEY") {
+		t.Fatalf("err=%v", err)
+	}
+	if len(s.tables) != 0 {
+		t.Fatalf("a non-UNIQUE target must not be cached: %#v", s.tables)
+	}
+}
+
+func TestSinkCreateTableRejectsKeyOrderDrift(t *testing.T) {
+	f := newFakeSQL()
+	f.columns["db.orders"] = []descColumn{
+		{Name: "tenant", Type: "VARCHAR(16)", Nullable: false, Key: true},
+		{Name: "id", Type: "BIGINT", Nullable: false, Key: true},
+		{Name: "name", Type: "VARCHAR(64)", Nullable: true},
+	}
+	f.creates["db.orders"] = fakeCreateTable("db", "orders", []string{"id", "tenant"})
+	source := validateSource()
+	source.Columns = []schema.Column{
+		{Name: "tenant", Type: "varchar(16)", Nullable: false},
+		{Name: "id", Type: "bigint", Nullable: false},
+		{Name: "name", Type: "varchar(32)", Nullable: true},
+	}
+	source.PrimaryKeys = []string{"tenant", "id"}
+	server := successServer(t, &[]string{})
+	s := testSink(t, server, f, definition.Sink{Type: "doris", AutoCreate: false})
+	err := s.CreateTable(source)
+	if err == nil || !strings.Contains(err.Error(), "order") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestSinkCreateTableDDLErrorIsReturned(t *testing.T) {
 	f := newFakeSQL()
 	f.execErr = fmt.Errorf("sink.doris: access denied")
@@ -226,8 +335,8 @@ func TestSinkWriteRequiresCachedOrDescribableTable(t *testing.T) {
 }
 
 func TestSinkWriteDescribesTargetAfterRestart(t *testing.T) {
-	// After a restart the sink cache is empty; Runner sends no Schema for
-	// already-captured tables, so the target must be read and checked lazily.
+	// After a restart the in-process cache is empty, so the target structure is
+	// read and checked before the first write.
 	var requests []string
 	server := successServer(t, &requests)
 	f := newFakeSQL()
@@ -273,7 +382,7 @@ func TestSinkWriteRejectsTargetWithoutKeyAfterRestart(t *testing.T) {
 	}
 	s := testSink(t, server, f, definition.Sink{Type: "doris"})
 	err := s.Write([]event.Event{createEvent(1, "a")})
-	if err == nil || !strings.Contains(err.Error(), "no UNIQUE KEY") {
+	if err == nil || !strings.Contains(err.Error(), "DUPLICATE KEY") {
 		t.Fatalf("err=%v", err)
 	}
 }
@@ -733,7 +842,7 @@ func TestSinkWriteAcceptsCaseInsensitiveEventColumns(t *testing.T) {
 		Database: "db", Table: "orders",
 		Columns: []schema.Column{
 			{Name: "ID", Type: "BIGINT", Nullable: false},
-			{Name: "Name", Type: "VARCHAR(32)", Nullable: true},
+			{Name: "Name", Type: "VARCHAR(96)", Nullable: true},
 		},
 		PrimaryKeys: []string{"ID"},
 	})
@@ -773,7 +882,7 @@ func TestSinkApplySchemaAddsColumn(t *testing.T) {
 	f.columns["db.orders"] = validTarget()
 	f.execHook = func(f *fakeSQL, statement string) {
 		if strings.Contains(statement, "ADD COLUMN") {
-			f.columns["db.orders"] = append(f.columns["db.orders"], descColumn{Name: "note", Type: "VARCHAR(32)", Nullable: true})
+			f.columns["db.orders"] = append(f.columns["db.orders"], descColumn{Name: "note", Type: "VARCHAR(96)", Nullable: true})
 		}
 	}
 	server := successServer(t, &[]string{})
@@ -789,7 +898,7 @@ func TestSinkApplySchemaAddsColumn(t *testing.T) {
 		t.Fatal(err)
 	}
 	statements := f.statements()
-	if len(statements) != 1 || !strings.Contains(statements[0], "ADD COLUMN `note` VARCHAR(32) NULL") {
+	if len(statements) != 1 || !strings.Contains(statements[0], "ADD COLUMN `note` VARCHAR(96) NULL") {
 		t.Fatalf("statements %#v", statements)
 	}
 	found := false
@@ -805,7 +914,7 @@ func TestSinkApplySchemaAddsColumn(t *testing.T) {
 
 func TestSinkApplySchemaRepeatedCompatibleIsNoop(t *testing.T) {
 	f := newFakeSQL()
-	f.columns["db.orders"] = append(validTarget(), descColumn{Name: "note", Type: "VARCHAR(32)", Nullable: true})
+	f.columns["db.orders"] = append(validTarget(), descColumn{Name: "note", Type: "VARCHAR(96)", Nullable: true})
 	server := successServer(t, &[]string{})
 	s := testSink(t, server, f, definition.Sink{Type: "doris", SchemaChange: true, SchemaChangeInclude: []string{"add.column"}})
 	change := schema.Change{
@@ -822,7 +931,7 @@ func TestSinkApplySchemaRepeatedCompatibleIsNoop(t *testing.T) {
 
 func TestSinkApplySchemaExistingColumnRefreshesStaleCache(t *testing.T) {
 	f := newFakeSQL()
-	f.columns["db.orders"] = append(validTarget(), descColumn{Name: "note", Type: "VARCHAR(32)", Nullable: true})
+	f.columns["db.orders"] = append(validTarget(), descColumn{Name: "note", Type: "VARCHAR(96)", Nullable: true})
 	server := successServer(t, &[]string{})
 	s := testSink(t, server, f, definition.Sink{Type: "doris", SchemaChange: true, SchemaChangeInclude: []string{"add.column"}})
 	// In-process cache predates the column that already exists on Doris.
@@ -910,7 +1019,10 @@ func TestSinkApplySchemaWaitTimeoutFails(t *testing.T) {
 	f := newFakeSQL()
 	f.columns["db.orders"] = validTarget()
 	server := successServer(t, &[]string{})
-	s := testSink(t, server, f, definition.Sink{Type: "doris", SchemaChange: true, SchemaChangeInclude: []string{"add.column"}})
+	s := testSink(t, server, f, definition.Sink{
+		Type: "doris", SchemaChange: true, SchemaChangeInclude: []string{"add.column"},
+		SchemaChangeWait: 3 * time.Millisecond,
+	})
 	change := schema.Change{
 		Action: schema.ActionAddColumn, Database: "db", Table: "orders",
 		AddColumns: []string{"note"}, ColumnDef: &schema.Column{Name: "note", Type: "varchar(32)", Nullable: true},
@@ -939,5 +1051,241 @@ func TestSinkCloseReleasesClients(t *testing.T) {
 	}
 	if f.closed != 1 {
 		t.Fatalf("closed=%d", f.closed)
+	}
+}
+
+// logCapture records slog output so structured logging can be asserted without
+// a live Doris FE.
+type logCapture struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (c *logCapture) Enabled(context.Context, slog.Level) bool { return true }
+
+func (c *logCapture) Handle(_ context.Context, record slog.Record) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.records = append(c.records, record.Clone())
+	return nil
+}
+
+func (c *logCapture) WithAttrs([]slog.Attr) slog.Handler { return c }
+
+func (c *logCapture) WithGroup(string) slog.Handler { return c }
+
+func (c *logCapture) find(level slog.Level, msg string) (slog.Record, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, record := range c.records {
+		if record.Level == level && record.Message == msg {
+			return record, true
+		}
+	}
+	return slog.Record{}, false
+}
+
+func (c *logCapture) messages() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, len(c.records))
+	for i, record := range c.records {
+		out[i] = record.Level.String() + " " + record.Message
+	}
+	return out
+}
+
+// attrText renders one record attribute for assertions.
+func attrText(record slog.Record, key string) string {
+	var out string
+	record.Attrs(func(a slog.Attr) bool {
+		if a.Key == key {
+			out = a.Value.String()
+			return false
+		}
+		return true
+	})
+	return out
+}
+
+func TestSinkCreateTableLogsValidation(t *testing.T) {
+	f := newFakeSQL()
+	f.columns["db.orders"] = validTarget()
+	server := successServer(t, &[]string{})
+	s := testSink(t, server, f, definition.Sink{Type: "doris"})
+	capture := &logCapture{}
+	s.log = slog.New(capture)
+
+	if err := s.CreateTable(validateSource()); err != nil {
+		t.Fatal(err)
+	}
+	record, ok := capture.find(slog.LevelInfo, "doris: target table validated")
+	if !ok {
+		t.Fatalf("logs %#v", capture.messages())
+	}
+	if attrText(record, "database") != "db" || attrText(record, "table") != "orders" {
+		t.Fatalf("record %v", record)
+	}
+	if attrText(record, "key_columns") != "[id]" || attrText(record, "columns") != "2" {
+		t.Fatalf("record %v", record)
+	}
+}
+
+func TestSinkCreateTableLogsRejection(t *testing.T) {
+	f := newFakeSQL()
+	f.columns["db.orders"] = validTarget()
+	// No keys means the fake reports a DUPLICATE KEY table.
+	f.creates["db.orders"] = fakeCreateTable("db", "orders", nil)
+	server := successServer(t, &[]string{})
+	s := testSink(t, server, f, definition.Sink{Type: "doris"})
+	capture := &logCapture{}
+	s.log = slog.New(capture)
+
+	err := s.CreateTable(validateSource())
+	if err == nil || !strings.Contains(err.Error(), "DUPLICATE KEY") {
+		t.Fatalf("err=%v", err)
+	}
+	record, ok := capture.find(slog.LevelWarn, "doris: target table rejected")
+	if !ok {
+		t.Fatalf("logs %#v", capture.messages())
+	}
+	if !strings.Contains(attrText(record, "error"), "DUPLICATE KEY") {
+		t.Fatalf("record %v", record)
+	}
+}
+
+func TestSinkApplySchemaLogsStatement(t *testing.T) {
+	old := schemaChangePollInterval
+	schemaChangePollInterval = time.Millisecond
+	t.Cleanup(func() { schemaChangePollInterval = old })
+
+	f := newFakeSQL()
+	f.columns["db.orders"] = validTarget()
+	f.execHook = func(f *fakeSQL, statement string) {
+		if strings.Contains(statement, "ADD COLUMN") {
+			f.columns["db.orders"] = append(f.columns["db.orders"], descColumn{Name: "note", Type: "VARCHAR(96)", Nullable: true})
+		}
+	}
+	server := successServer(t, &[]string{})
+	s := testSink(t, server, f, definition.Sink{Type: "doris", SchemaChange: true, SchemaChangeInclude: []string{"add.column"}})
+	capture := &logCapture{}
+	s.log = slog.New(capture)
+
+	change := schema.Change{
+		Action: schema.ActionAddColumn, Database: "db", Table: "orders",
+		AddColumns: []string{"note"}, ColumnDef: &schema.Column{Name: "note", Type: "varchar(32)", Nullable: true},
+	}
+	if err := s.ApplySchema(change); err != nil {
+		t.Fatal(err)
+	}
+	record, ok := capture.find(slog.LevelInfo, "doris: sending schema change")
+	if !ok {
+		t.Fatalf("logs %#v", capture.messages())
+	}
+	if !strings.Contains(attrText(record, "statement"), "ADD COLUMN `note`") {
+		t.Fatalf("record %v", record)
+	}
+	if attrText(record, "action") != string(schema.ActionAddColumn) {
+		t.Fatalf("record %v", record)
+	}
+	if _, ok := capture.find(slog.LevelInfo, "doris: schema change applied"); !ok {
+		t.Fatalf("logs %#v", capture.messages())
+	}
+}
+
+func TestSinkApplySchemaHonoursConfiguredWait(t *testing.T) {
+	old := schemaChangePollInterval
+	schemaChangePollInterval = time.Millisecond
+	t.Cleanup(func() { schemaChangePollInterval = old })
+
+	f := newFakeSQL()
+	f.columns["db.orders"] = validTarget()
+	server := successServer(t, &[]string{})
+	s := testSink(t, server, f, definition.Sink{
+		Type: "doris", SchemaChange: true, SchemaChangeInclude: []string{"add.column"},
+		SchemaChangeWait: 4 * time.Millisecond,
+	})
+	change := schema.Change{
+		Action: schema.ActionAddColumn, Database: "db", Table: "orders",
+		AddColumns: []string{"note"}, ColumnDef: &schema.Column{Name: "note", Type: "varchar(32)", Nullable: true},
+	}
+	err := s.ApplySchema(change)
+	if err == nil {
+		t.Fatal("the column never appears; the configured budget must expire")
+	}
+	// The message must quote the configured budget: a 4ms budget is not the 5s
+	// default. The exact poll count is timing-dependent, so it is not asserted.
+	if !strings.Contains(err.Error(), "within 4ms (") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestSinkLoadLogsFatalOutcome(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, fmt.Sprintf(`{"Status":"Fail","Label":%q,"Message":"bad rows"}`, r.Header.Get("label")))
+	}))
+	t.Cleanup(server.Close)
+
+	f := newFakeSQL()
+	s := testSink(t, server, f, definition.Sink{Type: "doris", MaxRetries: 2})
+	s.cacheTable(validateSource())
+	capture := &logCapture{}
+	s.log = slog.New(capture)
+
+	if err := s.Write([]event.Event{createEvent(1, "a")}); err == nil || !strings.Contains(err.Error(), "bad rows") {
+		t.Fatalf("err=%v", err)
+	}
+	record, ok := capture.find(slog.LevelError, "doris: stream load failed")
+	if !ok {
+		t.Fatalf("logs %#v", capture.messages())
+	}
+	if attrText(record, "outcome") != "fatal" {
+		t.Fatalf("outcome %q", attrText(record, "outcome"))
+	}
+	if _, retried := capture.find(slog.LevelWarn, "doris: stream load not confirmed; retrying"); retried {
+		t.Fatal("a fatal outcome must not be retried")
+	}
+}
+
+func TestSinkLoadLogsRetryThenSuccess(t *testing.T) {
+	var mu sync.Mutex
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		attempts++
+		n := attempts
+		mu.Unlock()
+		if n == 1 {
+			http.Error(w, "backend down", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, fmt.Sprintf(
+			`{"Status":"Success","Label":%q,"NumberTotalRows":1,"NumberLoadedRows":1}`, r.Header.Get("label")))
+	}))
+	t.Cleanup(server.Close)
+
+	f := newFakeSQL()
+	f.loadErr = errLoadNotFound
+	s := testSink(t, server, f, definition.Sink{Type: "doris", MaxRetries: 2})
+	s.cacheTable(validateSource())
+	capture := &logCapture{}
+	s.log = slog.New(capture)
+
+	if err := s.Write([]event.Event{createEvent(1, "a")}); err != nil {
+		t.Fatal(err)
+	}
+	warn, ok := capture.find(slog.LevelWarn, "doris: stream load not confirmed; retrying")
+	if !ok {
+		t.Fatalf("logs %#v", capture.messages())
+	}
+	if attrText(warn, "outcome") != "retryable" {
+		t.Fatalf("outcome %q", attrText(warn, "outcome"))
+	}
+	record, ok := capture.find(slog.LevelInfo, "doris: stream load succeeded")
+	if !ok {
+		t.Fatalf("logs %#v", capture.messages())
+	}
+	if attrText(record, "attempt") != "2" || attrText(record, "rows") != "1" {
+		t.Fatalf("record %v", record)
 	}
 }

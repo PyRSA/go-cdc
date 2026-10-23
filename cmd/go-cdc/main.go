@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/PyRSA/go-cdc/composer"
@@ -112,6 +113,9 @@ func run(args []string) int {
 		DB:          db,
 		Stream:      stream,
 		Spill:       spill,
+		// Only Doris revalidates the target from a fresh source catalogue on
+		// resume. MySQL / Kafka / stdout must not see an extra Schema batch.
+		ReemitCapturedSchemas: strings.EqualFold(pipe.Sink.Type, "doris"),
 		Warn: func(msg string, args ...any) {
 			logger.Warn(msg, args...)
 		},

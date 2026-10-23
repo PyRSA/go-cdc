@@ -77,11 +77,12 @@ Full job: [`configs/demo-doris.yaml`](../../configs/demo-doris.yaml).
 | `write-batch-size` | no | `1000` | Integer | Shared runner option: flush the DML batch when it reaches this many events (`>= 1`) |
 | `write-batch-interval` | no | `1s` | Duration | Shared runner option: time-based flush (`0` disables the timer) |
 | `max-retries` | no | `3` | Integer | Extra attempts after the first (`>= 0`), so at most `max-retries + 1` Stream Load attempts per table. Backoff is 100ms × attempt, capped at 2s |
-| `request-timeout` | no | `30s` | Duration | HTTP client timeout and SQL connect/read/write timeout (`> 0`) |
+| `request-timeout` | no | `30s` | Duration | Doris-side Stream Load `timeout` (seconds) and SQL connect/read/write timeout (`> 0`). The HTTP client deadline is this plus 30s so Doris reports its own verdict first. Sub-second values round up in the `timeout` header, because a truncated `0` is rejected by Doris |
 | `buckets` | no | `auto` | String | `auto` or a positive integer, emitted as `BUCKETS ...` |
 | `replication-num` | no | `0` | Integer | `0` omits `PROPERTIES`; a positive value emits `"replication_num"` |
 | `schema.change.enabled` | no | `false` | Boolean | Enables Doris `ADD COLUMN` handling; see [Schema evolution](#schema-evolution) |
 | `schema.change.include` | no | `["add.column"]` | List | v1 accepts only `add.column`; any other entry is a config error |
+| `schema.change.wait-timeout` | no | `5s` | Duration | How long an `ADD COLUMN` waits for the new column to appear in `DESC` (`> 0`). `DESC` is re-read every 500ms until the budget expires |
 | `partial-update.enabled` | no | `false` | Boolean | `true` is rejected at parse time (not implemented in v1) |
 | `delete.enabled` | no | `false` | Boolean | `true` is rejected at parse time (not implemented in v1) |
 | `schema.change.drop-truncate.enabled` | no | `false` | Boolean | `true` is rejected for Doris in v1 |
@@ -108,18 +109,30 @@ DISTRIBUTED BY HASH(`id`) BUCKETS auto
   keep their source order. Doris requires key columns to lead the definition.
 - Key columns are always `NOT NULL`. Source nullable columns are defined
   `NULL`; non-nullable columns are `NOT NULL`.
-- Source column comments are copied. **Default values are not copied**; CDC
-  writes every projected column, and v1 does not guess SQL expressions.
+- Source column comments are copied. Literal defaults from
+  `information_schema` are copied (numeric, string, `DATE`/`DATETIME`); SQL
+  expression defaults (`DEFAULT_GENERATED`, for example `CURRENT_TIMESTAMP`)
+  are **omitted rather than guessed**. CDC writes every projected column.
 - No partitions, indexes, engines, or merge-on-write properties are generated.
   `replication_num` is emitted only when configured.
 - `BUCKETS auto` and the cluster default merge-on-write mode are **not
   verified** against a real cluster.
 
 When `auto-create-table` is `false`, a missing database or table fails the job.
-Whether the table was just created or already existed, the sink reads `DESC`
-and validates it before caching it as writable:
+Whether the table was just created or already existed, the sink reads
+`SHOW CREATE TABLE` plus `DESC` and validates the target before caching it as
+writable:
 
-- Every source column exists and has a **compatible** type.
+- The target is a `UNIQUE KEY` table. `DESC` marks `UNIQUE`, `DUPLICATE` and
+  `AGGREGATE` key columns with the same `Key=YES`, so the model is read from
+  `SHOW CREATE TABLE`; a `DUPLICATE KEY` or `AGGREGATE KEY` target is rejected.
+- The target key columns match the source primary key in membership **and
+  order**.
+- Every source column exists and has a **compatible** type. A source column the
+  target does not have yet is accepted with a warning instead of failing: the
+  `ADD COLUMN` that created it is still ahead in the binlog and is replayed
+  before the first row that carries the column. `Write` still rejects any event
+  that references a column missing from the target.
 - A nullable source column is not written into a `NOT NULL` target column.
 - Every source primary-key column exists and is a Doris key column.
 - The target key set equals the source primary-key set (no extra or missing
@@ -128,9 +141,9 @@ and validates it before caching it as writable:
   otherwise the table is incompatible.
 - A source table without a primary key is rejected.
 
-If validation fails, the table is not cached and the Runner does not mark it
-captured. Auto-create is independent of schema evolution: it never alters an
-existing table.
+If validation fails for any other reason, the table is not cached and the Runner
+does not mark it captured. Auto-create is independent of schema evolution: it
+never alters an existing table.
 
 ## Type mapping
 
@@ -150,8 +163,8 @@ MySQL `column_type` is mapped centrally; unknown or lossy types are rejected.
 | `float` | `FLOAT` |
 | `double` / `real` | `DOUBLE` |
 | `decimal(p,s)` / `numeric(p,s)` | `DECIMAL(p,s)` (`1 <= p <= 38`, `0 <= s <= p`) |
-| `char(n)` | `CHAR(n)` |
-| `varchar(n)` | `VARCHAR(n)` |
+| `char(n)` | `CHAR(n*3)`; above 255 bytes becomes `VARCHAR(n*3)` |
+| `varchar(n)` | `VARCHAR(n*3)`; above 65533 bytes becomes `STRING` |
 | `tinytext` / `text` / `mediumtext` / `longtext` | `STRING` |
 | `date` | `DATE` |
 | `datetime(p)` / `timestamp(p)` | `DATETIME(p)` (`0 <= p <= 6`) |
@@ -162,11 +175,21 @@ Rejected: `binary` / `varbinary` / all `*blob`, `enum`, `set`, `bit`, `time`,
 spatial types, `decimal` without `(p,s)`, `p > 38`, and any unknown type. v1
 never truncates or converts to an unrelated type.
 
+MySQL counts `CHAR`/`VARCHAR` lengths in characters, Doris counts them in bytes.
+Auto-created columns reserve three bytes per character (`n*3`) — the same
+convention the Flink CDC Doris sink uses — so CJK text cannot fail a load on a
+column that fits the source. The widen is capped by the Doris per-type limit:
+`char(n)` above 255 bytes becomes `VARCHAR(n*3)`, and `varchar(n)` above 65533
+bytes becomes `STRING`. Characters outside the Basic Multilingual Plane (emoji)
+need four bytes and are rejected by the load rather than truncated.
+
 For an existing target, widening is accepted; narrowing is not:
 
 - Integer widening (`TINYINT` → `SMALLINT` → `INT` → `BIGINT` → `LARGEINT`).
 - `FLOAT` → `DOUBLE`.
-- `CHAR(n)` → `VARCHAR(m)` with `m >= n`; `CHAR`/`VARCHAR` → `STRING`.
+- `CHAR(n)` → `VARCHAR(m)` with `m >= 3n`; `CHAR`/`VARCHAR` → `STRING`. All
+  lengths are Doris byte capacities, so a pre-created `VARCHAR(64)` target does
+  **not** satisfy a `varchar(64)` source — that source needs `VARCHAR(192)`.
 - `DECIMAL(p,s)` → `DECIMAL(p',s')` only when both fractional digits
   (`s' >= s`) and integer digits (`p'-s' >= p-s`) fit.
 - `DATETIME(p)` → `DATETIME(p')` with `p' >= p`.
@@ -206,7 +229,11 @@ PUT http://<hostname>:<port>/api/<database>/<table>/_stream_load
 
 Headers: Basic auth, `label`, `format: json`, `read_json_by_line: true`,
 `strict_mode: true`, `max_filter_ratio: 0`, `Expect: 100-continue`, and a
-`timeout` in seconds. The body is JSON Lines — one JSON object per row.
+`timeout` in seconds. The HTTP client deadline is `request-timeout` plus 30s, so
+Doris always reports its own verdict before the request is cancelled; a client
+deadline equal to the Doris timeout would turn every timeout into an
+unconfirmed result plus a full body retry. The body is JSON Lines — one JSON
+object per row.
 
 A `2xx` response is **not** enough. The sink checks the Doris business status:
 
@@ -219,14 +246,28 @@ A `2xx` response is **not** enough. The sink checks the Doris business status:
 | `Label Already Exists` + `CANCELLED` | Fatal |
 | `Label Already Exists` + other / missing `ExistingJobStatus` | Other non-empty status is fatal; missing status is treated as unknown and queries `SHOW LOAD` |
 | `Fail` | Fatal; data-quality failures are not blindly retried |
-| Unknown status, invalid body, transport error, timeout | Query `SHOW LOAD FROM <db> WHERE Label = '<label>'` first |
+| Unknown status, invalid body, transport error, timeout | Query `SHOW LOAD` for the label first (see below) |
 
-For `SHOW LOAD`: `FINISHED` is success, `CANCELLED` is fatal,
-`RUNNING` / `PENDING` / `ETL` / `LOADING` are retryable with the same label,
-and “not found” falls back to the HTTP error class: `5xx` and `429` are
-retryable, other `4xx` are fatal, transport errors are retryable. If the label
-state cannot be queried, the batch is **fatal** — an unconfirmed load is never
-reported as success.
+For `SHOW LOAD`, the sink first runs
+`SHOW LOAD FROM <db> WHERE Label = '<label>'`. If that returns no row (observed
+on some Doris 2.1.x Stream Load paths), it falls back to
+`SHOW LOAD FROM <db>` and matches the label case-insensitively among recent
+rows.
+
+State mapping:
+
+| `SHOW LOAD` state | Outcome |
+| --- | --- |
+| `FINISHED` | Success |
+| `CANCELLED` | Fatal |
+| `RUNNING` / `PENDING` / `ETL` / `LOADING` | Retryable with the same label |
+| empty / `UNAVAILABLE` | Unknown (reconcile / retry path) |
+| any other non-empty state | Treated as still in flight; retry with the same label |
+
+If the filtered and unfiltered queries both find no row, the sink falls back to
+the HTTP error class: `5xx` and `429` are retryable, other `4xx` are fatal,
+transport errors are retryable. If `SHOW LOAD` itself errors (not “not found”),
+the batch is **fatal** — an unconfirmed load is never reported as success.
 
 Labels have the form `go-cdc_<fnv64hex>_<unixnano>_<seq>`. They are unique
 within a process, reused across retries of one sub-batch, and **not** reproduced
@@ -250,8 +291,10 @@ URLs are not configurable.
 
 Schema evolution is **off by default**. When disabled, an `ADD COLUMN` (and
 other column changes) affecting a projected column **fails the job explicitly**
-instead of being silently applied or dropped. DDL for unprojected columns, and
-DDL kinds with no Doris action, are ignored.
+instead of being silently applied or dropped. DDL for unprojected columns is
+ignored. Primary-key changes, `RENAME TABLE`, and unrecognised `ALTER TABLE`
+statements fail the job; secondary-index DDL is ignored because the Doris
+target never carries secondary indexes.
 
 When `schema.change.enabled: true` and `schema.change.include` contains
 `add.column`:
@@ -264,13 +307,45 @@ When `schema.change.enabled: true` and `schema.change.include` contains
    nullability), the repeat is an idempotent success. If it exists with a
    different definition, the job fails.
 4. Otherwise it executes `ALTER TABLE <db>.<table> ADD COLUMN ...`, then polls
-   `DESC` up to 10 times at 500ms intervals until the column is visible and
-   compatible.
+   `DESC` every 500ms until the column is visible and compatible or
+   `schema.change.wait-timeout` expires (default `5s`). A
+   `NOT NULL` addition needs a usable literal default (Doris rejects a new
+   `NOT NULL` value column without one); otherwise the sink fails before
+   touching the FE. Expression defaults are never translated.
 5. Failure at any step stops writes to the affected table.
 
 Not supported: drop column, modify column, rename column, key/model/partition/
-bucket changes, and `DROP TABLE` / `TRUNCATE`. MySQL DDL text is never executed
-against Doris.
+bucket changes, `RENAME TABLE`, and `DROP TABLE` / `TRUNCATE`. These fail the
+job explicitly (`DROP TABLE` / `TRUNCATE` fail when `drop.truncate` is
+enabled; otherwise that switch is an explicit opt-out). MySQL DDL text is
+never executed against Doris.
+
+## Logging
+
+The sink writes structured `slog` records through the process logger installed
+by `cmd/go-cdc` (text handler on stderr, `INFO` by default). Passwords and
+Stream Load bodies are never logged.
+
+| Event | Level | Message and fields |
+| --- | --- | --- |
+| Target validated after create or restart | `INFO` | `doris: target table validated` — `database`, `table`, `columns`, `key_columns`, `auto_create` |
+| Target accepted with source columns still pending | `WARN` | `doris: target table accepted with pending source columns; a replayed ADD COLUMN must create them before the first row` — `database`, `table`, `columns` |
+| Target rejected (model, key order, types) | `WARN` | `doris: target table rejected` — `database`, `table`, `error` |
+| Target loaded without a catalogue (cache miss) | `DEBUG` | `doris: target table loaded from DESC` — `database`, `table`, `columns`, `key_columns` |
+| `ADD COLUMN` statement issued | `INFO` | `doris: sending schema change` — `database`, `table`, `action`, `column`, `statement` |
+| `ADD COLUMN` confirmed | `INFO` | `doris: schema change applied` — `database`, `table`, `action`, `column`, `elapsed` |
+| `ADD COLUMN` Exec failed | `ERROR` | `doris: schema change failed` — `database`, `table`, `action`, `column`, `error` |
+| `ADD COLUMN` visibility timed out | `ERROR` | `doris: schema change not confirmed` — `database`, `table`, `column`, `wait_timeout`, `error` |
+| Stream Load committed | `INFO` | `doris: stream load succeeded` — `database`, `table`, `label`, `rows`, `attempt`, `elapsed` |
+| Load still unconfirmed, retrying | `WARN` | `doris: stream load not confirmed; retrying` — plus `outcome` (`retryable`, `unknown`, `label-exists`) |
+| Fatal load after confirmation | `ERROR` | `doris: stream load failed` — plus `outcome` (`fatal`) |
+| Last attempt still unconfirmed | `ERROR` | `doris: stream load was never confirmed` — plus `outcome` (`retryable`, `unknown`, or `label-exists`) |
+| `SHOW LOAD` reconciliation | `DEBUG` | `doris: stream load state resolved from SHOW LOAD` — `database`, `label`, `state`, `outcome` |
+| Generated DDL and idempotent repeats | `DEBUG` | `doris: create table statement`, `doris: schema change already present` |
+
+Every failure is still returned to the Runner and fails the job; the records are
+for operators, not control flow. `DEBUG` records are only emitted when the
+handler level permits — the shipped binary runs at `INFO`.
 
 ## Checkpoint and recovery
 
@@ -286,11 +361,23 @@ against Doris.
 - At-least-once only. Checkpoint state and Doris commits are not one atomic
   transaction.
 
-After a restart, the Runner does not re-send schemas for already captured
-tables. On the first write the sink lazily reads `DESC`, requires a target
-`UNIQUE KEY`, and requires the event key set to equal the target key set. This
-restart path **cannot** compare source column types; type drift is only caught
-when a catalog message is available.
+After a restart, a Doris pipeline opts the MySQL source into
+`ReemitCapturedSchemas`: the source re-reads every captured table and sends a
+schema message before binlog replay, so the sink re-runs the full compatibility
+check (model, key order, column types) before the first write. This applies to
+every startup mode that resumes from a checkpoint (`initial`, `latest`,
+`earliest`, `timestamp`, `specific-offset`); a first start has no captured
+tables and skips the read. MySQL / Kafka / stdout pipelines leave that flag off.
+If a captured table no longer exists at the source, that read is skipped with a
+warning; the sink then falls back to the lazy target `DESC` check (a `UNIQUE KEY`
+target is required and the event key set must equal the target key set). Any
+other catalogue error fails the job rather than silently skipping the check.
+
+A source column added while the job was down is still pending in the binlog.
+The resume check reports it as a warning and the table stays writable; the
+replayed `ADD COLUMN` creates the column before the first row that carries it.
+If the DDL never arrives (for example `schema.change.enabled: false`), the first
+event that carries the column fails the job explicitly.
 
 ## Tests
 
@@ -320,6 +407,13 @@ public Sink API and a real Doris FE/BE pair. It is excluded from normal
 `go test ./...` runs by the `doris_integration` build tag. It drives the Sink
 directly; it does not start a MySQL source or the Runner, so Runner checkpoint
 replay remains covered by unit tests.
+
+The same `run-doris-e2e.sh` first runs the pipeline harness
+(`harness/doris_it.py`): functional TP-DR01..DR04 plus load parity TP-DR05..DR07
+(bulk multi-table snapshot, concurrent peak writers + catch-up, typed
+spot-check). The load phase reuses the `LOAD_*` knobs and CI tiers of the
+MySQL/Kafka load suites and covers only Doris-mappable types (no
+BLOB/ENUM/BIT/SET/TIME).
 
 ```bash
 # Linux + Docker Compose + mysql client; host networking is required.
@@ -369,8 +463,9 @@ CI: [`.github/workflows/doris-integration.yml`](../../.github/workflows/doris-in
 runs the suite on Doris `2.1.8` for Doris-specific changes and via
 `workflow_dispatch`. It starts FE+BE with
 [`docker-compose.doris.yml`](../../test/integration/docker-compose.doris.yml),
-raises `vm.max_map_count` and the inotify limits, runs the tests, and uploads
-the test/compose logs.
+raises `vm.max_map_count` and the inotify limits, runs the pipeline harness
+(functional + load) and the Go suite, and uploads the report, `cdc-doris*.log`,
+and compose logs.
 
 **Execution status:** the suite and CI job are present, but a real Doris run
 has **not** been performed in this workspace. Do not change the pending items
@@ -391,7 +486,7 @@ several of them, but they stay pending until a real run is recorded as green:
 
 - `BUCKETS auto`, the cluster's default merge-on-write mode, and generated DDL.
 - `DESC` rendering of defaults, `NULL`, key columns, `DATEV2`, and `JSON`.
-- `ADD COLUMN` asynchronous visibility and the 10 × 500ms poll window.
+- `ADD COLUMN` asynchronous visibility and the default `5s` wait window.
 - `Publish Timeout`, `SHOW LOAD` state strings, and label retention.
 - FE `307` redirects, credential re-attachment, and BE authentication.
 - Snapshot / INSERT / full UPDATE upsert semantics and duplicate-key
@@ -405,8 +500,8 @@ several of them, but they stay pending until a real run is recorded as green:
 - `DROP TABLE` / `TRUNCATE`, drop/modify/rename column, multi-column ADD.
 - Exactly-once delivery, transactions, or stable labels across restarts.
 - HTTPS FE endpoints, multiple FE addresses, or custom Stream Load headers.
-- Automatic partitions, merge-on-write selection, index generation, or
-  default-value propagation.
+- Automatic partitions, merge-on-write selection, or index generation.
+- Translating SQL expression defaults (they are omitted, never guessed).
 - Deterministic failure injection for `Publish Timeout`, `CANCELLED`, 5xx/429,
   and network loss in the real-Doris suite.
 

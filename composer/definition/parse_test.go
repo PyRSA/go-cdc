@@ -488,6 +488,9 @@ pipeline:
 	if len(sink.SchemaChangeInclude) != 1 || sink.SchemaChangeInclude[0] != "add.column" {
 		t.Fatalf("include %#v", sink.SchemaChangeInclude)
 	}
+	if sink.SchemaChangeWait != 5*time.Second {
+		t.Fatalf("schema.change.wait-timeout default %s", sink.SchemaChangeWait)
+	}
 	if sink.ReplicationNum != 0 {
 		t.Fatalf("replication-num default %d", sink.ReplicationNum)
 	}
@@ -508,6 +511,7 @@ func TestParseDorisExplicitOptions(t *testing.T) {
   auto-create-table: false
   schema.change.enabled: true
   schema.change.include: add.column
+  schema.change.wait-timeout: 20s
   buckets: 16
   replication-num: 3
   max-retries: 5
@@ -526,6 +530,9 @@ pipeline:
 	}
 	if sink.AutoCreate || !sink.SchemaChange || sink.Buckets != "16" || sink.ReplicationNum != 3 {
 		t.Fatalf("switches %+v", sink)
+	}
+	if sink.SchemaChangeWait != 20*time.Second {
+		t.Fatalf("schema.change.wait-timeout %s", sink.SchemaChangeWait)
 	}
 }
 
@@ -546,6 +553,8 @@ func TestParseDorisRejectsUnsupportedV1Options(t *testing.T) {
 		{"delete", "  hostname: fe\n  username: root\n  password: secret\n  delete.enabled: true\n", "sink.delete.enabled"},
 		{"drop truncate", "  hostname: fe\n  username: root\n  password: secret\n  schema.change.drop-truncate.enabled: true\n", "sink.schema.change.drop-truncate.enabled"},
 		{"unsupported include", "  hostname: fe\n  username: root\n  password: secret\n  schema.change.include: add.column,drop.column\n", "sink.schema.change.include"},
+		{"wait timeout zero", "  hostname: fe\n  username: root\n  password: secret\n  schema.change.wait-timeout: 0s\n", "sink.schema.change.wait-timeout"},
+		{"wait timeout text", "  hostname: fe\n  username: root\n  password: secret\n  schema.change.wait-timeout: soon\n", "sink.schema.change.wait-timeout"},
 		{"buckets text", "  hostname: fe\n  username: root\n  password: secret\n  buckets: many\n", "sink.buckets"},
 		{"buckets zero", "  hostname: fe\n  username: root\n  password: secret\n  buckets: 0\n", "sink.buckets"},
 		{"negative replication", "  hostname: fe\n  username: root\n  password: secret\n  replication-num: -1\n", "sink.replication-num"},
@@ -603,5 +612,48 @@ pipeline:
 	}
 	if pipe.Sink.Port != 3306 || pipe.Sink.SQLPort != 0 || pipe.Sink.RequestTimeout != 0 || pipe.Sink.Buckets != "" {
 		t.Fatalf("Doris defaults leaked into mysql: %+v", pipe.Sink)
+	}
+	if pipe.Sink.SchemaChangeWait != 0 {
+		t.Fatalf("schema.change.wait-timeout leaked into mysql: %s", pipe.Sink.SchemaChangeWait)
+	}
+}
+
+func TestParseNonDorisRejectsDorisOnlyKeys(t *testing.T) {
+	// Doris-only options must fail for other sink types instead of being
+	// silently ignored (see AGENTS.md: accepted keys need a real meaning).
+	const base = `
+source:
+  hostname: 127.0.0.1
+  username: root
+  password: secret
+  tables: db\..*
+pipeline:
+  name: demo
+`
+	cases := []struct {
+		name  string
+		sink  string
+		field string
+	}{
+		{"mysql delete", "  type: mysql\n  hostname: h\n  username: u\n  password: p\n  delete.enabled: true\n", "sink.delete.enabled"},
+		{"mysql partial", "  type: mysql\n  hostname: h\n  username: u\n  password: p\n  partial-update.enabled: true\n", "sink.partial-update.enabled"},
+		{"mysql buckets", "  type: mysql\n  hostname: h\n  username: u\n  password: p\n  buckets: 8\n", "sink.buckets"},
+		{"mysql sql-port", "  type: mysql\n  hostname: h\n  username: u\n  password: p\n  sql-port: 9030\n", "sink.sql-port"},
+		{"mysql request-timeout", "  type: mysql\n  hostname: h\n  username: u\n  password: p\n  request-timeout: 10s\n", "sink.request-timeout"},
+		{"mysql schema.change.enabled", "  type: mysql\n  hostname: h\n  username: u\n  password: p\n  schema.change.enabled: true\n", "sink.schema.change.enabled"},
+		{"mysql schema.change.include", "  type: mysql\n  hostname: h\n  username: u\n  password: p\n  schema.change.include: [add.column]\n", "sink.schema.change.include"},
+		{"mysql replication-num", "  type: mysql\n  hostname: h\n  username: u\n  password: p\n  replication-num: 3\n", "sink.replication-num"},
+		{"mysql schema.change.wait-timeout", "  type: mysql\n  hostname: h\n  username: u\n  password: p\n  schema.change.wait-timeout: 5s\n", "sink.schema.change.wait-timeout"},
+		{"kafka delete", "  type: kafka\n  brokers: [localhost:9092]\n  topic: t\n  delete.enabled: false\n", "sink.delete.enabled"},
+		{"stdout buckets", "  type: stdout\n  buckets: auto\n", "sink.buckets"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse([]byte(base + "sink:\n" + tc.sink))
+			cfg, ok := err.(*ConfigError)
+			if !ok || cfg.Field != tc.field {
+				t.Fatalf("got %v, want field %s", err, tc.field)
+			}
+		})
 	}
 }

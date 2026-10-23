@@ -968,3 +968,62 @@ func TestDorisUnsupportedDDLIsFatalWhenEnabled(t *testing.T) {
 		t.Fatalf("unsupported DDL must not reach the sink: %#v", sk.applied)
 	}
 }
+
+func runDorisDDL(t *testing.T, ddl string, mutate func(*definition.Pipeline)) error {
+	t.Helper()
+	sk := &dorisRunnerSink{}
+	msgs := make(chan source.Message, 1)
+	msgs <- source.Message{Event: &event.Event{
+		Op: event.OpDDL, Database: "db", Table: "orders",
+		SourceDatabase: "db", SourceTable: "orders",
+		DDL: ddl,
+	}}
+	close(msgs)
+	pipeline := dorisPipeline()
+	if mutate != nil {
+		mutate(pipeline)
+	}
+	path := filepath.Join(t.TempDir(), "checkpoint.ckpt")
+	return Run(context.Background(), pipeline, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil)
+}
+
+func TestDorisPrimaryKeyChangeIsFatal(t *testing.T) {
+	// DROP PRIMARY KEY classifies as ActionIndex with Execute=false; silently
+	// skipping it would leave the sink keyed differently from the source.
+	err := runDorisDDL(t, "ALTER TABLE `db`.`orders` DROP PRIMARY KEY", nil)
+	if err == nil || !strings.Contains(err.Error(), "primary key change") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestDorisSecondaryIndexChangeIsIgnored(t *testing.T) {
+	// The Doris target never carries secondary indexes, so their changes are a
+	// no-op rather than an error.
+	for _, ddl := range []string{
+		"ALTER TABLE `db`.`orders` ADD INDEX idx_name (`name`)",
+		"ALTER TABLE `db`.`orders` DROP INDEX idx_name",
+		"CREATE INDEX idx_name ON `db`.`orders` (`name`)",
+	} {
+		if err := runDorisDDL(t, ddl, nil); err != nil {
+			t.Fatalf("%s: %v", ddl, err)
+		}
+	}
+}
+
+func TestDorisRenameTableIsFatal(t *testing.T) {
+	// RENAME cannot be followed on the target and must not be skipped just
+	// because drop.truncate is disabled.
+	err := runDorisDDL(t, "RENAME TABLE `db`.`orders` TO `db`.`orders_old`", nil)
+	if err == nil || !strings.Contains(err.Error(), "not supported in v1") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestDorisDropTableSkippedWhenDropTruncateDisabled(t *testing.T) {
+	err := runDorisDDL(t, "DROP TABLE `db`.`orders`", func(pipe *definition.Pipeline) {
+		pipe.Sink.DropTruncate = false
+	})
+	if err != nil {
+		t.Fatalf("explicit opt-out must not fail: %v", err)
+	}
+}

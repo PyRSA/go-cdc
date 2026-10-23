@@ -41,7 +41,7 @@ absolutize_checkpoint_dirs() {
   local name
   for name in CHECKPOINT_DIR CHECKPOINT_STDOUT_DIR CHECKPOINT_TYPES_DIR \
     CHECKPOINT_LOAD_DIR CHECKPOINT_KAFKA_DIR CHECKPOINT_KAFKA_LOAD_DIR \
-    CHECKPOINT_DORIS_DIR; do
+    CHECKPOINT_DORIS_DIR CHECKPOINT_DORIS_LOAD_DIR CHECKPOINT_DORIS_SCALE_DIR; do
     if [ -n "${!name:-}" ]; then
       _absolutize_under_it "${name}"
     fi

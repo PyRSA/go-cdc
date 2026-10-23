@@ -36,7 +36,7 @@ func newTestHTTP(t *testing.T, server *httptest.Server) *httpClient {
 }
 
 func TestStreamLoadRequest(t *testing.T) {
-	var method, path, body, label, format, byLine, strict, filter, contentType string
+	var method, path, body, label, format, byLine, strict, filter, contentType, timeout string
 	var authOK bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		method, path = r.Method, r.URL.Path
@@ -49,6 +49,7 @@ func TestStreamLoadRequest(t *testing.T) {
 		byLine = r.Header.Get("read_json_by_line")
 		strict = r.Header.Get("strict_mode")
 		filter = r.Header.Get("max_filter_ratio")
+		timeout = r.Header.Get("timeout")
 		contentType = r.Header.Get("Content-Type")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"Status":"Success","Label":"l1","NumberTotalRows":1,"NumberLoadedRows":1}`)
@@ -77,6 +78,53 @@ func TestStreamLoadRequest(t *testing.T) {
 	}
 	if contentType != "application/json" {
 		t.Fatalf("content-type %s", contentType)
+	}
+	// The Doris-side budget stays request-timeout; only the client deadline is
+	// larger (request-timeout + loadTimeoutGrace).
+	if timeout != "5" {
+		t.Fatalf("timeout header %q want 5", timeout)
+	}
+}
+
+// TestClientDeadlineOutlastsDorisTimeout pins the separation between the Doris
+// Stream Load budget and the HTTP deadline: Doris answers only after its own
+// timeout expires, so an equal client deadline would cancel the request exactly
+// when the verdict is written.
+func TestClientDeadlineOutlastsDorisTimeout(t *testing.T) {
+	client, err := newHTTPClient(definition.Sink{
+		Hostname: "127.0.0.1", Port: 8030, Username: "root", RequestTimeout: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.timeout != 30*time.Second {
+		t.Fatalf("doris-side timeout=%s want 30s", client.timeout)
+	}
+	want := 30*time.Second + loadTimeoutGrace
+	if client.client.Timeout != want {
+		t.Fatalf("client deadline=%s want %s", client.client.Timeout, want)
+	}
+	if client.client.Timeout <= client.timeout {
+		t.Fatalf("client deadline %s must exceed the Doris timeout %s", client.client.Timeout, client.timeout)
+	}
+}
+
+func TestTimeoutHeaderRoundsSubSecond(t *testing.T) {
+	// Truncating 1500ms would send 1s (shorter than requested) and 500ms would
+	// send 0, which Doris rejects before running the load.
+	cases := []struct {
+		in   time.Duration
+		want int
+	}{
+		{30 * time.Second, 30},
+		{1500 * time.Millisecond, 2},
+		{500 * time.Millisecond, 1},
+		{0, 1},
+	}
+	for _, tc := range cases {
+		if got := secondsRoundedUp(tc.in); got != tc.want {
+			t.Fatalf("%s -> %d want %d", tc.in, got, tc.want)
+		}
 	}
 }
 

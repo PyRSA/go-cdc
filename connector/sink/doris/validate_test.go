@@ -1,6 +1,7 @@
 package doris
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -22,7 +23,7 @@ func validateSource() schema.Table {
 func validTarget() []descColumn {
 	return []descColumn{
 		{Name: "id", Type: "BIGINT", Nullable: false, Key: true},
-		{Name: "name", Type: "VARCHAR(64)", Nullable: true},
+		{Name: "name", Type: "VARCHAR(96)", Nullable: true},
 	}
 }
 
@@ -74,11 +75,31 @@ func TestValidateTargetRejectsMissingColumn(t *testing.T) {
 	}
 }
 
+func TestValidateTargetReportsMissingColumnsAsRecoverable(t *testing.T) {
+	// CreateTable downgrades exactly this error to a warning; everything else
+	// must stay fatal.
+	source := validateSource()
+	source.Columns = append(source.Columns, schema.Column{Name: "note", Type: "varchar(32)", Nullable: true})
+	var missing *missingColumnsError
+	if err := validateTarget(source, validTarget()); !errors.As(err, &missing) {
+		t.Fatalf("err=%v", err)
+	}
+	if len(missing.Columns) != 1 || missing.Columns[0] != "note" {
+		t.Fatalf("columns %#v", missing.Columns)
+	}
+}
+
 func TestValidateTargetRejectsNarrowing(t *testing.T) {
 	target := validTarget()
-	target[1].Type = "VARCHAR(8)"
-	if err := validateTarget(validateSource(), target); err == nil {
+	target[1].Type = "VARCHAR(95)"
+	err := validateTarget(validateSource(), target)
+	if err == nil {
 		t.Fatal("narrowing must fail")
+	}
+	// The message must name the byte capacity the source needs so the operator
+	// can widen the target without guessing (varchar(32) needs 96 bytes).
+	if !strings.Contains(err.Error(), "VARCHAR(96)") {
+		t.Fatalf("err=%v", err)
 	}
 }
 
@@ -129,7 +150,7 @@ func TestValidateTargetRejectsUnsupportedSourceType(t *testing.T) {
 }
 
 func TestValidateExistingColumn(t *testing.T) {
-	existing := descColumn{Name: "name", Type: "VARCHAR(64)", Nullable: true}
+	existing := descColumn{Name: "name", Type: "VARCHAR(96)", Nullable: true}
 	if err := validateExistingColumn(existing, schema.Column{Name: "name", Type: "varchar(32)", Nullable: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -138,5 +159,67 @@ func TestValidateExistingColumn(t *testing.T) {
 	}
 	if err := validateExistingColumn(existing, schema.Column{Name: "name", Type: "varchar(32)", Nullable: false}); err == nil {
 		t.Fatal("nullability mismatch must fail")
+	}
+}
+
+func TestParseTableModelUniqueKey(t *testing.T) {
+	ddl := "CREATE TABLE `db`.`orders` (\n  `tenant` VARCHAR(16) NOT NULL,\n  `id` BIGINT NOT NULL\n" +
+		") ENGINE=OLAP\nUNIQUE KEY(`tenant`, `id`)\nDISTRIBUTED BY HASH(`tenant`) BUCKETS auto"
+	model, err := parseTableModel(ddl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !model.UniqueKey {
+		t.Fatal("expected a UNIQUE KEY model")
+	}
+	want := []string{"tenant", "id"}
+	if len(model.Keys) != len(want) || model.Keys[0] != want[0] || model.Keys[1] != want[1] {
+		t.Fatalf("keys %#v", model.Keys)
+	}
+}
+
+func TestParseTableModelRejectsOtherModels(t *testing.T) {
+	duplicate := "CREATE TABLE `db`.`orders` (`id` BIGINT NOT NULL) ENGINE=OLAP\nDUPLICATE KEY(`id`) BUCKETS auto"
+	if _, err := parseTableModel(duplicate); err == nil || !strings.Contains(err.Error(), "DUPLICATE KEY") {
+		t.Fatalf("duplicate err=%v", err)
+	}
+	aggregate := "CREATE TABLE `db`.`orders` (`id` BIGINT NOT NULL) ENGINE=OLAP\nAGGREGATE KEY(`id`) BUCKETS auto"
+	if _, err := parseTableModel(aggregate); err == nil || !strings.Contains(err.Error(), "AGGREGATE KEY") {
+		t.Fatalf("aggregate err=%v", err)
+	}
+	unknown := "CREATE TABLE `db`.`orders` (`id` BIGINT NOT NULL) ENGINE=OLAP"
+	if _, err := parseTableModel(unknown); err == nil {
+		t.Fatal("an unknown model must not be treated as compatible")
+	}
+}
+
+func TestParseTableModelIgnoresQuotedText(t *testing.T) {
+	// A column comment mentioning UNIQUE KEY must not be read as the model.
+	ddl := "CREATE TABLE `db`.`orders` (`id` BIGINT NOT NULL COMMENT 'UNIQUE KEY(`id`)') " +
+		"ENGINE=OLAP\nDUPLICATE KEY(`id`) BUCKETS auto"
+	if _, err := parseTableModel(ddl); err == nil || !strings.Contains(err.Error(), "DUPLICATE KEY") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateTableModelEnforcesKeyOrder(t *testing.T) {
+	source := schema.Table{
+		Database: "db", Table: "orders", PrimaryKeys: []string{"tenant", "id"},
+		Columns: []schema.Column{{Name: "tenant", Type: "varchar(16)"}, {Name: "id", Type: "bigint"}},
+	}
+	if err := validateTableModel(source, tableModel{UniqueKey: true, Keys: []string{"tenant", "id"}}); err != nil {
+		t.Fatal(err)
+	}
+	err := validateTableModel(source, tableModel{UniqueKey: true, Keys: []string{"id", "tenant"}})
+	if err == nil || !strings.Contains(err.Error(), "order") {
+		t.Fatalf("err=%v", err)
+	}
+	err = validateTableModel(source, tableModel{UniqueKey: true, Keys: []string{"tenant"}})
+	if err == nil || !strings.Contains(err.Error(), "does not match source primary key") {
+		t.Fatalf("err=%v", err)
+	}
+	err = validateTableModel(source, tableModel{})
+	if err == nil || !strings.Contains(err.Error(), "not a UNIQUE KEY table") {
+		t.Fatalf("err=%v", err)
 	}
 }

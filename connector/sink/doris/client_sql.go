@@ -134,6 +134,53 @@ func (c *sqlClient) descTable(ctx context.Context, database, table string) ([]de
 	return out, nil
 }
 
+// showCreateTable returns the Doris DDL for one table. DESC reports the same
+// Key=YES marker for UNIQUE, DUPLICATE and AGGREGATE tables, so the target
+// model must be read from SHOW CREATE TABLE.
+func (c *sqlClient) showCreateTable(ctx context.Context, database, table string) (string, error) {
+	qualified := schema.Qualified(database, table)
+	rows, err := c.db.QueryContext(ctx, "SHOW CREATE TABLE "+qualified)
+	if err != nil {
+		return "", fmt.Errorf("sink.doris: show create table %s: %w", qualified, err)
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		return "", err
+	}
+	if len(columns) < 2 {
+		return "", fmt.Errorf("sink.doris: show create table %s returned %d columns", qualified, len(columns))
+	}
+	// Doris returns (Table, Create Table); locate the DDL column by name and
+	// fall back to the second column for older layouts.
+	createIdx := 1
+	for i, name := range columns {
+		if strings.Contains(strings.ToLower(name), "create") {
+			createIdx = i
+			break
+		}
+	}
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return "", fmt.Errorf("sink.doris: show create table %s: %w", qualified, err)
+		}
+		return "", fmt.Errorf("sink.doris: show create table %s returned no rows", qualified)
+	}
+	values := make([]any, len(columns))
+	ptrs := make([]any, len(columns))
+	for i := range values {
+		ptrs[i] = &values[i]
+	}
+	if err := rows.Scan(ptrs...); err != nil {
+		return "", err
+	}
+	create := valueString(values[createIdx])
+	if strings.TrimSpace(create) == "" {
+		return "", fmt.Errorf("sink.doris: show create table %s returned empty DDL", qualified)
+	}
+	return create, nil
+}
+
 func isYes(value string) bool {
 	return strings.EqualFold(value, "yes") || strings.EqualFold(value, "true") || strings.EqualFold(value, "1")
 }

@@ -4,6 +4,7 @@ package composer
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/PyRSA/go-cdc/common/event"
@@ -273,6 +274,7 @@ func columnsOf(item event.Event) []schema.Column {
 
 // applyDorisDDL keeps Doris DDL failures fatal. CREATE was already executed and
 // validated by applyCatalog, so the table only becomes capturable afterwards.
+// Anything the sink cannot reproduce must fail instead of being skipped.
 func applyDorisDDL(sk sink.Sink, state *checkpoint.State, dst event.Event, decision schemaevol.Decision, change schema.Change, catalogApplied bool) error {
 	switch decision.Change.Action {
 	case schema.ActionCreate:
@@ -286,10 +288,20 @@ func applyDorisDDL(sk sink.Sink, state *checkpoint.State, dst event.Event, decis
 			return nil
 		}
 		return sk.ApplySchema(change)
-	default:
-		if decision.Execute {
-			return fmt.Errorf("sink.doris: schema change %s on %s is not supported in v1", decision.Change.Action, dst.SinkID())
+	case schema.ActionDropTable, schema.ActionTruncate:
+		if !decision.Execute {
+			// drop.truncate.enabled=false is an explicit opt-out.
+			return nil
 		}
+		return fmt.Errorf("sink.doris: %s on %s is not supported in v1", decision.Change.Action, dst.SinkID())
+	case schema.ActionIndex:
+		if strings.Contains(strings.ToUpper(decision.Change.DDL), "PRIMARY") {
+			return fmt.Errorf("sink.doris: primary key change on %s is not supported in v1: %s", dst.SinkID(), decision.Change.DDL)
+		}
+		// Secondary indexes are never created on the Doris target, so their
+		// changes have no effect there.
 		return nil
+	default:
+		return fmt.Errorf("sink.doris: schema change %s on %s is not supported in v1", decision.Change.Action, dst.SinkID())
 	}
 }

@@ -3,6 +3,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
@@ -251,13 +252,19 @@ func (d *sqlDB) ListTables(ctx context.Context) ([]schema.Table, error) {
 	return d.loadTables(ctx, "", "")
 }
 
+// ErrTableNotFound reports a catalogue lookup for a table that no longer
+// exists. Resume revalidation treats only this error as a skip; any other
+// DescribeTable failure must fail the job instead of silently weakening the
+// compatibility check.
+var ErrTableNotFound = errors.New("source.mysql: table not found")
+
 func (d *sqlDB) DescribeTable(ctx context.Context, database, table string) (schema.Table, error) {
 	tables, err := d.loadTables(ctx, database, table)
 	if err != nil {
 		return schema.Table{}, err
 	}
 	if len(tables) == 0 {
-		return schema.Table{}, fmt.Errorf("source.mysql: table %s.%s not found", database, table)
+		return schema.Table{}, fmt.Errorf("%w: %s.%s", ErrTableNotFound, database, table)
 	}
 	return tables[0], nil
 }

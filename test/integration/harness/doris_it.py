@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""MySQL → Doris pipeline integration suite (TP-DR01..DR04).
+"""MySQL → Doris pipeline integration suite (TP-DR01..TP-DR07).
 
 Mirrors kafka_it style: seed MySQL → start go-cdc YAML job → assert sink state.
-Doris v1 rejects DELETE and filter-retraction deletes; this suite covers
-snapshot / route / projection / filter, incremental insert+update, ADD COLUMN,
-and restart at-least-once (UNIQUE KEY converge).
+Functional (DR01–DR04): snapshot / route / projection / filter, incremental
+insert+update, ADD COLUMN, and restart at-least-once (UNIQUE KEY converge).
+Load parity (DR05–DR07): multi-table bulk snapshot, typed spot-check, and
+concurrent peak writers + catch-up. The load phase reuses the LOAD_* knobs of
+the MySQL/Kafka load suites and restricts itself to types Doris v1 can map
+(no BLOB/ENUM/BIT).
+
+Doris v1 rejects DELETE and filter-retraction deletes, so no test issues one.
 
 IDs use TP-DR* so they do not collide with types suite TP-D01..D04.
 
@@ -12,17 +17,22 @@ Requires MySQL (mysql-up) + Doris FE/BE (doris-up).
 """
 from __future__ import annotations
 
+import json
 import signal
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pymysql
 
 from . import config as cfg
 from .logutil import log
+from .sysstat import format_cpu_mem, format_host_res
 
 SRC = cfg.conn_kwargs(cfg.SRC_USER, cfg.SRC_PASSWORD, cfg.FUNC_SRC_DB)
 WORKDIR = cfg.WORKDIR
@@ -33,8 +43,26 @@ LOG = WORKDIR / "cdc-doris.log"
 REPORT = cfg.REPORT_DORIS
 SNK_DB = cfg.DORIS_SNK_DB
 
+CK_LOAD = Path(cfg.CHECKPOINT_DORIS_LOAD_PATH)
+YAML_LOAD = WORKDIR / "pipeline.doris.load.yaml"
+LOG_LOAD = WORKDIR / "cdc-doris-load.log"
+
+# Load phase volumes: same MySQL knobs as the mysql→mysql / kafka load suites.
+LOAD_SRC_DB = cfg.LOAD_SRC_DB
+LOAD_SRC = cfg.conn_kwargs(cfg.SRC_USER, cfg.SRC_PASSWORD, LOAD_SRC_DB)
+LOAD_ROWS = cfg.LOAD_ROWS_PER_TABLE
+PEAK_SEC = cfg.LOAD_PEAK_SECONDS
+WORKERS = cfg.LOAD_PEAK_WORKERS
+PEAK_BATCH = cfg.LOAD_PEAK_BATCH
+LOAD_BIZ = ("tpdl01_t1", "tpdl01_t2", "tpdl01_t3", "tpdl01_t4")
+LOAD_TYPED = "tpdl01_typed"
+LOAD_TABLES = LOAD_BIZ + (LOAD_TYPED,)
+
 results: list["TPResult"] = []
 proc: subprocess.Popen | None = None
+# Set by start_cdc / start_load_cdc so liveness errors quote the active phase log.
+current_log = LOG
+load_timings: dict[str, float] = {}
 
 
 @dataclass
@@ -95,12 +123,13 @@ def wait_cdc_alive(
 
 
 def start_cdc(*, reset_ckpt: bool = True) -> None:
-    global proc
+    global proc, current_log
     stop_cdc()
     if reset_ckpt and CK.exists():
         CK.unlink()
     CK.parent.mkdir(parents=True, exist_ok=True)
     cfg.render_template("pipeline.doris.yaml.tpl", YAML)
+    current_log = LOG
     log_path = LOG.open("w", encoding="utf-8")
     proc = subprocess.Popen(
         [BINARY, str(YAML)],
@@ -127,8 +156,27 @@ def stop_cdc() -> None:
 
 def ensure_alive(desc: str = "go-cdc doris") -> None:
     if proc is not None and proc.poll() is not None:
-        text = LOG.read_text(errors="replace")[-2000:] if LOG.exists() else ""
+        text = current_log.read_text(errors="replace")[-2000:] if current_log.exists() else ""
         raise RuntimeError(f"{desc} exited ({proc.returncode}):\n{text}")
+
+
+def start_load_cdc() -> None:
+    """Start the bulk/peak pipeline (db_tp_load_src.tpdl01_* → Doris)."""
+    global proc, current_log
+    stop_cdc()
+    if CK_LOAD.exists():
+        CK_LOAD.unlink()
+    CK_LOAD.parent.mkdir(parents=True, exist_ok=True)
+    cfg.render_template("pipeline.doris.load.yaml.tpl", YAML_LOAD)
+    current_log = LOG_LOAD
+    log_path = LOG_LOAD.open("w", encoding="utf-8")
+    proc = subprocess.Popen(
+        [BINARY, str(YAML_LOAD)],
+        stdout=log_path,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    wait_cdc_alive(LOG_LOAD, desc="go-cdc doris load")
 
 
 def wait_ckpt(path: Path, timeout_s: float = 60.0) -> bool:
@@ -192,11 +240,72 @@ def drop_sink_tables() -> None:
                 "tpds01_orders",
                 "tpds01_misc",
                 "tpds01_evolve",
+                *LOAD_TABLES,
             ):
                 try:
                     cur.execute(f"DROP TABLE IF EXISTS `{SNK_DB}`.`{t}`")
                 except pymysql.Error:
                     pass
+    finally:
+        c.close()
+
+
+def doris_exec(sql: str) -> None:
+    c = doris_conn()
+    try:
+        with c.cursor() as cur:
+            cur.execute(sql)
+    finally:
+        c.close()
+
+
+def doris_count(table: str) -> int:
+    c = doris_conn()
+    try:
+        with c.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM `{SNK_DB}`.`{table}`")
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+    finally:
+        c.close()
+
+
+def doris_query(sql: str) -> list[dict]:
+    c = doris_conn(cursorclass=pymysql.cursors.DictCursor)
+    try:
+        with c.cursor() as cur:
+            cur.execute(sql)
+            return [{k: (None if v is None else v) for k, v in r.items()} for r in cur.fetchall()]
+    finally:
+        c.close()
+
+
+def load_exec_sql(sql: str, args: tuple | None = None) -> None:
+    c = pymysql.connect(**LOAD_SRC, autocommit=True)
+    try:
+        with c.cursor() as cur:
+            cur.execute(sql, args or ())
+    finally:
+        c.close()
+
+
+def load_count_rows(table: str) -> int:
+    c = pymysql.connect(**LOAD_SRC)
+    try:
+        with c.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM `{LOAD_SRC_DB}`.`{table}`")
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+    finally:
+        c.close()
+
+
+def load_query(sql: str) -> list[dict]:
+    c = pymysql.connect(**LOAD_SRC, cursorclass=pymysql.cursors.DictCursor)
+    try:
+        with c.cursor() as cur:
+            cur.execute(sql)
+            return [{k: (None if v is None else v) for k, v in r.items()} for r in cur.fetchall()]
     finally:
         c.close()
 
@@ -439,6 +548,447 @@ def tp_d04_restart_at_least_once() -> None:
     )
 
 
+# Load phase tables. Doris v1 rejects BLOB/ENUM/BIT/SET/TIME, so the typed table
+# carries only mappable columns; everything else mirrors the mysql→mysql load
+# suite (same MySQL source knobs, no projection).
+LOAD_DDL = {
+    "tpdl01_t1": (
+        "(id BIGINT PRIMARY KEY, c_ref BIGINT NOT NULL, "
+        "c_amt DECIMAL(12,2) NOT NULL, c_flag VARCHAR(16) NOT NULL)"
+    ),
+    "tpdl01_t2": (
+        "(id BIGINT PRIMARY KEY, c_ref BIGINT NOT NULL, "
+        "c_code VARCHAR(32) NOT NULL, c_qty INT NOT NULL)"
+    ),
+    "tpdl01_t3": "(id BIGINT PRIMARY KEY, c_name VARCHAR(64) NOT NULL, c_city VARCHAR(32) NOT NULL)",
+    "tpdl01_t4": (
+        "(id BIGINT PRIMARY KEY, c_ref BIGINT NOT NULL, "
+        "c_method VARCHAR(16) NOT NULL, c_paid DECIMAL(12,2) NOT NULL)"
+    ),
+    LOAD_TYPED: (
+        "(id BIGINT PRIMARY KEY, "
+        "c_tinyint TINYINT NOT NULL, "
+        "c_int INT NOT NULL, "
+        "c_bigint BIGINT NOT NULL, "
+        "c_decimal DECIMAL(10,4) NOT NULL, "
+        "c_float FLOAT NOT NULL, "
+        "c_double DOUBLE NOT NULL, "
+        "c_varchar VARCHAR(64) NOT NULL, "
+        "c_date DATE NOT NULL, "
+        "c_datetime DATETIME(6) NOT NULL, "
+        "c_timestamp TIMESTAMP(6) NULL, "
+        "c_json JSON NULL, "
+        "c_bool TINYINT(1) NOT NULL)"
+    ),
+}
+
+_INSERT_T1 = (
+    f"INSERT INTO `{LOAD_SRC_DB}`.tpdl01_t1(id,c_ref,c_amt,c_flag) VALUES (%s,%s,%s,%s)"
+)
+_INSERT_T2 = (
+    f"INSERT INTO `{LOAD_SRC_DB}`.tpdl01_t2(id,c_ref,c_code,c_qty) VALUES (%s,%s,%s,%s)"
+)
+_INSERT_T3 = (
+    f"INSERT INTO `{LOAD_SRC_DB}`.tpdl01_t3(id,c_name,c_city) VALUES (%s,%s,%s)"
+)
+_INSERT_T4 = (
+    f"INSERT INTO `{LOAD_SRC_DB}`.tpdl01_t4(id,c_ref,c_method,c_paid) VALUES (%s,%s,%s,%s)"
+)
+_INSERT_TYPED = (
+    f"INSERT INTO `{LOAD_SRC_DB}`.tpdl01_typed("
+    "id,c_tinyint,c_int,c_bigint,c_decimal,c_float,c_double,c_varchar,"
+    "c_date,c_datetime,c_timestamp,c_json,c_bool"
+    ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+)
+
+
+def _seed_load_range(sql: str, row_fn, id_end: int) -> None:
+    c = pymysql.connect(**LOAD_SRC, autocommit=True)
+    try:
+        with c.cursor() as cur:
+            cur.execute("SET time_zone = '+08:00'")
+            for start in range(1, id_end + 1, PEAK_BATCH):
+                end = min(start + PEAK_BATCH - 1, id_end)
+                cur.executemany(sql, [row_fn(i) for i in range(start, end + 1)])
+    finally:
+        c.close()
+
+
+def _load_typed_row(i: int) -> tuple:
+    return (
+        i,
+        (i % 100) - 50,
+        i,
+        i * 1000,
+        float(i % 1000) + 0.1234,
+        float(i % 50) + 0.5,
+        float(i) + 0.25,
+        f"row-{i}",
+        f"2024-{(i % 12) + 1:02d}-{(i % 28) + 1:02d}",
+        f"2024-06-15 {(i % 24):02d}:30:00.123456",
+        f"2024-06-15 {(i % 24):02d}:30:00.123456",
+        json.dumps({"id": i, "k": "v"}),
+        i % 2,
+    )
+
+
+def ensure_load_schema() -> None:
+    """Recreate source tables and wipe the matching Doris targets."""
+    for name, cols in LOAD_DDL.items():
+        load_exec_sql(f"DROP TABLE IF EXISTS `{LOAD_SRC_DB}`.`{name}`")
+        load_exec_sql(f"CREATE TABLE `{LOAD_SRC_DB}`.`{name}` {cols} ENGINE=InnoDB")
+    for name in LOAD_TABLES:
+        try:
+            doris_exec(f"DROP TABLE IF EXISTS `{SNK_DB}`.`{name}`")
+        except pymysql.Error:
+            pass
+
+
+def seed_load_baseline() -> None:
+    """Seed every load table in parallel (one connection per table, batch inserts)."""
+    cities = ("hz", "sh", "bj", "sz")
+    specs = (
+        ("tpdl01_t1", _INSERT_T1, lambda i: (i, i % 1000 + 1, float(i % 100) + 0.5, "ok")),
+        ("tpdl01_t2", _INSERT_T2, lambda i: (i, i, f"C{i % 500:04d}", (i % 5) + 1)),
+        ("tpdl01_t3", _INSERT_T3, lambda i: (i, f"n{i}", cities[i % 4])),
+        (
+            "tpdl01_t4",
+            _INSERT_T4,
+            lambda i: (i, i, "m1" if i % 2 == 0 else "m2", float(i % 50) + 1.0),
+        ),
+        (LOAD_TYPED, _INSERT_TYPED, _load_typed_row),
+    )
+    seed_workers = max(1, min(WORKERS * 2, 8, len(specs)))
+    log(
+        f"    seed workers={seed_workers} "
+        f"(LOAD_PEAK_WORKERS={WORKERS} × 2, cap=8, one conn/table)"
+    )
+    with ThreadPoolExecutor(max_workers=seed_workers) as pool:
+        futs = {
+            pool.submit(_seed_load_range, sql, fn, LOAD_ROWS): name
+            for name, sql, fn in specs
+        }
+        for fut in as_completed(futs):
+            name = futs[fut]
+            try:
+                fut.result()
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(f"{LOAD_SRC_DB}.{name}: seed failed: {exc}") from exc
+            log(f"    seed done {name}")
+
+
+def peak_writer(worker_id: int, stop_at: float, counter: list[int], lock: threading.Lock) -> int:
+    """Insert t1+typed batches until stop_at; ids stay above the snapshot range."""
+    written = 0
+    base = LOAD_ROWS + 1 + worker_id * 10_000_000
+    seq = 0
+    c = pymysql.connect(**LOAD_SRC, autocommit=True)
+    try:
+        with c.cursor() as cur:
+            cur.execute("SET time_zone = '+08:00'")
+            while time.time() < stop_at:
+                orders = []
+                typed = []
+                for _ in range(PEAK_BATCH):
+                    seq += 1
+                    i = base + seq
+                    orders.append((i, i % 1000 + 1, float(i % 100) + 0.5, "peak"))
+                    typed.append(_load_typed_row(i))
+                cur.executemany(_INSERT_T1, orders)
+                cur.executemany(_INSERT_TYPED, typed)
+                written += len(orders)
+                with lock:
+                    counter[0] += len(orders)
+    finally:
+        c.close()
+    return written
+
+
+def wait_doris_count(
+    table: str,
+    minimum: int,
+    *,
+    deadline: float,
+    interval: float = 5.0,
+    desc: str = "doris count",
+) -> int:
+    """Poll Doris COUNT(*) until the table is visible and reaches minimum."""
+    last = 0
+    last_log = 0.0
+    while time.time() < deadline:
+        ensure_alive(desc)
+        try:
+            last = doris_count(table)
+        except pymysql.Error:
+            last = 0
+        if last >= minimum:
+            return last
+        now = time.time()
+        if now - last_log >= 15:
+            log(f"    {desc}: {last}/{minimum} rows")
+            last_log = now
+        time.sleep(interval)
+    raise TimeoutError(
+        f"timeout waiting for {desc}: {SNK_DB}.{table} has {last} rows, need {minimum}"
+    )
+
+
+def wait_load_catchup(
+    expect_t1: int,
+    expect_typed: int,
+    *,
+    timeout: float = 3600,
+    interval: float = 10.0,
+    log_every: float = 15.0,
+) -> float:
+    """Wait until t1 and typed are within 1% of the post-storm source counts."""
+    t0 = time.time()
+    deadline = t0 + timeout
+    last_log = 0.0
+    format_cpu_mem()  # baseline /proc/stat so the first periodic line has cpu=%
+    while time.time() < deadline:
+        ensure_alive("go-cdc doris load")
+        try:
+            snk_t1 = doris_count("tpdl01_t1")
+            snk_ty = doris_count(LOAD_TYPED)
+        except pymysql.Error:
+            snk_t1 = snk_ty = 0
+        lag_t1 = abs(expect_t1 - snk_t1) / max(expect_t1, 1)
+        lag_ty = abs(expect_typed - snk_ty) / max(expect_typed, 1)
+        if lag_t1 <= 0.01 and lag_ty <= 0.01:
+            elapsed = time.time() - t0
+            log(f"TIMING  wait [doris_peak catch-up] done in {elapsed:.1f}s")
+            return elapsed
+        now = time.time()
+        if now - last_log >= log_every:
+            cdc_pid = proc.pid if proc is not None else None
+            log(
+                f"    doris peak catch-up {now - t0:.0f}s: "
+                f"t1 {snk_t1}/{expect_t1} lag={lag_t1:.2%} | "
+                f"typed {snk_ty}/{expect_typed} lag={lag_ty:.2%} | {format_host_res(cdc_pid)}"
+            )
+            last_log = now
+        time.sleep(interval)
+    raise TimeoutError(
+        f"timeout waiting for doris_peak catch-up after {time.time() - t0:.1f}s "
+        f"(t1 {lag_t1:.2%}, typed {lag_ty:.2%})"
+    )
+
+
+def _norm_typed(rows: list[dict]) -> dict[int, dict]:
+    """Normalise the spot-check columns so MySQL and Doris values compare equal."""
+    out: dict[int, dict] = {}
+    for row in rows:
+        rid = int(row["id"])
+        doc = row["c_json"]
+        if isinstance(doc, (bytes, bytearray)):
+            doc = doc.decode("utf-8", "replace")
+        try:
+            doc = json.loads(doc) if doc is not None else None
+        except (TypeError, ValueError):
+            pass
+        try:
+            dec = str(Decimal(str(row["c_decimal"])).normalize())
+        except (InvalidOperation, TypeError, ValueError):
+            dec = str(row["c_decimal"])
+        out[rid] = {
+            "c_int": int(row["c_int"]),
+            "c_bigint": int(row["c_bigint"]),
+            "c_decimal": dec,
+            "c_varchar": str(row["c_varchar"]),
+            "c_date": str(row["c_date"]),
+            "c_datetime": str(row["c_datetime"]),
+            "c_json": doc,
+            "c_bool": int(row["c_bool"]),
+        }
+    return out
+
+
+def tp_d05_bulk_multi_table_snapshot() -> None:
+    """Bulk snapshot across five routed tables (DR05)."""
+    stop_cdc()
+    ensure_load_schema()
+    log(f"==> doris load seed {LOAD_ROWS} rows x {len(LOAD_TABLES)} tables")
+    t0 = time.time()
+    seed_load_baseline()
+    load_timings["doris_seed_baseline"] = time.time() - t0
+    log(f"TIMING  doris_seed_baseline {load_timings['doris_seed_baseline']:.1f}s")
+
+    t0 = time.time()
+    start_load_cdc()
+    threshold = max(1, int(LOAD_ROWS * 0.99))
+    deadline = time.time() + 3600
+    for table in LOAD_TABLES:
+        wait_doris_count(
+            table,
+            threshold,
+            deadline=deadline,
+            desc=f"d05 {table} snapshot",
+        )
+    load_timings["doris_snapshot"] = time.time() - t0
+    log(f"TIMING  doris_snapshot {load_timings['doris_snapshot']:.1f}s")
+
+    rows = []
+    ok = True
+    for table in LOAD_TABLES:
+        src = load_count_rows(table)
+        snk = doris_count(table)
+        lag = abs(src - snk) / max(src, 1)
+        hit = src == LOAD_ROWS and lag <= 0.01
+        ok = ok and hit
+        rows.append(
+            f"| {table} | {LOAD_ROWS} | {src} | {snk} | {lag:.2%} | "
+            f"{'✅' if hit else '❌'} |"
+        )
+    detail = (
+        "| Table | Expected | Source | Doris | Lag | Verdict |\n"
+        "| --- | ---: | ---: | ---: | ---: | --- |\n"
+        + "\n".join(rows)
+        + "\n"
+        + f"\nseed={load_timings['doris_seed_baseline']:.1f}s, "
+        + f"snapshot={load_timings['doris_snapshot']:.1f}s, "
+        + f"tables={len(LOAD_TABLES)}\n"
+        + f"\n| Summary | | | | | **{'✅ PASS' if ok else '❌ FAIL'}** |"
+    )
+    record(
+        TPResult(
+            id="TP-DR05",
+            title="bulk multi-table snapshot (t1–t4 + typed)",
+            action=(
+                f"seed {LOAD_ROWS} rows x {len(LOAD_TABLES)} MySQL tables; "
+                "wait Doris COUNT(*) ≥99%"
+            ),
+            expected_desc="Every table keeps src/sink delta <=1% after snapshot",
+            passed=ok,
+            detail_md=detail,
+        )
+    )
+
+
+def tp_d07_typed_spotcheck() -> None:
+    """Spot-check mappable typed columns after the bulk snapshot (DR07)."""
+    ids = sorted({1, max(1, LOAD_ROWS // 2), max(1, LOAD_ROWS)})
+    id_list = ", ".join(str(i) for i in ids)
+    columns = (
+        "id, c_int, c_bigint, c_decimal, c_varchar, "
+        "DATE_FORMAT(c_date, '%Y-%m-%d') AS c_date, "
+        "DATE_FORMAT(c_datetime, '%Y-%m-%d %H:%i:%s') AS c_datetime, "
+        "c_json, c_bool"
+    )
+    src_rows = load_query(
+        f"SELECT {columns} FROM `{LOAD_SRC_DB}`.`{LOAD_TYPED}` "
+        f"WHERE id IN ({id_list}) ORDER BY id"
+    )
+    snk_rows = doris_query(
+        f"SELECT {columns} FROM `{SNK_DB}`.`{LOAD_TYPED}` "
+        f"WHERE id IN ({id_list}) ORDER BY id"
+    )
+    src = _norm_typed(src_rows)
+    snk = _norm_typed(snk_rows)
+    missing = [i for i in ids if i not in src or i not in snk]
+    mismatched = [i for i in ids if i in src and i in snk and src[i] != snk[i]]
+    ok = not missing and not mismatched
+    lines = []
+    for i in ids:
+        if i in missing:
+            verdict = "missing"
+        elif i in mismatched:
+            verdict = "mismatch: " + ", ".join(
+                key for key in src[i] if src[i][key] != snk[i][key]
+            )
+        else:
+            verdict = "match"
+        lines.append(f"| {i} | {verdict} | {'✅' if verdict == 'match' else '❌'} |")
+    detail = (
+        "| Sample id | Verdict | Result |\n| --- | --- | --- |\n"
+        + "\n".join(lines)
+        + "\n"
+        + f"\nchecked: int/bigint/decimal/varchar/date/datetime/json/bool; "
+        + f"rows src={len(src)} sink={len(snk)}\n"
+        + f"\n| Summary | | **{'✅ PASS' if ok else '❌ FAIL'}** |"
+    )
+    record(
+        TPResult(
+            id="TP-DR07",
+            title="typed columns under bulk load (spot-check)",
+            action=f"compare ids {ids} source vs Doris for mappable types",
+            expected_desc="int/decimal/varchar/date/datetime/json/bool match",
+            passed=ok,
+            detail_md=detail,
+        )
+    )
+
+
+def tp_d06_peak_catchup() -> None:
+    """Concurrent INSERT storm on t1 + typed; Doris must catch up within 1% (DR06)."""
+    ensure_alive("go-cdc doris load")
+    src_before = load_count_rows("tpdl01_t1")
+    typed_before = load_count_rows(LOAD_TYPED)
+
+    counter = [0]
+    lock = threading.Lock()
+    stop_at = time.time() + PEAK_SEC
+    log(f"==> doris peak writers {WORKERS}x{PEAK_SEC}s (batch {PEAK_BATCH})")
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        futs = [
+            pool.submit(peak_writer, i, stop_at, counter, lock)
+            for i in range(WORKERS)
+        ]
+        written_each = [f.result() for f in as_completed(futs)]
+    elapsed = max(time.time() - t0, 0.001)
+    written = sum(written_each)
+    load_timings["doris_peak_write"] = elapsed
+    log(
+        f"TIMING  doris_peak_write {elapsed:.1f}s "
+        f"({written} rows ≈ {written / elapsed:.0f} rps)"
+    )
+
+    src_after = load_count_rows("tpdl01_t1")
+    typed_after = load_count_rows(LOAD_TYPED)
+    load_timings["doris_peak_catchup"] = wait_load_catchup(src_after, typed_after)
+    log(f"TIMING  doris_peak_catchup {load_timings['doris_peak_catchup']:.1f}s")
+
+    ck_ok = wait_ckpt(CK_LOAD, timeout_s=60)
+    ck = json.loads(CK_LOAD.read_text()) if ck_ok and CK_LOAD.exists() else {}
+    has_offset = bool(ck.get("acked_offset"))
+    snk_t1 = doris_count("tpdl01_t1")
+    snk_ty = doris_count(LOAD_TYPED)
+    lag_t1 = abs(src_after - snk_t1) / max(src_after, 1)
+    lag_ty = abs(typed_after - snk_ty) / max(typed_after, 1)
+    grew = src_after > src_before and typed_after > typed_before
+    job_alive = proc is not None and proc.poll() is None
+    ok = written > 0 and grew and lag_t1 <= 0.01 and lag_ty <= 0.01 and job_alive and has_offset
+    detail = (
+        "| Check | Actual | Verdict |\n| --- | --- | --- |\n"
+        f"| peak writes | {written} rows / {elapsed:.1f}s ≈ {written / elapsed:.0f} rps | "
+        f"{'✅' if written > 0 else '❌'} |\n"
+        f"| t1 source grew | {src_before}→{src_after} | {'✅' if src_after > src_before else '❌'} |\n"
+        f"| t1 src/sink | {src_after}/{snk_t1} lag={lag_t1:.2%} | "
+        f"{'✅' if lag_t1 <= 0.01 else '❌'} |\n"
+        f"| typed src/sink | {typed_after}/{snk_ty} lag={lag_ty:.2%} | "
+        f"{'✅' if lag_ty <= 0.01 else '❌'} |\n"
+        f"| catch-up time | {load_timings['doris_peak_catchup']:.1f}s | |\n"
+        f"| job still running | {job_alive} | {'✅' if job_alive else '❌'} |\n"
+        f"| resume offset recorded | {'yes' if has_offset else 'no'} | "
+        f"{'✅' if has_offset else '❌'} |\n"
+        f"| Summary | | **{'✅ PASS' if ok else '❌ FAIL'}** |"
+    )
+    record(
+        TPResult(
+            id="TP-DR06",
+            title="peak incremental stress + catch-up",
+            action=(
+                f"{WORKERS} workers x {PEAK_SEC}s concurrent INSERT "
+                f"t1+typed; wait Doris counts"
+            ),
+            expected_desc="After catch-up delta <=1%; job up; resume offset saved",
+            passed=ok,
+            detail_md=detail,
+        )
+    )
+
+
 def write_report() -> Path:
     REPORT.parent.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -454,6 +1004,33 @@ def write_report() -> Path:
         "this suite does not cover delete paths.",
         "",
     ]
+    if load_timings:
+        lines += [
+            "## Load phase plan",
+            "",
+            f"- Load source: `{cfg.MYSQL_HOST}:{cfg.MYSQL_PORT}/{LOAD_SRC_DB}`",
+            f"- Load tables: {', '.join(f'`{t}`' for t in LOAD_TABLES)}",
+            "",
+            "| Knob | Value | Meaning |",
+            "| --- | --- | --- |",
+            f"| `LOAD_PROFILE` | {cfg.LOAD_PROFILE or '(unset)'} | CI/local tier label |",
+            f"| `LOAD_ROWS_PER_TABLE` | {LOAD_ROWS} | rows in each of {len(LOAD_TABLES)} load tables |",
+            f"| `LOAD_PEAK_SECONDS` | {PEAK_SEC} | peak writer duration |",
+            f"| `LOAD_PEAK_WORKERS` | {WORKERS} | concurrent peak writers (seed uses ×2, cap 8) |",
+            f"| `LOAD_PEAK_BATCH` | {PEAK_BATCH} | rows per INSERT batch |",
+            f"| `LOAD_PARALLELISM` | {cfg.LOAD_PARALLELISM} | snapshot table readers |",
+            "",
+            "Note: the load phase uses Doris-mappable types only "
+            "(no BLOB/ENUM/BIT/SET/TIME), so it cannot reuse `tpl01_typed` / "
+            "`tpl01_large` from the mysql→mysql suite.",
+            "",
+            "## Load phase timings",
+            "",
+            "| Phase | Seconds |",
+            "| --- | ---: |",
+        ]
+        lines += [f"| {name} | {sec:.1f} |" for name, sec in load_timings.items()]
+        lines.append("")
     failed = 0
     for r in results:
         mark = "✅ PASS" if r.passed else "❌ FAIL"
@@ -525,6 +1102,21 @@ def main() -> int:
             "TP-DR04",
             "restart at-least-once",
             tp_d04_restart_at_least_once,
+        )
+        _run_tp(
+            "TP-DR05",
+            "bulk multi-table snapshot (t1–t4 + typed)",
+            tp_d05_bulk_multi_table_snapshot,
+        )
+        _run_tp(
+            "TP-DR07",
+            "typed columns under bulk load (spot-check)",
+            tp_d07_typed_spotcheck,
+        )
+        _run_tp(
+            "TP-DR06",
+            "peak incremental stress + catch-up",
+            tp_d06_peak_catchup,
         )
     finally:
         stop_cdc()

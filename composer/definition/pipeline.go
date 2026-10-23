@@ -79,6 +79,7 @@ type Sink struct {
 	RequestTimeout      time.Duration // request-timeout; Stream Load HTTP timeout
 	SchemaChange        bool          // schema.change.enabled; default false
 	SchemaChangeInclude []string      // schema.change.include; v1 allows only add.column
+	SchemaChangeWait    time.Duration // schema.change.wait-timeout; ADD COLUMN visibility budget
 	PartialUpdate       bool          // partial-update.enabled; v1 must stay false
 	DeleteEnabled       bool          // delete.enabled; v1 must stay false
 	Buckets             string        // buckets; "auto" or a positive integer

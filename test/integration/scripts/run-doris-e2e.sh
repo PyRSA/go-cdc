@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build go-cdc, ensure MySQL+Doris are up, run:
-#   1) MySQL→Doris pipeline harness (TP-DR01..DR04) — same shape as kafka_it
+#   1) MySQL→Doris pipeline harness (TP-DR01..DR07) — functional + load parity
 #   2) Real-Doris sink Go suite (doris_integration tag) — sink-level checks
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -27,6 +27,7 @@ export DORIS_SNK_DB="${DORIS_SNK_DB:-db_tp_doris_snk}"
 export DORIS_BUCKETS="${DORIS_BUCKETS:-auto}"
 
 export CHECKPOINT_DORIS_DIR="${CHECKPOINT_DORIS_DIR:-${WORKDIR}/ckpts-doris}"
+export CHECKPOINT_DORIS_LOAD_DIR="${CHECKPOINT_DORIS_LOAD_DIR:-${WORKDIR}/ckpts-doris-load}"
 export GO_CDC="${GO_CDC:-${WORKDIR}/go-cdc}"
 # wait-for-doris.sh dumps compose logs on timeout using COMPOSE_PROJECT_NAME.
 # In CI that variable points at the MySQL stack, so keep the Doris project
@@ -38,7 +39,17 @@ fi
 
 absolutize_go_cdc
 absolutize_checkpoint_dirs
-mkdir -p "${CHECKPOINT_DORIS_DIR}"
+
+# Load phase knobs: same tiering as the mysql→mysql / kafka load suites.
+# CI overrides LOAD_ROWS_PER_TABLE via GITHUB_ENV before this script runs.
+export LOAD_PROFILE="${LOAD_PROFILE:-local}"
+export LOAD_ROWS_PER_TABLE="${LOAD_ROWS_PER_TABLE:-50000}"
+export LOAD_PEAK_SECONDS="${LOAD_PEAK_SECONDS:-60}"
+export LOAD_PEAK_WORKERS="${LOAD_PEAK_WORKERS:-4}"
+export LOAD_PEAK_BATCH="${LOAD_PEAK_BATCH:-200}"
+export LOAD_PARALLELISM="${LOAD_PARALLELISM:-${LOAD_PEAK_WORKERS}}"
+
+mkdir -p "${CHECKPOINT_DORIS_DIR}" "${CHECKPOINT_DORIS_LOAD_DIR}"
 
 # Local-only: tear down mysql + doris on exit unless KEEP_IT_MYSQL=1 / KEEP_IT_DORIS=1.
 if [ -z "${CI:-}" ] && [ -z "${GITHUB_ACTIONS:-}" ]; then
@@ -79,12 +90,20 @@ COMPOSE_PROJECT_NAME="${DORIS_COMPOSE_PROJECT}" bash "${IT}/scripts/wait-for-dor
 
 log "==> seed doris pipeline suite tables"
 mysql_as "${SRC_USER}" "${SRC_PASSWORD}" < "${IT}/fixtures/seed_doris.sql"
-rm -rf "${CHECKPOINT_DORIS_DIR}"
-mkdir -p "${CHECKPOINT_DORIS_DIR}"
+rm -rf "${CHECKPOINT_DORIS_DIR}" "${CHECKPOINT_DORIS_LOAD_DIR}"
+mkdir -p "${CHECKPOINT_DORIS_DIR}" "${CHECKPOINT_DORIS_LOAD_DIR}"
+
+log "==> load knobs"
+log "    LOAD_PROFILE=${LOAD_PROFILE}"
+log "    LOAD_ROWS_PER_TABLE=${LOAD_ROWS_PER_TABLE}"
+log "    LOAD_PEAK_SECONDS=${LOAD_PEAK_SECONDS}"
+log "    LOAD_PEAK_WORKERS=${LOAD_PEAK_WORKERS}"
+log "    LOAD_PEAK_BATCH=${LOAD_PEAK_BATCH}"
+log "    LOAD_PARALLELISM=${LOAD_PARALLELISM}"
 
 status=0
 
-log "==> run MySQL→Doris pipeline harness (TP-DR01..DR04)"
+log "==> run MySQL→Doris pipeline harness (TP-DR01..DR07)"
 cd "${IT}"
 if ! "${PYTHON_BIN}" -m harness.doris_it; then
   status=1

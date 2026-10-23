@@ -24,8 +24,8 @@ func TestMapColumnType(t *testing.T) {
 		{"decimal(10,2)", "DECIMAL(10,2)"},
 		{"decimal(38,0)", "DECIMAL(38,0)"},
 		{"numeric(5,1)", "DECIMAL(5,1)"},
-		{"char(3)", "CHAR(3)"},
-		{"varchar(255)", "VARCHAR(255)"},
+		{"char(3)", "CHAR(9)"},
+		{"varchar(255)", "VARCHAR(765)"},
 		{"tinytext", "STRING"},
 		{"text", "STRING"},
 		{"mediumtext", "STRING"},
@@ -45,6 +45,34 @@ func TestMapColumnType(t *testing.T) {
 		}
 		if mapped.Doris != tc.want {
 			t.Fatalf("%s: got %s want %s", tc.raw, mapped.Doris, tc.want)
+		}
+	}
+}
+
+// TestStringLengthsAreDorisByteCapacities pins the character-to-byte widening
+// and the degrade path that keeps generated DDL inside the Doris type limits.
+func TestStringLengthsAreDorisByteCapacities(t *testing.T) {
+	cases := []struct {
+		raw        string
+		wantDoris  string
+		wantLength int
+	}{
+		{"varchar(1)", "VARCHAR(3)", 3},
+		{"varchar(85)", "VARCHAR(255)", 255},
+		{"varchar(21844)", "VARCHAR(65532)", 65532},
+		{"varchar(21845)", "STRING", 0},
+		{"char(85)", "CHAR(255)", 255},
+		{"char(86)", "VARCHAR(258)", 258},
+		{"char(300)", "VARCHAR(900)", 900},
+	}
+	for _, tc := range cases {
+		mapped, err := mapColumnType(tc.raw)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.raw, err)
+		}
+		if mapped.Doris != tc.wantDoris || mapped.Length != tc.wantLength {
+			t.Fatalf("%s: got %s length=%d, want %s length=%d",
+				tc.raw, mapped.Doris, mapped.Length, tc.wantDoris, tc.wantLength)
 		}
 	}
 }
@@ -75,7 +103,8 @@ func TestCompatible(t *testing.T) {
 		{"int unsigned", "BIGINT", true},
 		{"bigint unsigned", "LARGEINT", true},
 		{"bigint unsigned", "BIGINT", false},
-		{"varchar(32)", "VARCHAR(64)", true},
+		{"varchar(32)", "VARCHAR(96)", true},
+		{"varchar(32)", "VARCHAR(64)", false},
 		{"varchar(64)", "VARCHAR(32)", false},
 		{"varchar(32)", "STRING", true},
 		{"text", "STRING", true},
@@ -86,8 +115,10 @@ func TestCompatible(t *testing.T) {
 		{"decimal(10,2)", "DECIMAL(10,1)", false},
 		{"decimal(10,2)", "DECIMAL(10,3)", false},
 		{"decimal(10,2)", "DECIMAL(11,3)", true},
-		{"char(8)", "VARCHAR(8)", true},
+		{"char(8)", "VARCHAR(24)", true},
 		{"char(8)", "VARCHAR(4)", false},
+		{"varchar(30000)", "VARCHAR(65533)", false},
+		{"varchar(30000)", "STRING", true},
 		{"datetime(6)", "DATETIME(6)", true},
 		{"datetime(6)", "DATETIME(3)", false},
 		{"datetime", "DATETIME", true},

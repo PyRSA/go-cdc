@@ -7,6 +7,7 @@ GOLANGCI_LINT_VERSION ?= v2.1.6
 	integration-up integration-test integration-down \
 	integration-kafka-up integration-kafka-test \
 	integration-doris-up integration-doris-test integration-doris-down \
+	integration-doris-scale-normal integration-doris-scale-heavy \
 	integration-scale-normal integration-scale-heavy
 
 build:
@@ -66,6 +67,12 @@ integration-doris-test:
 integration-doris-down:
 	bash test/integration/scripts/doris-down.sh
 	bash test/integration/scripts/mysql-down.sh
+
+integration-doris-scale-normal:
+	bash test/integration/scripts/run-doris-scale.sh normal
+
+integration-doris-scale-heavy:
+	bash test/integration/scripts/run-doris-scale.sh heavy
 
 integration-scale-normal:
 	bash test/integration/scale/run-scale.sh normal

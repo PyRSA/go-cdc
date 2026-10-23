@@ -45,6 +45,25 @@ const (
 	outcomeLabelExists
 )
 
+// String names the outcome for structured logs. The name is stable so operators
+// can filter Stream Load records by severity class.
+func (o loadOutcome) String() string {
+	switch o {
+	case outcomeSuccess:
+		return "success"
+	case outcomeRetryable:
+		return "retryable"
+	case outcomeFatal:
+		return "fatal"
+	case outcomeUnknown:
+		return "unknown"
+	case outcomeLabelExists:
+		return "label-exists"
+	default:
+		return "unexpected"
+	}
+}
+
 // classifyLoad turns one Stream Load response into the retry state machine.
 // HTTP 200 is never sufficient on its own. wantRows is the number of JSON
 // Lines sent in this sub-batch; a success response must confirm that count.

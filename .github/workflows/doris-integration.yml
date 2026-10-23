@@ -16,6 +16,7 @@ on:
       - "test/integration/harness/requirements.txt"
       - "test/integration/fixtures/seed_doris.sql"
       - "test/integration/fixtures/pipeline.doris.yaml.tpl"
+      - "test/integration/fixtures/pipeline.doris.load.yaml.tpl"
       - "test/integration/docker-compose.doris.yml"
       - "test/integration/docker-compose.yml"
       - "test/integration/scripts/doris-*.sh"
@@ -23,6 +24,10 @@ on:
       - "test/integration/scripts/wait-for-doris.sh"
       - "test/integration/scripts/wait-for-mysql.sh"
       - "test/integration/scripts/run-doris-e2e.sh"
+      - "test/integration/scripts/run-doris-scale.sh"
+      - "test/integration/scale/doris_scale_it.py"
+      - "test/integration/scale/doris_schemas.py"
+      - "test/integration/scale/test_doris_schemas.py"
       - "test/integration/scripts/_log.sh"
       - "go.mod"
       - "go.sum"
@@ -41,6 +46,7 @@ on:
       - "test/integration/harness/requirements.txt"
       - "test/integration/fixtures/seed_doris.sql"
       - "test/integration/fixtures/pipeline.doris.yaml.tpl"
+      - "test/integration/fixtures/pipeline.doris.load.yaml.tpl"
       - "test/integration/docker-compose.doris.yml"
       - "test/integration/docker-compose.yml"
       - "test/integration/scripts/doris-*.sh"
@@ -48,6 +54,10 @@ on:
       - "test/integration/scripts/wait-for-doris.sh"
       - "test/integration/scripts/wait-for-mysql.sh"
       - "test/integration/scripts/run-doris-e2e.sh"
+      - "test/integration/scripts/run-doris-scale.sh"
+      - "test/integration/scale/doris_scale_it.py"
+      - "test/integration/scale/doris_schemas.py"
+      - "test/integration/scale/test_doris_schemas.py"
       - "test/integration/scripts/_log.sh"
       - "go.mod"
       - "go.sum"
@@ -59,6 +69,11 @@ on:
         description: "Doris FE/BE image version (2.1.x)"
         type: string
         default: "2.1.8"
+      load_profile:
+        description: "Load tier (rows per table: normal 30000 / full 100000, full also runs heavy scale)"
+        type: choice
+        options: [normal, full]
+        default: full
 
 concurrency:
   group: doris-integration-${{ github.event.pull_request.number || github.ref }}
@@ -66,9 +81,9 @@ concurrency:
 
 jobs:
   doris-e2e:
-    name: MySQL → Doris 2.1.x
+    name: MySQL → Doris 2.1.x (func + load + scale)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 150
     permissions:
       contents: read
     env:
@@ -128,13 +143,56 @@ jobs:
           COMPOSE_PROJECT_NAME: gocdc-doris-ci
         run: bash scripts/doris-up.sh
 
+      - name: Determine load profile
+        # Mirrors CI / Integration: PR / main / release-* get the full tier,
+        # other branch pushes get normal. workflow_dispatch chooses explicitly.
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ inputs.load_profile }}" == "normal" ]]; then
+              echo "LOAD_PROFILE=normal" >> "$GITHUB_ENV"
+              echo "LOAD_ROWS_PER_TABLE=30000" >> "$GITHUB_ENV"
+            else
+              echo "LOAD_PROFILE=full" >> "$GITHUB_ENV"
+              echo "LOAD_ROWS_PER_TABLE=100000" >> "$GITHUB_ENV"
+            fi
+          elif [[ "${{ github.event_name }}" == "pull_request" ]] ||
+               [[ "${{ github.ref }}" == "refs/heads/main" ]] ||
+               [[ "${{ github.ref }}" == "refs/heads/master" ]] ||
+               [[ "${{ github.ref }}" == refs/heads/release-* ]]; then
+            echo "LOAD_PROFILE=full" >> "$GITHUB_ENV"
+            echo "LOAD_ROWS_PER_TABLE=100000" >> "$GITHUB_ENV"
+          else
+            echo "LOAD_PROFILE=normal" >> "$GITHUB_ENV"
+            echo "LOAD_ROWS_PER_TABLE=30000" >> "$GITHUB_ENV"
+          fi
+
       - name: Run MySQL→Doris pipeline + sink Go suite
         env:
           # mysql-down / wait scripts may read this; keep MySQL project for seed host only.
           COMPOSE_PROJECT_NAME: gocdc-doris-mysql-ci
           # Doris containers use their own project; wait-for-doris.sh reads this.
           DORIS_COMPOSE_PROJECT: gocdc-doris-ci
+          # Peak writers; LOAD_PROFILE / LOAD_ROWS_PER_TABLE come from the step above.
+          LOAD_PEAK_SECONDS: "60"
+          LOAD_PEAK_WORKERS: "4"
+          LOAD_PEAK_BATCH: "200"
         run: bash scripts/run-doris-e2e.sh
+
+      - name: Run Doris scale integration
+        # Multi-DB / multi-table stress against the same Doris stack. PRs and
+        # branch pushes take the normal tier (20 tables / 5 DBs / 50k rows);
+        # the heavy tier (50 tables / 10 DBs / 300k rows + hotspot burst/peak)
+        # only runs on a manual dispatch that selects the full tier.
+        env:
+          COMPOSE_PROJECT_NAME: gocdc-doris-mysql-ci
+          DORIS_COMPOSE_PROJECT: gocdc-doris-ci
+          DORIS_SCALE_PROFILE: ${{ (github.event_name == 'workflow_dispatch' && inputs.load_profile == 'full') && 'heavy' || 'normal' }}
+          # Doris commits by batch, so keep the MySQL→MySQL peak shape and let
+          # the report show whether it converges; lower these if it does not.
+          DORIS_SCALE_BURST_ROWS_PER_HOT: "50000"
+          DORIS_SCALE_PEAK_SECONDS: "45"
+          DORIS_SCALE_PEAK_BATCH: "200"
+        run: bash scripts/run-doris-scale.sh "${DORIS_SCALE_PROFILE}"
 
       - name: Capture Doris compose logs
         if: failure()
@@ -152,8 +210,12 @@ jobs:
           name: go-cdc-doris-integration
           path: |
             docs/test/reports/mysql-doris.md
+            docs/test/reports/mysql-doris-scale-normal.md
+            docs/test/reports/mysql-doris-scale-heavy.md
             test/integration/workdir/doris-integration.log
             test/integration/workdir/cdc-doris.log
+            test/integration/workdir/cdc-doris-load.log
+            test/integration/workdir/cdc-doris-scale-*.log
             test/integration/workdir/doris-compose.log
           if-no-files-found: warn
 

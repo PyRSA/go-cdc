@@ -15,11 +15,26 @@ type columnType struct {
 	// Precision and Scale apply to DECIMAL.
 	Precision int
 	Scale     int
-	// Length applies to CHAR and VARCHAR.
+	// Length is the Doris byte capacity of CHAR and VARCHAR.
 	Length int
 	// DateTimePrecision applies to DATETIME.
 	DateTimePrecision int
 }
+
+// mysqlBytesPerChar is the widest UTF-8 encoding of one character in the
+// Basic Multilingual Plane. MySQL measures CHAR/VARCHAR lengths in characters
+// while Doris measures them in bytes, so a Doris column must reserve at least
+// this many bytes per source character; the Flink CDC Doris sink widens by the
+// same factor. Characters outside the BMP (emoji) need four bytes and are
+// rejected by the load instead of being truncated.
+const mysqlBytesPerChar = 3
+
+// Doris per-type string limits in bytes. A widened length above a limit
+// degrades to the next wider type rather than emitting DDL the FE rejects.
+const (
+	dorisCharMaxLength    = 255
+	dorisVarcharMaxLength = 65533
+)
 
 func (t columnType) isJSON() bool { return t.Base == "JSONB" }
 func (t columnType) isNumeric() bool {
@@ -84,12 +99,12 @@ func mapColumnType(raw string) (columnType, error) {
 		if len(args) != 1 || args[0] < 1 {
 			return columnType{}, fmt.Errorf("doris: char type %q needs a positive length", raw)
 		}
-		return columnType{Doris: fmt.Sprintf("CHAR(%d)", args[0]), Base: "CHAR", Length: args[0]}, nil
+		return stringColumnType("CHAR", args[0]), nil
 	case "varchar":
 		if len(args) != 1 || args[0] < 1 {
 			return columnType{}, fmt.Errorf("doris: varchar type %q needs a positive length", raw)
 		}
-		return columnType{Doris: fmt.Sprintf("VARCHAR(%d)", args[0]), Base: "VARCHAR", Length: args[0]}, nil
+		return stringColumnType("VARCHAR", args[0]), nil
 	case "tinytext", "text", "mediumtext", "longtext":
 		return columnType{Doris: "STRING", Base: "STRING"}, nil
 	case "date":
@@ -123,6 +138,22 @@ func mapColumnType(raw string) (columnType, error) {
 	default:
 		return columnType{}, fmt.Errorf("doris: column type %q is not supported", raw)
 	}
+}
+
+// stringColumnType widens a MySQL character length to the Doris byte capacity.
+// A length above the Doris limit for the type degrades to the next wider string
+// type, matching the Flink CDC Doris sink: CHAR becomes VARCHAR and VARCHAR
+// becomes STRING. Length always reports bytes, so compatibility checks compare
+// the required capacity against the live DESC type without rescaling.
+func stringColumnType(base string, chars int) columnType {
+	length := chars * mysqlBytesPerChar
+	if base == "CHAR" && length <= dorisCharMaxLength {
+		return columnType{Doris: fmt.Sprintf("CHAR(%d)", length), Base: "CHAR", Length: length}
+	}
+	if length <= dorisVarcharMaxLength {
+		return columnType{Doris: fmt.Sprintf("VARCHAR(%d)", length), Base: "VARCHAR", Length: length}
+	}
+	return columnType{Doris: "STRING", Base: "STRING"}
 }
 
 // parseMySQLType splits a MySQL column_type into base, unsigned, and
