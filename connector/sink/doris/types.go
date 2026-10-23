@@ -177,6 +177,9 @@ func mapDorisType(raw string) (columnType, error) {
 	switch base {
 	case "TINYINT", "SMALLINT", "INT", "BIGINT", "LARGEINT", "FLOAT", "DOUBLE", "STRING", "DATE", "JSONB", "BOOLEAN":
 		return columnType{Doris: base, Base: base}, nil
+	case "TEXT", "TINYTEXT", "MEDIUMTEXT", "LONGTEXT":
+		// Doris CREATE uses STRING; DESC on 2.1.x often reports the alias TEXT.
+		return columnType{Doris: "STRING", Base: "STRING"}, nil
 	case "DECIMAL":
 		if len(args) != 2 {
 			return columnType{}, fmt.Errorf("doris: target decimal type %q has no precision", raw)

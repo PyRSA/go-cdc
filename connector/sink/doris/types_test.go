@@ -79,6 +79,8 @@ func TestCompatible(t *testing.T) {
 		{"varchar(64)", "VARCHAR(32)", false},
 		{"varchar(32)", "STRING", true},
 		{"text", "STRING", true},
+		{"text", "TEXT", true},
+		{"varchar(32)", "TEXT", true},
 		{"text", "VARCHAR(1024)", false},
 		{"decimal(10,2)", "DECIMAL(12,2)", true},
 		{"decimal(10,2)", "DECIMAL(10,1)", false},
@@ -118,6 +120,8 @@ func TestMapDorisType(t *testing.T) {
 		{"DATEV2", "DATEV2"},
 		{"JSON", "JSONB"},
 		{"STRING", "STRING"},
+		{"TEXT", "STRING"},
+		{"text", "STRING"},
 		{"JSONB", "JSONB"},
 	}
 	for _, tc := range cases {

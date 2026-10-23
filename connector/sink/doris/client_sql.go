@@ -182,6 +182,10 @@ type loadState struct {
 // showLoad reads the latest load job for a label. SHOW LOAD is scoped to one
 // database, so the caller passes the routed database explicitly; the label is
 // validated and escaped before it is inlined.
+//
+// Prefer WHERE Label = …; if Doris returns no row (observed on some 2.1.x
+// Stream Load paths), fall back to scanning recent SHOW LOAD rows and matching
+// the label case-insensitively.
 func (c *sqlClient) showLoad(ctx context.Context, database, label string) (loadState, error) {
 	if database == "" {
 		return loadState{}, fmt.Errorf("sink.doris: show load requires a database")
@@ -189,7 +193,18 @@ func (c *sqlClient) showLoad(ctx context.Context, database, label string) (loadS
 	if !validLabel(label) {
 		return loadState{}, fmt.Errorf("sink.doris: invalid label %q", label)
 	}
-	statement := "SHOW LOAD FROM " + schema.Quote(database) + " WHERE Label = '" + escapeSQLString(label) + "'"
+	state, err := c.showLoadQuery(ctx,
+		"SHOW LOAD FROM "+schema.Quote(database)+" WHERE Label = '"+escapeSQLString(label)+"'",
+		label, true)
+	if err == nil || !errors.Is(err, errLoadNotFound) {
+		return state, err
+	}
+	return c.showLoadQuery(ctx,
+		"SHOW LOAD FROM "+schema.Quote(database),
+		label, false)
+}
+
+func (c *sqlClient) showLoadQuery(ctx context.Context, statement, label string, exactFilter bool) (loadState, error) {
 	rows, err := c.db.QueryContext(ctx, statement)
 	if err != nil {
 		return loadState{}, fmt.Errorf("sink.doris: show load %q: %w", label, err)
@@ -203,9 +218,9 @@ func (c *sqlClient) showLoad(ctx context.Context, database, label string) (loadS
 	for i, name := range columns {
 		lower[i] = strings.ToLower(name)
 	}
-	found := false
 	var out loadState
-	if rows.Next() {
+	found := false
+	for rows.Next() {
 		values := make([]any, len(columns))
 		ptrs := make([]any, len(columns))
 		for i := range values {
@@ -218,8 +233,12 @@ func (c *sqlClient) showLoad(ctx context.Context, database, label string) (loadS
 		for i, name := range lower {
 			row[name] = valueString(values[i])
 		}
+		if !exactFilter && !strings.EqualFold(row["label"], label) {
+			continue
+		}
 		out = loadState{State: row["state"], ErrorMsg: row["errormsg"]}
 		found = true
+		// Keep scanning so the last matching row wins (latest job for the label).
 	}
 	if err := rows.Err(); err != nil {
 		return loadState{}, err
