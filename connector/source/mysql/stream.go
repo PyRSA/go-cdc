@@ -40,7 +40,9 @@ func binlogReadTimeout(heartbeat time.Duration) time.Duration {
 }
 
 // OpenStream builds the binlog reader. Snapshot connections stay on OpenDB.
-func OpenStream(cfg definition.Source) (*canalStream, error) {
+// db is the catalog connection used to recover structured DDL metadata; it may
+// be nil in tests that only exercise row events.
+func OpenStream(cfg definition.Source, db DB) (*canalStream, error) {
 	cc := canal.NewDefaultConfig()
 	cc.Addr = fmt.Sprintf("%s:%d", cfg.Hostname, cfg.Port)
 	cc.User = cfg.Username
@@ -74,7 +76,7 @@ func OpenStream(cfg definition.Source) (*canalStream, error) {
 	}
 	stream := &canalStream{canal: instance, ch: make(chan Commit)}
 	stream.handler = &handler{
-		ch: stream.ch, canal: instance,
+		ch: stream.ch, canal: instance, db: db,
 		include:          compilePatterns(cfg.TablesInclude),
 		exclude:          compilePatterns(cfg.TablesExclude),
 		skipEvents:       cfg.SkipEvents,
@@ -139,6 +141,7 @@ func splitPatterns(raw string) []string {
 
 // ReadFrom starts one dump from pos. GTID wins when it is set.
 func (s *canalStream) ReadFrom(ctx context.Context, pos checkpoint.Position) (<-chan Commit, error) {
+	s.handler.ctx = ctx
 	go func() {
 		defer close(s.ch)
 		var err error
@@ -180,6 +183,8 @@ type handler struct {
 	canal.DummyEventHandler
 	ch               chan Commit
 	canal            *canal.Canal
+	db               DB
+	ctx              context.Context
 	include          []*regexp.Regexp
 	exclude          []*regexp.Regexp
 	allow            map[string]struct{}
@@ -323,6 +328,14 @@ func (h *handler) OnDDL(header *replication.EventHeader, _ mysql.Position, query
 		SourceDatabase: database, SourceTable: change.Table, DDL: text,
 		SourceTSMs: sourceTSMs,
 	}}
+	if change.Action == schema.ActionAddColumn {
+		// The column definition must come from catalog metadata: DDL text alone
+		// cannot express type, nullability, or defaults reliably.
+		if err := h.fillAddColumn(database, &change); err != nil {
+			return err
+		}
+		commit.Event.Change = &change
+	}
 	if change.Action == schema.ActionCreate && h.canal != nil {
 		table, err := h.canal.GetTable(database, change.Table)
 		if err != nil || table == nil {
@@ -337,6 +350,38 @@ func (h *handler) OnDDL(header *replication.EventHeader, _ mysql.Position, query
 	}
 	h.ch <- commit
 	return nil
+}
+
+// fillAddColumn attaches catalog-backed ColumnDef for a single-column ADD.
+// Multi-column ADD leaves ColumnDef nil (sinks reject it). Catalog failures
+// return an error so OnDDL does not emit a Change that only fails later as
+// "no structured column metadata".
+func (h *handler) fillAddColumn(database string, change *schema.Change) error {
+	change.AddColumns = schema.AddColumns(change.DDL)
+	if len(change.AddColumns) != 1 {
+		return nil
+	}
+	if h.db == nil {
+		return fmt.Errorf("source.mysql: cannot load column metadata for ADD COLUMN on %s.%s: no catalog connection",
+			database, change.Table)
+	}
+	ctx := h.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	table, err := h.db.DescribeTable(ctx, database, change.Table)
+	if err != nil {
+		return fmt.Errorf("source.mysql: describe %s.%s for ADD COLUMN: %w", database, change.Table, err)
+	}
+	for i := range table.Columns {
+		if strings.EqualFold(table.Columns[i].Name, change.AddColumns[0]) {
+			column := table.Columns[i]
+			change.ColumnDef = &column
+			return nil
+		}
+	}
+	return fmt.Errorf("source.mysql: column %s not found in %s.%s after ADD COLUMN",
+		change.AddColumns[0], database, change.Table)
 }
 
 func (h *handler) dropEvent() bool {

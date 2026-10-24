@@ -55,6 +55,11 @@ type Capture struct {
 	Project func(database, table string, columns []string) ([]string, error)
 	// SkipSnapshot reports a table whose sink targets are already excluded.
 	SkipSnapshot func(database, table string) bool
+	// ReemitCapturedSchemas reloads the source catalogue for captured tables on
+	// resume and sends Schema messages before binlog replay. Set only for sinks
+	// that need a full source↔target compatibility check on restart (Doris).
+	// MySQL / Kafka / stdout leave this false so resume stays unchanged.
+	ReemitCapturedSchemas bool
 }
 
 // Messages starts capture. The consumer must apply an event before acting on
@@ -136,6 +141,18 @@ func (c *Capture) run(ctx context.Context, out chan<- source.Message) error {
 		}
 		if err := c.limitBinlogTables(ctx); err != nil {
 			return err
+		}
+		if c.ReemitCapturedSchemas {
+			// Non-initial modes have no snapshot phase, so every captured table is
+			// revalidated here. A fresh start has no captured tables and this is a
+			// no-op.
+			live := map[string]struct{}{}
+			for _, id := range c.State.CapturedTables {
+				live[id] = struct{}{}
+			}
+			if err := c.emitCapturedSchemas(ctx, out, live, nil); err != nil {
+				return err
+			}
 		}
 		return c.binlogFrom(ctx, out, pos, nil)
 	}
@@ -316,10 +333,10 @@ func (c *Capture) snapshotTable(ctx context.Context, out chan<- source.Message, 
 		}
 	}
 	if len(pending) == 0 {
-		if len(splits) == 0 {
-			return c.send(ctx, out, source.Message{Schema: cloneTable(table)})
-		}
-		return nil
+		// No splits left: either the table is empty, or a previous run
+		// checkpointed every split before recording Captured. Both resume through
+		// this path, so the catalogue must be announced before any row.
+		return c.send(ctx, out, source.Message{Schema: cloneTable(table)})
 	}
 	if err := c.send(ctx, out, source.Message{Schema: cloneTable(table)}); err != nil {
 		return err

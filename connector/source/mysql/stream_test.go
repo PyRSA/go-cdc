@@ -1,8 +1,15 @@
 package mysql
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/replication"
+
+	"github.com/PyRSA/go-cdc/common/schema"
 )
 
 func TestBinlogReadTimeout(t *testing.T) {
@@ -56,5 +63,103 @@ func TestAdmitCreateWithAllowSet(t *testing.T) {
 	}
 	if h.captured("db", "order") {
 		t.Fatal("config-diff table must remain blocked after unrelated CREATE")
+	}
+}
+
+func addColumnDB() *memDB {
+	db := newMemDB(nil)
+	db.tables = []schema.Table{{
+		Database: "db", Table: "orders",
+		Columns: []schema.Column{
+			{Name: "id", Type: "bigint", Nullable: false},
+			{Name: "note", Type: "varchar(32)", Nullable: true},
+		},
+		PrimaryKeys: []string{"id"},
+	}}
+	return db
+}
+
+func TestFillAddColumnUsesCatalogMetadata(t *testing.T) {
+	h := &handler{db: addColumnDB()}
+	change := schema.Change{
+		Action: schema.ActionAddColumn, Database: "db", Table: "orders",
+		DDL: "ALTER TABLE `db`.`orders` ADD COLUMN `note` varchar(32) NULL",
+	}
+	if err := h.fillAddColumn("db", &change); err != nil {
+		t.Fatal(err)
+	}
+	if len(change.AddColumns) != 1 || change.AddColumns[0] != "note" {
+		t.Fatalf("AddColumns %#v", change.AddColumns)
+	}
+	if change.ColumnDef == nil || change.ColumnDef.Type != "varchar(32)" || !change.ColumnDef.Nullable {
+		t.Fatalf("ColumnDef %#v", change.ColumnDef)
+	}
+}
+
+func TestFillAddColumnWithoutCatalogFails(t *testing.T) {
+	h := &handler{}
+	change := schema.Change{
+		Action: schema.ActionAddColumn, Database: "db", Table: "orders",
+		DDL: "ALTER TABLE db.orders ADD COLUMN note varchar(32) NULL",
+	}
+	err := h.fillAddColumn("db", &change)
+	if err == nil || !strings.Contains(err.Error(), "no catalog connection") {
+		t.Fatalf("err=%v change %#v", err, change)
+	}
+	if len(change.AddColumns) != 1 || change.ColumnDef != nil {
+		t.Fatalf("change %#v", change)
+	}
+}
+
+func TestFillAddColumnDescribeFailurePropagates(t *testing.T) {
+	db := newMemDB(nil)
+	db.describeErr = fmt.Errorf("catalog refused")
+	h := &handler{db: db}
+	change := schema.Change{
+		Action: schema.ActionAddColumn, Database: "db", Table: "orders",
+		DDL: "ALTER TABLE db.orders ADD COLUMN note varchar(32) NULL",
+	}
+	err := h.fillAddColumn("db", &change)
+	if err == nil || !strings.Contains(err.Error(), "catalog refused") {
+		t.Fatalf("err=%v", err)
+	}
+	if change.ColumnDef != nil {
+		t.Fatalf("ColumnDef should stay nil: %#v", change.ColumnDef)
+	}
+}
+
+func TestFillAddColumnMultiAddIsNotGuessed(t *testing.T) {
+	h := &handler{db: addColumnDB()}
+	change := schema.Change{
+		Action: schema.ActionAddColumn, Database: "db", Table: "orders",
+		DDL: "ALTER TABLE db.orders ADD COLUMN note varchar(32), ADD COLUMN extra int",
+	}
+	if err := h.fillAddColumn("db", &change); err != nil {
+		t.Fatal(err)
+	}
+	if len(change.AddColumns) != 2 || change.ColumnDef != nil {
+		t.Fatalf("change %#v", change)
+	}
+}
+
+func TestOnDDLAddColumnCarriesChangeMetadata(t *testing.T) {
+	ch := make(chan Commit, 1)
+	h := &handler{
+		ch: ch, db: addColumnDB(),
+		include: compilePatterns(`db\..*`), allow: map[string]struct{}{"db.orders": {}},
+	}
+	query := &replication.QueryEvent{
+		Schema: []byte("db"),
+		Query:  []byte("ALTER TABLE `db`.`orders` ADD COLUMN `note` varchar(32) NULL"),
+	}
+	if err := h.OnDDL(nil, mysql.Position{}, query); err != nil {
+		t.Fatal(err)
+	}
+	commit := <-ch
+	if commit.Event == nil || commit.Event.Change == nil {
+		t.Fatalf("missing change metadata: %#v", commit)
+	}
+	if commit.Event.Change.ColumnDef == nil || commit.Event.Change.ColumnDef.Name != "note" {
+		t.Fatalf("column definition %#v", commit.Event.Change.ColumnDef)
 	}
 }

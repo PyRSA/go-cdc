@@ -4,12 +4,12 @@
 
 ## 简介
 
-go-cdc 是一个用 YAML 描述同步作业的 CDC 工具：从 MySQL 捕获全量与增量变更，可选变换与路由后，写出到 **标准输出**、**MySQL** 或 **Kafka**（至少一次）。一个进程、一份配置、一个二进制：`go-cdc`。
+go-cdc 是一个用 YAML 描述同步作业的 CDC 工具：从 MySQL 捕获全量与增量变更，可选变换与路由后，写出到 **标准输出**、**MySQL**、**Kafka** 或 **Doris**（Kafka / Doris 至少一次）。一个进程、一份配置、一个二进制：`go-cdc`。
 
 本版本能力：
 
 - MySQL 源（全量快照 + binlog）
-- Stdout Sink（换行 JSON）、MySQL Sink，以及 Kafka Sink（至少一次）
+- Stdout Sink（换行 JSON）、MySQL Sink、Kafka Sink，以及 Doris Sink（UNIQUE KEY + Stream Load，至少一次）
 - 列投影、行过滤、表路由、结构变更策略、文件检查点
 - **注意：** stdout JSON 已改为与 Kafka 共用的 Debezium 风格信封（`source.db` / `source.table`），不再使用顶层 `database` / `table`
 
@@ -95,6 +95,7 @@ make test        # go test -race
   - [MySQL Sink](docs/connectors/mysql-sink.md)
   - [Stdout Sink](docs/connectors/stdout-sink.md)
   - [Kafka Sink](docs/connectors/kafka-sink.md)
+  - [Doris Sink](docs/connectors/doris-sink.md)
 
 **最小示例（MySQL → stdout）：**
 
@@ -106,6 +107,7 @@ make test        # go test -race
 ```
 
 3. MySQL → MySQL 请使用 [`configs/demo-mysql.yaml`](configs/demo-mysql.yaml)。
+4. MySQL → Doris 请使用 [`configs/demo-doris.yaml`](configs/demo-doris.yaml)。
 
 ## 性能
 

@@ -755,3 +755,275 @@ type createError struct{}
 func (createError) Error() string { return "create failed" }
 
 var errCreate = createError{}
+
+// dorisRunnerSink records the Doris-specific Runner calls and can fail either.
+type dorisRunnerSink struct {
+	created   []schema.Table
+	applied   []schema.Change
+	createErr error
+	applyErr  error
+}
+
+func (s *dorisRunnerSink) Open(context.Context) error { return nil }
+func (s *dorisRunnerSink) CreateTable(table schema.Table) error {
+	if s.createErr != nil {
+		return s.createErr
+	}
+	s.created = append(s.created, table)
+	return nil
+}
+func (s *dorisRunnerSink) ApplySchema(change schema.Change) error {
+	if s.applyErr != nil {
+		return s.applyErr
+	}
+	s.applied = append(s.applied, change)
+	return nil
+}
+func (s *dorisRunnerSink) Write([]event.Event) error { return nil }
+func (s *dorisRunnerSink) Flush() error              { return nil }
+func (s *dorisRunnerSink) Close() error              { return nil }
+
+func dorisPipeline() *definition.Pipeline {
+	return &definition.Pipeline{
+		Sink: definition.Sink{Type: "doris", AutoCreate: true},
+		Routes: []definition.Route{{
+			SourceTable: `db\.orders`, SinkTable: "doris.orders",
+		}},
+		Runtime:    definition.Runtime{RouteMode: definition.RouteAllMatch},
+		Checkpoint: definition.Checkpoint{Interval: time.Hour},
+	}
+}
+
+func TestDorisCatalogCreateMarksCapturedOnlyAfterValidation(t *testing.T) {
+	sk := &dorisRunnerSink{}
+	msgs := make(chan source.Message, 2)
+	msgs <- source.Message{
+		Schema: &schema.Table{
+			Database: "db", Table: "orders",
+			Columns: []schema.Column{
+				{Name: "id", Type: "bigint", Nullable: false},
+				{Name: "note", Type: "varchar(32)", Nullable: true},
+			},
+			PrimaryKeys: []string{"id"},
+		},
+		Event: &event.Event{
+			Op: event.OpDDL, Database: "db", Table: "orders",
+			SourceDatabase: "db", SourceTable: "orders",
+			DDL: "CREATE TABLE `db`.`orders` (id bigint primary key)",
+		},
+	}
+	msgs <- source.Message{Position: &source.Position{File: "mysql-bin.000001", Pos: 120}}
+	close(msgs)
+
+	path := filepath.Join(t.TempDir(), "checkpoint.ckpt")
+	if err := Run(context.Background(), dorisPipeline(), msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(sk.created) != 1 || sk.created[0].Database != "doris" || sk.created[0].Table != "orders" {
+		t.Fatalf("created %#v", sk.created)
+	}
+	if len(sk.created[0].PrimaryKeys) != 1 || len(sk.created[0].Columns) != 2 {
+		t.Fatalf("projected table lost metadata: %#v", sk.created[0])
+	}
+	if len(sk.applied) != 0 {
+		t.Fatalf("CREATE must not be re-applied as raw DDL: %#v", sk.applied)
+	}
+	state, err := (checkpoint.Store{Path: path}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.HasCaptured("db.orders") {
+		t.Fatalf("validated CREATE must be captured: %#v", state)
+	}
+	if state.AckedOffset == nil || state.AckedOffset.Pos != 120 {
+		t.Fatalf("checkpoint %#v", state)
+	}
+}
+
+func TestDorisCreateFailureStopsRunBeforeCheckpoint(t *testing.T) {
+	sk := &dorisRunnerSink{createErr: errors.New("doris fe unavailable")}
+	msgs := make(chan source.Message, 2)
+	msgs <- source.Message{Schema: &schema.Table{
+		Database: "db", Table: "orders",
+		Columns:     []schema.Column{{Name: "id", Type: "bigint", Nullable: false}},
+		PrimaryKeys: []string{"id"},
+	}}
+	msgs <- source.Message{Position: &source.Position{File: "mysql-bin.000001", Pos: 130}}
+	close(msgs)
+
+	path := filepath.Join(t.TempDir(), "checkpoint.ckpt")
+	err := Run(context.Background(), dorisPipeline(), msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "doris fe unavailable") {
+		t.Fatalf("err=%v", err)
+	}
+	state, loadErr := (checkpoint.Store{Path: path}).Load()
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if state.HasCaptured("db.orders") {
+		t.Fatalf("failed CREATE must not be captured: %#v", state)
+	}
+	if state.AckedOffset != nil && state.AckedOffset.Pos == 130 {
+		t.Fatalf("checkpoint advanced despite CREATE failure: %#v", state)
+	}
+}
+
+func TestDorisCreateWithoutCatalogFails(t *testing.T) {
+	sk := &dorisRunnerSink{}
+	msgs := make(chan source.Message, 1)
+	msgs <- source.Message{Event: &event.Event{
+		Op: event.OpDDL, Database: "db", Table: "orders",
+		SourceDatabase: "db", SourceTable: "orders",
+		DDL: "CREATE TABLE `db`.`orders` (id bigint primary key)",
+	}}
+	close(msgs)
+
+	path := filepath.Join(t.TempDir(), "checkpoint.ckpt")
+	err := Run(context.Background(), dorisPipeline(), msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "without a source table definition") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestDorisAddColumnForwardsStructuredMetadata(t *testing.T) {
+	sk := &dorisRunnerSink{}
+	msgs := make(chan source.Message, 2)
+	msgs <- source.Message{Event: &event.Event{
+		Op: event.OpDDL, Database: "db", Table: "orders",
+		SourceDatabase: "db", SourceTable: "orders",
+		DDL: "ALTER TABLE `db`.`orders` ADD COLUMN `note` varchar(32) NULL",
+		Change: &schema.Change{
+			Action: schema.ActionAddColumn, AddColumns: []string{"note"},
+			ColumnDef: &schema.Column{Name: "note", Type: "varchar(32)", Nullable: true},
+		},
+	}}
+	msgs <- source.Message{Position: &source.Position{File: "mysql-bin.000001", Pos: 140}}
+	close(msgs)
+
+	pipeline := dorisPipeline()
+	pipeline.Sink.SchemaChange = true
+	pipeline.Sink.SchemaChangeInclude = []string{"add.column"}
+	path := filepath.Join(t.TempDir(), "checkpoint.ckpt")
+	if err := Run(context.Background(), pipeline, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(sk.applied) != 1 {
+		t.Fatalf("applied %#v", sk.applied)
+	}
+	change := sk.applied[0]
+	if change.Database != "doris" || change.Table != "orders" {
+		t.Fatalf("change not routed: %#v", change)
+	}
+	if len(change.AddColumns) != 1 || change.AddColumns[0] != "note" {
+		t.Fatalf("AddColumns lost: %#v", change)
+	}
+	if change.ColumnDef == nil || change.ColumnDef.Type != "varchar(32)" {
+		t.Fatalf("ColumnDef lost: %#v", change.ColumnDef)
+	}
+}
+
+func TestDorisApplySchemaErrorStopsRun(t *testing.T) {
+	sk := &dorisRunnerSink{applyErr: errors.New("schema change rejected")}
+	msgs := make(chan source.Message, 2)
+	msgs <- source.Message{Event: &event.Event{
+		Op: event.OpDDL, Database: "db", Table: "orders",
+		SourceDatabase: "db", SourceTable: "orders",
+		DDL: "ALTER TABLE `db`.`orders` ADD COLUMN `note` varchar(32) NULL",
+		Change: &schema.Change{
+			Action: schema.ActionAddColumn, AddColumns: []string{"note"},
+			ColumnDef: &schema.Column{Name: "note", Type: "varchar(32)", Nullable: true},
+		},
+	}}
+	msgs <- source.Message{Position: &source.Position{File: "mysql-bin.000001", Pos: 150}}
+	close(msgs)
+
+	pipeline := dorisPipeline()
+	pipeline.Sink.SchemaChange = true
+	pipeline.Sink.SchemaChangeInclude = []string{"add.column"}
+	path := filepath.Join(t.TempDir(), "checkpoint.ckpt")
+	err := Run(context.Background(), pipeline, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "schema change rejected") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestDorisUnsupportedDDLIsFatalWhenEnabled(t *testing.T) {
+	sk := &dorisRunnerSink{}
+	msgs := make(chan source.Message, 1)
+	msgs <- source.Message{Event: &event.Event{
+		Op: event.OpDDL, Database: "db", Table: "orders",
+		SourceDatabase: "db", SourceTable: "orders",
+		DDL: "DROP TABLE `db`.`orders`",
+	}}
+	close(msgs)
+
+	pipeline := dorisPipeline()
+	pipeline.Sink.DropTruncate = true
+	path := filepath.Join(t.TempDir(), "checkpoint.ckpt")
+	err := Run(context.Background(), pipeline, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "not supported in v1") {
+		t.Fatalf("err=%v", err)
+	}
+	if len(sk.applied) != 0 {
+		t.Fatalf("unsupported DDL must not reach the sink: %#v", sk.applied)
+	}
+}
+
+func runDorisDDL(t *testing.T, ddl string, mutate func(*definition.Pipeline)) error {
+	t.Helper()
+	sk := &dorisRunnerSink{}
+	msgs := make(chan source.Message, 1)
+	msgs <- source.Message{Event: &event.Event{
+		Op: event.OpDDL, Database: "db", Table: "orders",
+		SourceDatabase: "db", SourceTable: "orders",
+		DDL: ddl,
+	}}
+	close(msgs)
+	pipeline := dorisPipeline()
+	if mutate != nil {
+		mutate(pipeline)
+	}
+	path := filepath.Join(t.TempDir(), "checkpoint.ckpt")
+	return Run(context.Background(), pipeline, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil)
+}
+
+func TestDorisPrimaryKeyChangeIsFatal(t *testing.T) {
+	// DROP PRIMARY KEY classifies as ActionIndex with Execute=false; silently
+	// skipping it would leave the sink keyed differently from the source.
+	err := runDorisDDL(t, "ALTER TABLE `db`.`orders` DROP PRIMARY KEY", nil)
+	if err == nil || !strings.Contains(err.Error(), "primary key change") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestDorisSecondaryIndexChangeIsIgnored(t *testing.T) {
+	// The Doris target never carries secondary indexes, so their changes are a
+	// no-op rather than an error.
+	for _, ddl := range []string{
+		"ALTER TABLE `db`.`orders` ADD INDEX idx_name (`name`)",
+		"ALTER TABLE `db`.`orders` DROP INDEX idx_name",
+		"CREATE INDEX idx_name ON `db`.`orders` (`name`)",
+	} {
+		if err := runDorisDDL(t, ddl, nil); err != nil {
+			t.Fatalf("%s: %v", ddl, err)
+		}
+	}
+}
+
+func TestDorisRenameTableIsFatal(t *testing.T) {
+	// RENAME cannot be followed on the target and must not be skipped just
+	// because drop.truncate is disabled.
+	err := runDorisDDL(t, "RENAME TABLE `db`.`orders` TO `db`.`orders_old`", nil)
+	if err == nil || !strings.Contains(err.Error(), "not supported in v1") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestDorisDropTableSkippedWhenDropTruncateDisabled(t *testing.T) {
+	err := runDorisDDL(t, "DROP TABLE `db`.`orders`", func(pipe *definition.Pipeline) {
+		pipe.Sink.DropTruncate = false
+	})
+	if err != nil {
+		t.Fatalf("explicit opt-out must not fail: %v", err)
+	}
+}

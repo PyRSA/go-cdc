@@ -1,0 +1,243 @@
+name: CI / Doris Integration
+
+on:
+  # Doris-specific changes only. Docs and demo configs do not start the heavy
+  # FE+BE pair; unit tests remain covered by CI / Integration.
+  push:
+    paths:
+      - "connector/sink/doris/**"
+      - "composer/**"
+      - "common/**"
+      - "connector/source/mysql/**"
+      - "cmd/go-cdc/**"
+      - "test/integration/doris/**"
+      - "test/integration/harness/doris_it.py"
+      - "test/integration/harness/config.py"
+      - "test/integration/harness/logutil.py"
+      - "test/integration/harness/sysstat.py"
+      - "test/integration/harness/__init__.py"
+      - "test/integration/harness/requirements.txt"
+      - "test/integration/fixtures/seed_doris.sql"
+      - "test/integration/fixtures/pipeline.doris.yaml.tpl"
+      - "test/integration/fixtures/pipeline.doris.load.yaml.tpl"
+      - "test/integration/docker-compose.doris.yml"
+      - "test/integration/docker-compose.yml"
+      - "test/integration/scripts/doris-*.sh"
+      - "test/integration/scripts/mysql-*.sh"
+      - "test/integration/scripts/wait-for-doris.sh"
+      - "test/integration/scripts/wait-for-mysql.sh"
+      - "test/integration/scripts/run-doris-e2e.sh"
+      - "test/integration/scripts/run-doris-scale.sh"
+      - "test/integration/scale/doris_scale_it.py"
+      - "test/integration/scale/doris_schemas.py"
+      - "test/integration/scale/test_doris_schemas.py"
+      - "test/integration/scale/test_doris_scale_pipeline.py"
+      - "test/integration/scripts/_log.sh"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/doris-integration.yml"
+      - "!**/*.md"
+  pull_request:
+    paths:
+      - "connector/sink/doris/**"
+      - "composer/**"
+      - "common/**"
+      - "connector/source/mysql/**"
+      - "cmd/go-cdc/**"
+      - "test/integration/doris/**"
+      - "test/integration/harness/doris_it.py"
+      - "test/integration/harness/config.py"
+      - "test/integration/harness/logutil.py"
+      - "test/integration/harness/sysstat.py"
+      - "test/integration/harness/__init__.py"
+      - "test/integration/harness/requirements.txt"
+      - "test/integration/fixtures/seed_doris.sql"
+      - "test/integration/fixtures/pipeline.doris.yaml.tpl"
+      - "test/integration/fixtures/pipeline.doris.load.yaml.tpl"
+      - "test/integration/docker-compose.doris.yml"
+      - "test/integration/docker-compose.yml"
+      - "test/integration/scripts/doris-*.sh"
+      - "test/integration/scripts/mysql-*.sh"
+      - "test/integration/scripts/wait-for-doris.sh"
+      - "test/integration/scripts/wait-for-mysql.sh"
+      - "test/integration/scripts/run-doris-e2e.sh"
+      - "test/integration/scripts/run-doris-scale.sh"
+      - "test/integration/scale/doris_scale_it.py"
+      - "test/integration/scale/doris_schemas.py"
+      - "test/integration/scale/test_doris_schemas.py"
+      - "test/integration/scale/test_doris_scale_pipeline.py"
+      - "test/integration/scripts/_log.sh"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/doris-integration.yml"
+      - "!**/*.md"
+  workflow_dispatch:
+    inputs:
+      doris_version:
+        description: "Doris FE/BE image version (2.1.x)"
+        type: string
+        default: "2.1.8"
+      load_profile:
+        description: "Load tier (rows per table: normal 30000 / full 100000, full also runs heavy scale)"
+        type: choice
+        options: [normal, full]
+        default: full
+
+concurrency:
+  group: doris-integration-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  doris-e2e:
+    name: MySQL → Doris 2.1.x (func + load + scale)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    env:
+      DORIS_VERSION: ${{ github.event.inputs.doris_version || '2.1.8' }}
+      MYSQL_HOST: 127.0.0.1
+      MYSQL_PORT: "13306"
+      MYSQL_TAG: "80"
+      DORIS_HOST: 127.0.0.1
+      DORIS_HTTP_PORT: "8030"
+      DORIS_SQL_PORT: "9030"
+      DORIS_USER: root
+      DORIS_PASSWORD: ""
+      DORIS_REPLICATION_NUM: "1"
+      # Keep compose for artifact capture; Tear down is the last step.
+      KEEP_IT_MYSQL: "1"
+      KEEP_IT_DORIS: "1"
+    defaults:
+      run:
+        working-directory: test/integration
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet unit and Doris integration tests
+        # Compile-checks the doris_integration suite before the heavy FE+BE pair
+        # starts, so a broken test file fails in seconds instead of after the
+        # cluster boots. golangci-lint does not see build-tagged files.
+        working-directory: ${{ github.workspace }}
+        run: |
+          go vet ./...
+          go vet -tags doris_integration ./test/integration/doris/
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install MySQL client + harness deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y mysql-client
+          python3 -m pip install -r harness/requirements.txt
+
+      - name: Raise kernel limits for Doris FE+BE
+        # FE (BerkeleyDB JE) needs a large inotify watch budget; BE needs
+        # vm.max_map_count. Runners have passwordless sudo.
+        run: |
+          sudo sysctl -w vm.max_map_count=2000000
+          sudo sysctl -w fs.inotify.max_user_watches=1048576
+          sudo sysctl -w fs.inotify.max_user_instances=8192
+
+      - name: Start MySQL (binlog source)
+        env:
+          # Separate compose project from Doris FE/BE.
+          COMPOSE_PROJECT_NAME: gocdc-doris-mysql-ci
+        run: bash scripts/mysql-up.sh
+
+      - name: Start Doris FE+BE
+        env:
+          COMPOSE_PROJECT_NAME: gocdc-doris-ci
+        run: bash scripts/doris-up.sh
+
+      - name: Determine load profile
+        # Mirrors CI / Integration: PR / main / release-* get the full tier,
+        # other branch pushes get normal. workflow_dispatch chooses explicitly.
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ inputs.load_profile }}" == "normal" ]]; then
+              echo "LOAD_PROFILE=normal" >> "$GITHUB_ENV"
+              echo "LOAD_ROWS_PER_TABLE=30000" >> "$GITHUB_ENV"
+            else
+              echo "LOAD_PROFILE=full" >> "$GITHUB_ENV"
+              echo "LOAD_ROWS_PER_TABLE=100000" >> "$GITHUB_ENV"
+            fi
+          elif [[ "${{ github.event_name }}" == "pull_request" ]] ||
+               [[ "${{ github.ref }}" == "refs/heads/main" ]] ||
+               [[ "${{ github.ref }}" == "refs/heads/master" ]] ||
+               [[ "${{ github.ref }}" == refs/heads/release-* ]]; then
+            echo "LOAD_PROFILE=full" >> "$GITHUB_ENV"
+            echo "LOAD_ROWS_PER_TABLE=100000" >> "$GITHUB_ENV"
+          else
+            echo "LOAD_PROFILE=normal" >> "$GITHUB_ENV"
+            echo "LOAD_ROWS_PER_TABLE=30000" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run MySQL→Doris pipeline + sink Go suite
+        env:
+          # mysql-down / wait scripts may read this; keep MySQL project for seed host only.
+          COMPOSE_PROJECT_NAME: gocdc-doris-mysql-ci
+          # Doris containers use their own project; wait-for-doris.sh reads this.
+          DORIS_COMPOSE_PROJECT: gocdc-doris-ci
+          # Peak writers; LOAD_PROFILE / LOAD_ROWS_PER_TABLE come from the step above.
+          LOAD_PEAK_SECONDS: "60"
+          LOAD_PEAK_WORKERS: "4"
+          LOAD_PEAK_BATCH: "200"
+        run: bash scripts/run-doris-e2e.sh
+
+      - name: Run Doris scale integration
+        # Multi-DB / multi-table stress against the same Doris stack. PRs and
+        # branch pushes take the normal tier (20 tables / 5 DBs / 50k rows);
+        # the heavy tier (50 tables / 10 DBs / 300k rows + hotspot burst/peak)
+        # only runs on a manual dispatch that selects the full tier.
+        env:
+          COMPOSE_PROJECT_NAME: gocdc-doris-mysql-ci
+          DORIS_COMPOSE_PROJECT: gocdc-doris-ci
+          DORIS_SCALE_PROFILE: ${{ (github.event_name == 'workflow_dispatch' && inputs.load_profile == 'full') && 'heavy' || 'normal' }}
+          # Doris commits by batch, so keep the MySQL→MySQL peak shape and let
+          # the report show whether it converges; lower these if it does not.
+          DORIS_SCALE_BURST_ROWS_PER_HOT: "50000"
+          DORIS_SCALE_PEAK_SECONDS: "45"
+          DORIS_SCALE_PEAK_BATCH: "200"
+        run: bash scripts/run-doris-scale.sh "${DORIS_SCALE_PROFILE}"
+
+      - name: Capture Doris compose logs
+        if: failure()
+        env:
+          COMPOSE_PROJECT_NAME: gocdc-doris-ci
+        run: |
+          mkdir -p workdir
+          docker compose -f docker-compose.doris.yml logs --no-color --tail=500 \
+            > workdir/doris-compose.log || true
+
+      - name: Upload Doris integration logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-cdc-doris-integration
+          path: |
+            docs/test/reports/mysql-doris.md
+            docs/test/reports/mysql-doris-scale-normal.md
+            docs/test/reports/mysql-doris-scale-heavy.md
+            test/integration/workdir/doris-integration.log
+            test/integration/workdir/cdc-doris.log
+            test/integration/workdir/cdc-doris-load.log
+            test/integration/workdir/cdc-doris-scale-*.log
+            test/integration/workdir/doris-compose.log
+          if-no-files-found: warn
+
+      - name: Tear down
+        if: always()
+        run: |
+          COMPOSE_PROJECT_NAME=gocdc-doris-ci bash scripts/doris-down.sh || true
+          COMPOSE_PROJECT_NAME=gocdc-doris-mysql-ci bash scripts/mysql-down.sh || true
