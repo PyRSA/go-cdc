@@ -113,10 +113,10 @@ func TestEncodeBatchRejectsBadValues(t *testing.T) {
 			match: "invalid JSON value",
 		},
 		{
-			name: "binary value",
+			name: "text value with invalid UTF-8",
 			item: event.Event{Op: event.OpCreate, Database: "db", Table: "orders",
-				Columns: []string{"id", "note"}, After: map[string]any{"id": int64(1), "note": []byte{0x01}}},
-			match: "binary value",
+				Columns: []string{"id", "note"}, After: map[string]any{"id": int64(1), "note": []byte{0xff, 0xfe}}},
+			match: "not valid UTF-8",
 		},
 		{
 			name: "invalid numeric value",
@@ -165,6 +165,30 @@ func TestEncodeValueDateAndDateTime(t *testing.T) {
 	text := string(body)
 	if !strings.Contains(text, `"d":"2024-05-06"`) || !strings.Contains(text, `"dt":"2024-05-06 07:08:09.123456"`) {
 		t.Fatalf("time encoding: %s", text)
+	}
+}
+
+// A TEXT / LONGTEXT column arrives as a string from the snapshot reader and as
+// a byte slice from the binlog decoder, because both share the BLOB protocol
+// type. Doris stores either shape as STRING, so the bytes are written verbatim
+// and only bytes that are not UTF-8 fail the load.
+func TestEncodeValueTextFromBytes(t *testing.T) {
+	column := schema.Column{Name: "content", Type: "text"}
+	value, err := encodeValue([]byte("filler-C01T001I7|"), column)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text, ok := value.(string); !ok || text != "filler-C01T001I7|" {
+		t.Fatalf("got %T %v", value, value)
+	}
+	if _, err := encodeValue([]byte{0xff, 0xfe}, column); err == nil || !strings.Contains(err.Error(), "not valid UTF-8") {
+		t.Fatalf("invalid UTF-8 must fail, err=%v", err)
+	}
+	// A column type the sink cannot classify keeps rejecting bytes: that is the
+	// only remaining path to the binary error and it must not silently pass.
+	if _, err := encodeValue([]byte{0x01}, schema.Column{Name: "raw", Type: "binary(16)"}); err == nil ||
+		!strings.Contains(err.Error(), "binary value") {
+		t.Fatalf("unmapped column type must reject bytes, err=%v", err)
 	}
 }
 

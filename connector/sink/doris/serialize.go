@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/PyRSA/go-cdc/common/event"
 	"github.com/PyRSA/go-cdc/common/schema"
@@ -164,6 +165,17 @@ func encodeValue(value any, column schema.Column) (any, error) {
 				return nil, fmt.Errorf("invalid JSON value")
 			}
 			return json.RawMessage(typed), nil
+		}
+		if class == classString {
+			// go-mysql decodes TEXT / LONGTEXT as byte slices because they share the
+			// BLOB protocol type, while the snapshot path returns a string, so one
+			// column arrives in two shapes. Doris stores both as STRING; the bytes
+			// must be UTF-8, and invalid bytes fail instead of being replaced with
+			// U+FFFD by the JSON encoder.
+			if !utf8.Valid(typed) {
+				return nil, fmt.Errorf("column value is not valid UTF-8")
+			}
+			return string(typed), nil
 		}
 		return nil, fmt.Errorf("binary value is not supported in v1")
 	case string:
