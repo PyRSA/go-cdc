@@ -29,13 +29,18 @@ const loadTimeoutGrace = 30 * time.Second
 // loadResponse is the subset of the Doris Stream Load JSON response that the
 // state machine uses. Unknown Status / missing ExistingJobStatus go through
 // SHOW LOAD; a Success response with bad row counts is fatal, not unknown.
+//
+// The row counters are pointers so that "Doris did not send this field" (nil)
+// stays distinguishable from "Doris reported 0" (*0). The 2.1 manual documents
+// what each counter means but does not promise that every status carries them,
+// and a plain int64 would make an omitted counter look like a reported zero.
 type loadResponse struct {
 	Status             string `json:"Status"`
 	Message            string `json:"Message"`
 	Label              string `json:"Label"`
-	NumberTotalRows    int64  `json:"NumberTotalRows"`
-	NumberLoadedRows   int64  `json:"NumberLoadedRows"`
-	NumberFilteredRows int64  `json:"NumberFilteredRows"`
+	NumberTotalRows    *int64 `json:"NumberTotalRows"`
+	NumberLoadedRows   *int64 `json:"NumberLoadedRows"`
+	NumberFilteredRows *int64 `json:"NumberFilteredRows"`
 	ErrorURL           string `json:"ErrorURL"`
 	ExistingJobStatus  string `json:"ExistingJobStatus"`
 }

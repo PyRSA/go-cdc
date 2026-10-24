@@ -1,6 +1,7 @@
 package doris
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -73,6 +74,39 @@ func TestStringLengthsAreDorisByteCapacities(t *testing.T) {
 		if mapped.Doris != tc.wantDoris || mapped.Length != tc.wantLength {
 			t.Fatalf("%s: got %s length=%d, want %s length=%d",
 				tc.raw, mapped.Doris, mapped.Length, tc.wantDoris, tc.wantLength)
+		}
+	}
+}
+
+// TestAutoCreatedTypeAcceptsItsOwnDesc pins the invariant behind the Doris
+// 2.1.8 CI failures: the length the sink emits in CREATE TABLE / ADD COLUMN is
+// the same length DESC reports back, so a target the sink just created must
+// validate. Comparing the source length directly against the DDL length (32 vs
+// 96) rejected a table the sink itself had created.
+func TestAutoCreatedTypeAcceptsItsOwnDesc(t *testing.T) {
+	for _, raw := range []string{"varchar(32)", "varchar(64)", "varchar(21844)", "char(8)", "char(300)", "varchar(30000)"} {
+		source, err := mapColumnType(raw)
+		if err != nil {
+			t.Fatalf("%s: %v", raw, err)
+		}
+		// Doris 2.1.8 DESC reports the type in lowercase.
+		desc := strings.ToLower(source.Doris)
+		reported, err := mapDorisType(desc)
+		if err != nil {
+			t.Fatalf("%s: DESC type %s: %v", raw, desc, err)
+		}
+		if !compatible(source, desc) {
+			t.Fatalf("%s: a target created as %s must accept DESC %s", raw, source.Doris, desc)
+		}
+		if reported.Length != source.Length {
+			t.Fatalf("%s: DDL length %d and DESC length %d disagree", raw, source.Length, reported.Length)
+		}
+		if source.Base == "STRING" {
+			continue
+		}
+		narrower := fmt.Sprintf("%s(%d)", source.Base, source.Length-1)
+		if compatible(source, narrower) {
+			t.Fatalf("%s: %s is one byte too narrow and must be rejected", raw, narrower)
 		}
 	}
 }

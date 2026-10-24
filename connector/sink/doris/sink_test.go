@@ -1192,9 +1192,11 @@ func TestSinkWriteHTTP400IsFatalWhenLabelMissing(t *testing.T) {
 
 func TestSinkWritePublishTimeoutCompletesWithoutRetry(t *testing.T) {
 	var requests int
+	var labels []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++
 		label := r.Header.Get("label")
+		labels = append(labels, label)
 		_, _ = io.WriteString(w, fmt.Sprintf(
 			`{"Status":"Publish Timeout","Label":%q,"NumberTotalRows":1,"NumberLoadedRows":1}`, label))
 	}))
@@ -1211,6 +1213,44 @@ func TestSinkWritePublishTimeoutCompletesWithoutRetry(t *testing.T) {
 	}
 	if len(f.loads) != 0 {
 		t.Fatalf("Publish Timeout must not query SHOW LOAD: %#v", f.loads)
+	}
+	// The batch that is still publishing owns its label: the next batch must
+	// not reuse it, or Doris would answer Label Already Exists for new rows.
+	if err := s.Write([]event.Event{createEvent(2, "b")}); err != nil {
+		t.Fatal(err)
+	}
+	if len(labels) != 2 || labels[0] == labels[1] {
+		t.Fatalf("each batch needs its own label: %#v", labels)
+	}
+}
+
+// TestSinkWritePublishTimeoutWithShortfallFails pins that a Publish Timeout
+// cannot launder a shortfall: the status says the load completed, but the row
+// counters it reports still have to account for the batch. A reported loss is
+// fatal, so the batch is neither reloaded under the same label nor resolved
+// through SHOW LOAD, and Write fails before the runner can advance a checkpoint.
+func TestSinkWritePublishTimeoutWithShortfallFails(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		_, _ = io.WriteString(w, fmt.Sprintf(
+			`{"Status":"Publish Timeout","Label":%q,"NumberTotalRows":2,"NumberLoadedRows":1,"NumberFilteredRows":1}`,
+			r.Header.Get("label")))
+	}))
+	defer server.Close()
+
+	f := newFakeSQL()
+	s := testSink(t, server, f, definition.Sink{Type: "doris", MaxRetries: 3})
+	s.cacheTable(validateSource())
+	err := s.Write([]event.Event{createEvent(1, "a"), createEvent(2, "b")})
+	if err == nil || !strings.Contains(err.Error(), "filtered 1 rows") {
+		t.Fatalf("err=%v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("a reported shortfall must not be reloaded: %d", requests)
+	}
+	if len(f.loads) != 0 {
+		t.Fatalf("a definitive shortfall must not fall through to SHOW LOAD: %#v", f.loads)
 	}
 }
 
@@ -1443,6 +1483,135 @@ func TestSinkApplySchemaWaitTimeoutFails(t *testing.T) {
 	}
 	if err := s.ApplySchema(change); err == nil || !strings.Contains(err.Error(), "was not confirmed") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestSinkApplySchemaAcceptsColumnThatAppearedDespiteExecError(t *testing.T) {
+	old := schemaChangePollInterval
+	schemaChangePollInterval = time.Millisecond
+	t.Cleanup(func() { schemaChangePollInterval = old })
+
+	// The FE committed the ALTER and the response was lost. The column only shows
+	// up on a later DESC, so ApplySchema must resolve it through the same bounded
+	// re-read CreateTable uses instead of failing a schema change that already ran.
+	f := newFakeSQL()
+	f.columns["db.orders"] = validTarget()
+	f.execErrHook = func(f *fakeSQL, statement string) error {
+		if strings.Contains(statement, "ADD COLUMN") {
+			return fmt.Errorf("sink.doris: read tcp 127.0.0.1:9030: i/o timeout")
+		}
+		return nil
+	}
+	descs := 0
+	f.descHook = func(f *fakeSQL, id string) {
+		descs++
+		if descs == 2 {
+			f.columns[id] = append(f.columns[id], descColumn{Name: "note", Type: "VARCHAR(96)", Nullable: true})
+		}
+	}
+	server := successServer(t, &[]string{})
+	s := testSink(t, server, f, definition.Sink{
+		Type: "doris", SchemaChange: true, SchemaChangeInclude: []string{"add.column"},
+		SchemaChangeWait: 500 * time.Millisecond,
+	})
+	s.cacheTable(validateSource())
+
+	change := schema.Change{
+		Action: schema.ActionAddColumn, Database: "db", Table: "orders",
+		AddColumns: []string{"note"}, ColumnDef: &schema.Column{Name: "note", Type: "varchar(32)", Nullable: true},
+	}
+	if err := s.ApplySchema(change); err != nil {
+		t.Fatalf("an ADD COLUMN that took effect must not fail: %v", err)
+	}
+	if !hasColumn(s.tables["db.orders"], "note") {
+		t.Fatalf("the resolved column must be cached: %#v", s.tables["db.orders"])
+	}
+	if statements := f.statements(); len(statements) != 1 {
+		t.Fatalf("a resolved ADD COLUMN must not be re-sent: %#v", statements)
+	}
+}
+
+func TestSinkApplySchemaFailsWhenColumnNeverAppears(t *testing.T) {
+	old := schemaChangePollInterval
+	schemaChangePollInterval = time.Millisecond
+	t.Cleanup(func() { schemaChangePollInterval = old })
+
+	// A real DDL failure must stay fatal, keep the original error, and leave the
+	// cache untouched: the column is not usable just because Exec returned late.
+	f := newFakeSQL()
+	f.columns["db.orders"] = validTarget()
+	f.execErrHook = func(f *fakeSQL, statement string) error {
+		if strings.Contains(statement, "ADD COLUMN") {
+			return fmt.Errorf("sink.doris: Error 1105 (HY000): backend unavailable")
+		}
+		return nil
+	}
+	server := successServer(t, &[]string{})
+	s := testSink(t, server, f, definition.Sink{
+		Type: "doris", SchemaChange: true, SchemaChangeInclude: []string{"add.column"},
+		SchemaChangeWait: 30 * time.Millisecond,
+	})
+	s.cacheTable(validateSource())
+
+	change := schema.Change{
+		Action: schema.ActionAddColumn, Database: "db", Table: "orders",
+		AddColumns: []string{"note"}, ColumnDef: &schema.Column{Name: "note", Type: "varchar(32)", Nullable: true},
+	}
+	err := s.ApplySchema(change)
+	if err == nil {
+		t.Fatal("a column that never appears must fail")
+	}
+	for _, want := range []string{"note", "did not take effect", "backend unavailable", "never became visible"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error must mention %q: %v", want, err)
+		}
+	}
+	if hasColumn(s.tables["db.orders"], "note") {
+		t.Fatalf("a failed ADD COLUMN must not be cached: %#v", s.tables["db.orders"])
+	}
+}
+
+func TestSinkCreateTableDoesNotReportStaleDescFailure(t *testing.T) {
+	old := schemaChangePollInterval
+	schemaChangePollInterval = time.Millisecond
+	t.Cleanup(func() { schemaChangePollInterval = old })
+
+	// The structure is unreadable for the first poll and readable afterwards,
+	// while the column never appears. Reporting the earlier read failure next to
+	// "DESC succeeded" would contradict itself and send operators after the FE.
+	f := newFakeSQL()
+	f.columns["db.orders"] = validTarget()
+	f.execErrHook = func(f *fakeSQL, statement string) error {
+		if strings.Contains(statement, "ADD COLUMN") {
+			delete(f.columns, "db.orders")
+			return fmt.Errorf("sink.doris: Error 1105 (HY000): backend unavailable")
+		}
+		return nil
+	}
+	descs := 0
+	f.descHook = func(f *fakeSQL, id string) {
+		descs++
+		if descs == 3 {
+			f.columns[id] = validTarget()
+		}
+	}
+	server := successServer(t, &[]string{})
+	s := testSink(t, server, f, definition.Sink{
+		Type: "doris", SchemaChange: true, SchemaChangeInclude: []string{"add.column"},
+		SchemaChangeWait: 50 * time.Millisecond,
+	})
+	source := validateSource()
+	source.Columns = append(source.Columns, schema.Column{Name: "note", Type: "varchar(32)", Nullable: true})
+
+	err := s.CreateTable(source)
+	if err == nil {
+		t.Fatal("a column that never appears must fail")
+	}
+	if !strings.Contains(err.Error(), "never became visible") {
+		t.Fatalf("error must report the live condition: %v", err)
+	}
+	if strings.Contains(err.Error(), "structure re-read failed") {
+		t.Fatalf("a recovered DESC must not be reported as unreadable: %v", err)
 	}
 }
 

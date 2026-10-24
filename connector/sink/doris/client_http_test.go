@@ -1,6 +1,8 @@
 package doris
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -86,6 +88,41 @@ func TestStreamLoadRequest(t *testing.T) {
 	}
 }
 
+// TestLoadResponseDistinguishesMissingCountersFromZero pins the decode contract
+// the state machine relies on: a counter the FE omits decodes to nil, which
+// classifyLoad treats as unverifiable, while an explicit 0 decodes to a value
+// and is read as a reported shortfall.
+func TestLoadResponseDistinguishesMissingCountersFromZero(t *testing.T) {
+	var omitted loadResponse
+	if err := json.Unmarshal([]byte(`{"Status":"Publish Timeout","Label":"l1"}`), &omitted); err != nil {
+		t.Fatal(err)
+	}
+	if omitted.NumberTotalRows != nil || omitted.NumberLoadedRows != nil || omitted.NumberFilteredRows != nil {
+		t.Fatalf("an omitted counter must decode to nil: %#v", omitted)
+	}
+
+	var zero loadResponse
+	body := `{"Status":"Publish Timeout","Label":"l1","NumberTotalRows":0,"NumberLoadedRows":0,"NumberFilteredRows":0}`
+	if err := json.Unmarshal([]byte(body), &zero); err != nil {
+		t.Fatal(err)
+	}
+	if zero.NumberTotalRows == nil || zero.NumberLoadedRows == nil || zero.NumberFilteredRows == nil {
+		t.Fatalf("an explicit zero must decode to a value: %#v", zero)
+	}
+	if *zero.NumberTotalRows != 0 || *zero.NumberLoadedRows != 0 || *zero.NumberFilteredRows != 0 {
+		t.Fatalf("explicit zeros decoded as %d/%d/%d", *zero.NumberTotalRows, *zero.NumberLoadedRows, *zero.NumberFilteredRows)
+	}
+
+	// A JSON null is not a report either: Doris sends nothing usable there.
+	var null loadResponse
+	if err := json.Unmarshal([]byte(`{"Status":"Publish Timeout","Label":"l1","NumberLoadedRows":null}`), &null); err != nil {
+		t.Fatal(err)
+	}
+	if null.NumberLoadedRows != nil {
+		t.Fatalf("a null counter must decode to nil: %#v", null)
+	}
+}
+
 // TestClientDeadlineOutlastsDorisTimeout pins the separation between the Doris
 // Stream Load budget and the HTTP deadline: Doris answers only after its own
 // timeout expires, so an equal client deadline would cancel the request exactly
@@ -153,6 +190,41 @@ func TestStreamLoadInvalidJSONIsUnknown(t *testing.T) {
 	var unknown *unknownResultError
 	if !errors.As(err, &unknown) {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+// TestStreamLoadCancelledContextIsUnknown pins cancellation to `unknown` rather
+// than success or failure: the FE may have committed the transaction before the
+// client gave up, so the label must be resolved through SHOW LOAD instead of
+// being retried under a new one. The call has to return on cancellation itself,
+// not after the full Doris-side timeout.
+func TestStreamLoadCancelledContextIsUnknown(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	defer server.Close()
+	defer close(release)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	client := newTestHTTP(t, server)
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	_, err := client.streamLoad(ctx, "db", "orders", "l1", []byte("{}\n"))
+	var unknown *unknownResultError
+	if !errors.As(err, &unknown) {
+		t.Fatalf("err=%v", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation must stay in the error chain: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("cancellation took %s", elapsed)
 	}
 }
 

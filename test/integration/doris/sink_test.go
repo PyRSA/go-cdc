@@ -51,6 +51,12 @@ func TestIntegrationAutoCreateAndUniqueKeyLifecycle(t *testing.T) {
 	if err := sk.CreateTable(table); err != nil {
 		t.Fatalf("create target table: %v", err)
 	}
+	// varchar(64) reserves three bytes per character, so the auto-created column
+	// is VARCHAR(192) and DESC must report it in the same unit. This is the live
+	// proof that auto-create and target validation share one length rule.
+	if got := describeColumns(t, db, database, "orders"); !strings.EqualFold(got["name"], "varchar(192)") {
+		t.Fatalf("auto-created name type=%q want varchar(192); DESC and mapColumnType disagree on the unit", got["name"])
+	}
 
 	writeEvents(t, sk, orderEvent(event.OpRead, database, "orders", 1,
 		"snapshot", "12.34", `{"a":1}`, "2026-10-22 10:11:12.123456"))
@@ -69,9 +75,16 @@ func TestIntegrationAutoCreateAndUniqueKeyLifecycle(t *testing.T) {
 		t.Fatalf("payload=%v", payload)
 	}
 
-	// A full UPDATE must replace the UNIQUE KEY row, not append.
-	writeEvents(t, sk, orderEvent(event.OpUpdate, database, "orders", 1,
-		"updated", "99.50", `{"a":2}`, "2026-10-22 10:11:12.123456"))
+	// A full UPDATE must replace the UNIQUE KEY row, not append. The Before image
+	// is what lets the sink prove the primary key did not change: Doris v1 cannot
+	// withdraw the old row, so an UPDATE without it is rejected before the load.
+	update := orderEvent(event.OpUpdate, database, "orders", 1,
+		"updated", "99.50", `{"a":2}`, "2026-10-22 10:11:12.123456")
+	update.Before = map[string]any{
+		"id": int64(1), "name": "snapshot", "amount": "12.34",
+		"payload": `{"a":1}`, "created_at": "2026-10-22 10:11:12.123456",
+	}
+	writeEvents(t, sk, update)
 	row = queryRow(t, db, "SELECT id, name, amount, payload FROM "+
 		schema.Qualified(database, "orders")+" WHERE id = 1")
 	assertText(t, row, "name", "updated")
@@ -105,6 +118,49 @@ func TestIntegrationAutoCreateAndUniqueKeyLifecycle(t *testing.T) {
 	if got := queryCount(t, db, database, "orders"); got != 3 {
 		t.Fatalf("row count=%d want 3", got)
 	}
+}
+
+func TestIntegrationRejectsUpdateThatWouldStrandARow(t *testing.T) {
+	cfg := integrationConfig(t)
+	db := openDB(t, cfg)
+	database := uniqueName("go_cdc_it")
+	createDatabase(t, db, database)
+	const table = "guarded"
+	sk := openSink(t, cfg)
+	if err := sk.CreateTable(ordersTable(database, table)); err != nil {
+		t.Fatalf("create target table: %v", err)
+	}
+	writeEvents(t, sk, orderEvent(event.OpCreate, database, table, 1,
+		"keep", "1.00", `{"a":1}`, "2026-10-22 10:00:00.000000"))
+
+	// Without a Before image the sink cannot prove the primary key did not move,
+	// so the batch must fail before any Stream Load request is sent.
+	noBefore := orderEvent(event.OpUpdate, database, table, 1,
+		"changed", "2.00", `{"a":2}`, "2026-10-22 10:00:00.000000")
+	if err := sk.Write([]event.Event{noBefore}); err == nil || !strings.Contains(err.Error(), "no Before image") {
+		t.Fatalf("an UPDATE without Before must fail: %v", err)
+	}
+
+	// A moved primary key cannot be written as an upsert: the Before row would
+	// stay behind, so the row count would silently grow.
+	moved := orderEvent(event.OpUpdate, database, table, 2,
+		"moved", "3.00", `{"a":3}`, "2026-10-22 10:00:00.000000")
+	moved.Before = map[string]any{
+		"id": int64(1), "name": "keep", "amount": "1.00",
+		"payload": `{"a":1}`, "created_at": "2026-10-22 10:00:00.000000",
+	}
+	if err := sk.Write([]event.Event{moved}); err == nil || !strings.Contains(err.Error(), "changed primary key") {
+		t.Fatalf("a moved primary key must fail: %v", err)
+	}
+
+	// Both rejections happened before the load: the original row is untouched and
+	// no second row was written.
+	if got := queryCount(t, db, database, table); got != 1 {
+		t.Fatalf("row count=%d want 1 (a rejected UPDATE must not write)", got)
+	}
+	row := queryRow(t, db, "SELECT name, amount FROM "+schema.Qualified(database, table)+" WHERE id = 1")
+	assertText(t, row, "name", "keep")
+	assertNumber(t, row, "amount", "1.00")
 }
 
 func TestIntegrationExtraColumnAndSchemaEvolution(t *testing.T) {

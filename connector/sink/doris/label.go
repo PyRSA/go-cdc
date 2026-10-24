@@ -22,8 +22,9 @@ func (s *labelSequence) next(table string) string {
 	return fmt.Sprintf("go-cdc_%x_%d_%d", hash.Sum64(), time.Now().UnixNano(), s.value.Add(1))
 }
 
-// loadStatus values from Doris 2.1.x Stream Load docs. Exact strings are covered
-// by unit tests; real-cluster confirmation remains pending until CI is green.
+// loadStatus values from the Doris 2.1 Stream Load manual. `Success` and
+// `Label Already Exists` are confirmed by the 2.1.8 CI run; `Publish Timeout`
+// has only been forced in unit tests so far.
 const (
 	statusSuccess          = "Success"
 	statusPublishTimeout   = "Publish Timeout"
@@ -76,20 +77,56 @@ func classifyLoad(resp *loadResponse, label string, wantRows int) (loadOutcome, 
 	}
 	switch resp.Status {
 	case statusSuccess:
-		if resp.NumberFilteredRows > 0 {
-			return outcomeFatal, fmt.Errorf("sink.doris: label %s filtered %d rows", label, resp.NumberFilteredRows)
+		if resp.NumberFilteredRows != nil && *resp.NumberFilteredRows > 0 {
+			return outcomeFatal, fmt.Errorf("sink.doris: label %s filtered %d rows", label, *resp.NumberFilteredRows)
 		}
-		if wantRows > 0 && resp.NumberTotalRows != int64(wantRows) {
-			return outcomeFatal, fmt.Errorf("sink.doris: label %s reported %d rows, sent %d", label, resp.NumberTotalRows, wantRows)
+		// Success must account for every row. A counter the response omits is a
+		// broken response, not a zero.
+		if wantRows > 0 {
+			if resp.NumberTotalRows == nil {
+				return outcomeFatal, fmt.Errorf("sink.doris: label %s reported no NumberTotalRows, sent %d", label, wantRows)
+			}
+			if *resp.NumberTotalRows != int64(wantRows) {
+				return outcomeFatal, fmt.Errorf("sink.doris: label %s reported %d rows, sent %d", label, *resp.NumberTotalRows, wantRows)
+			}
 		}
-		if resp.NumberTotalRows > 0 && resp.NumberLoadedRows != resp.NumberTotalRows {
-			return outcomeFatal, fmt.Errorf("sink.doris: label %s loaded %d of %d rows",
-				label, resp.NumberLoadedRows, resp.NumberTotalRows)
+		if resp.NumberTotalRows != nil && *resp.NumberTotalRows > 0 {
+			if resp.NumberLoadedRows == nil {
+				return outcomeFatal, fmt.Errorf("sink.doris: label %s reported no NumberLoadedRows for %d rows", label, *resp.NumberTotalRows)
+			}
+			if *resp.NumberLoadedRows != *resp.NumberTotalRows {
+				return outcomeFatal, fmt.Errorf("sink.doris: label %s loaded %d of %d rows",
+					label, *resp.NumberLoadedRows, *resp.NumberTotalRows)
+			}
 		}
 		return outcomeSuccess, nil
 	case statusPublishTimeout:
-		// Doris documents Publish Timeout as an import that already completed;
-		// visibility may lag. Retrying with a new label would duplicate data.
+		// Doris documents this status as an import that already completed, whose
+		// data may only become visible later ("导入已经完成，但数据可能会延迟可见，
+		// 无需重试"). The transaction is committed, so a new label would duplicate
+		// rows and must never be used.
+		//
+		// A counter that is present is a fact, including an explicit 0: a load
+		// that reports writing none of the sent rows is a shortfall, not an
+		// unverifiable statistic. Only a counter the response omits is skipped,
+		// because the 2.1 manual defines what the counters mean but does not
+		// promise that every status carries them.
+		if resp.NumberFilteredRows != nil && *resp.NumberFilteredRows > 0 {
+			return outcomeFatal, fmt.Errorf("sink.doris: label %s filtered %d rows (status %q)",
+				label, *resp.NumberFilteredRows, resp.Status)
+		}
+		if wantRows > 0 && resp.NumberTotalRows != nil && *resp.NumberTotalRows != int64(wantRows) {
+			return outcomeFatal, fmt.Errorf("sink.doris: label %s processed %d of %d rows (status %q)",
+				label, *resp.NumberTotalRows, wantRows, resp.Status)
+		}
+		if wantRows > 0 && resp.NumberLoadedRows != nil && *resp.NumberLoadedRows != int64(wantRows) {
+			return outcomeFatal, fmt.Errorf("sink.doris: label %s loaded %d of %d rows (status %q)",
+				label, *resp.NumberLoadedRows, wantRows, resp.Status)
+		}
+		if resp.NumberTotalRows != nil && resp.NumberLoadedRows != nil && *resp.NumberLoadedRows != *resp.NumberTotalRows {
+			return outcomeFatal, fmt.Errorf("sink.doris: label %s loaded %d of %d rows (status %q)",
+				label, *resp.NumberLoadedRows, *resp.NumberTotalRows, resp.Status)
+		}
 		return outcomeSuccess, nil
 	case statusLabelExists:
 		switch strings.ToUpper(strings.TrimSpace(resp.ExistingJobStatus)) {

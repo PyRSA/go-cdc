@@ -248,6 +248,9 @@ func (s *Sink) awaitColumnAfterDDLError(database, table string, column schema.Co
 				"polls", polls, "ddl_error", ddlErr)
 			return nil
 		default:
+			// DESC answered and the column is still absent, so an earlier read
+			// failure no longer describes the target.
+			lastDescErr = nil
 			notVisible = true
 		}
 		remaining := time.Until(deadline)
@@ -327,11 +330,19 @@ func (s *Sink) ApplySchema(change schema.Change) error {
 	s.logger().Info("doris: sending schema change",
 		"database", table.Database, "table", table.Table,
 		"action", string(change.Action), "column", change.ColumnDef.Name, "statement", statement)
-	if err := s.sql.Exec(context.Background(), statement); err != nil {
-		s.logger().Error("doris: schema change failed",
-			"database", table.Database, "table", table.Table,
-			"action", string(change.Action), "column", change.ColumnDef.Name, "error", err)
-		return err
+	if execErr := s.sql.Exec(context.Background(), statement); execErr != nil {
+		// A rejected response does not prove the DDL did not run: the FE may have
+		// committed it and lost the response. Resolve it through the same bounded
+		// DESC wait the target-validation path uses before failing the job.
+		if resolveErr := s.awaitColumnAfterDDLError(table.Database, table.Table, *change.ColumnDef, execErr); resolveErr != nil {
+			s.logger().Error("doris: schema change failed",
+				"database", table.Database, "table", table.Table,
+				"action", string(change.Action), "column", change.ColumnDef.Name, "error", resolveErr)
+			return resolveErr
+		}
+		s.logger().Info("doris: schema change had already taken effect despite the failed response",
+			"database", table.Database, "table", table.Table, "column", change.ColumnDef.Name,
+			"ddl_error", execErr)
 	}
 	started := time.Now()
 	if err := s.waitForColumn(table.Database, table.Table, *change.ColumnDef); err != nil {

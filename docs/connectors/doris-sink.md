@@ -79,6 +79,11 @@ apply here: the parser keeps the two Doris ports separate.
   deduplicates it), while other `4xx` responses fail the job. A label matching
   more than one `SHOW LOAD` row is ambiguous and fails the job rather than
   guessing a state.
+- `Publish Timeout` counts as success: Doris has committed the load and only the
+  data visibility may lag, so re-sending it would write the batch twice. The row
+  counters are still enforced when the response carries them — filtered rows or a
+  shortfall fail the job — while a response that omits them is accepted as
+  unverifiable instead of being read as zero.
 - Recovery after a crash re-sends the events with **new labels**. The target is a
   `UNIQUE KEY` table, so replayed rows converge by primary key — at-least-once,
   not exactly-once.
@@ -270,6 +275,11 @@ Not implemented in v1:
   without leaving the old row behind, so such an `UPDATE` fails the job.
 - `DROP TABLE` / `TRUNCATE`, drop/modify/rename column, multi-column ADD.
 - Exactly-once delivery, transactions, or stable labels across restarts.
+- Cross-batch ordering against a second writer. `Write` submits one batch at a
+  time and confirms it before the next, so per-key order matches the binlog, but
+  the target has no sequence column: another loader that commits a row after the
+  sink can still replace a newer row with an older one. Keep the target
+  single-writer.
 - HTTPS FE endpoints, multiple FE addresses, or custom Stream Load headers.
 - Automatic partitions, merge-on-write selection, or index generation.
 - Translating SQL expression defaults (they are omitted, never guessed).
@@ -281,11 +291,12 @@ addresses (for example `doris-be-0`) are **not** allowlisted, so prefer an FE
 that advertises BE IPs, or run with host networking so redirects stay on
 loopback.
 
-Not yet verified against a real cluster: generated DDL (`BUCKETS auto`,
-merge-on-write default), `DESC` rendering of defaults / `DATEV2` / `JSON`,
-`ADD COLUMN` visibility timing, `Publish Timeout` and `SHOW LOAD` state strings,
-FE `307` redirects with BE authentication, and multi-table partial recovery.
-To check them on the target cluster, run the integration suite — see
+Verified against Doris `2.1.8` in CI: auto-created DDL, `DESC` nullability and
+empty-string defaults, live `ADD COLUMN` visibility and partial reconcile,
+`Label Already Exists` + `FINISHED`, a finished label whose `SHOW LOAD` row is
+**not** returned, the FE→BE redirect with BE authentication, and multi-table
+first-failure recovery. Still unverified: `Publish Timeout` (only forced in unit
+`httptest` runs). To check it on the target cluster, run the integration suite — see
 [`test/integration/README.md`](../../test/integration/README.md).
 
 ## Related Docs

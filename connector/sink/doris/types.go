@@ -143,8 +143,14 @@ func mapColumnType(raw string) (columnType, error) {
 // stringColumnType widens a MySQL character length to the Doris byte capacity.
 // A length above the Doris limit for the type degrades to the next wider string
 // type, matching the Flink CDC Doris sink: CHAR becomes VARCHAR and VARCHAR
-// becomes STRING. Length always reports bytes, so compatibility checks compare
-// the required capacity against the live DESC type without rescaling.
+// becomes STRING. Length always reports bytes, and Doris `DESC` echoes the
+// declared byte capacity unchanged (verified on 2.1.8: a `VARCHAR(32)` target
+// reports `varchar(32)`), so compatibility checks compare the required capacity
+// against the live DESC type without rescaling.
+//
+// The widening also covers data, not just DDL: `strict_mode=true` with
+// `max_filter_ratio=0` rejects a value that does not fit instead of truncating,
+// so an underestimated capacity fails the load rather than losing characters.
 func stringColumnType(base string, chars int) columnType {
 	length := chars * mysqlBytesPerChar
 	if base == "CHAR" && length <= dorisCharMaxLength {
