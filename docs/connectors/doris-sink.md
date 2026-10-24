@@ -72,6 +72,13 @@ apply here: the parser keeps the two Doris ports separate.
 - Each Stream Load is confirmed through the Doris **business status**, not just a
   `2xx`, before `Write` returns. A failed load fails the job and does **not**
   advance the checkpoint.
+- A failed or unrecognised response is first resolved by the same label in
+  `SHOW LOAD`: `FINISHED` counts as success, `CANCELLED` fails the job, and an
+  in-flight state is retried. When Doris returns no row for that label at all, a
+  transport error, `5xx`, or `429` is retried with the same label (Doris
+  deduplicates it), while other `4xx` responses fail the job. A label matching
+  more than one `SHOW LOAD` row is ambiguous and fails the job rather than
+  guessing a state.
 - Recovery after a crash re-sends the events with **new labels**. The target is a
   `UNIQUE KEY` table, so replayed rows converge by primary key — at-least-once,
   not exactly-once.

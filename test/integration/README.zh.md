@@ -160,7 +160,8 @@ Doris 对应项。
 
 同一 `run-doris-e2e.sh` 随后跑 sink 级 Go 套件（`doris_integration`）：自动建表 /
 UNIQUE KEY、同批重复主键、空 Schema 缓存重启、额外列、类型拒绝/往返、Label +
-`SHOW LOAD`（单个 Label 只应有一行、过滤行为、已完成 Label 的重试）、`DESC`
+`SHOW LOAD`（单个 Label 只应有一行、过滤行为、已完成 Label 的重试；若该构建
+根本不记录 Stream Load 作业，此探针显式报 `SKIP`）、`DESC`
 可空性与空串默认值解析、`ADD COLUMN` 可见性与“部分列已添加”状态、重启重新校验、
 多表首败即停。`Publish Timeout` / `CANCELLED` / 5xx 注入仍由单元 / `httptest`
 覆盖；“DDL 已生效但返回错误”也属于该范围。

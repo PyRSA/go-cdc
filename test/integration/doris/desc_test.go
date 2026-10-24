@@ -33,12 +33,14 @@ func TestIntegrationDescNullabilityAndDefaults(t *testing.T) {
 	database := uniqueName("go_cdc_it")
 	createDatabase(t, db, database)
 	const table = "desc_probe"
+	// varchar(32) needs 96 bytes in Doris, so the target declares VARCHAR(96);
+	// a VARCHAR(32) target would fail the type check before nullability is read.
 	execSQL(t, db, "CREATE TABLE "+schema.Qualified(database, table)+" ("+
 		"`id` BIGINT NOT NULL, "+
-		"`nn` VARCHAR(32) NOT NULL, "+
-		"`nn_empty` VARCHAR(32) NOT NULL DEFAULT '', "+
-		"`nul` VARCHAR(32) NULL, "+
-		"`nul_empty` VARCHAR(32) NULL DEFAULT ''"+
+		"`nn` VARCHAR(96) NOT NULL, "+
+		"`nn_empty` VARCHAR(96) NOT NULL DEFAULT '', "+
+		"`nul` VARCHAR(96) NULL, "+
+		"`nul_empty` VARCHAR(96) NULL DEFAULT ''"+
 		") UNIQUE KEY(`id`) DISTRIBUTED BY HASH(`id`) BUCKETS 1 "+
 		`PROPERTIES ("replication_num" = "1")`)
 

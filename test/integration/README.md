@@ -228,7 +228,8 @@ mega-field `tpl01_large` case has no Doris equivalent.
 The same `run-doris-e2e.sh` then runs the sink-level Go suite (`doris_integration`):
 auto-create / UNIQUE KEY, same-batch duplicate keys, empty Schema cache restart,
 extra columns, type rejection / round-trips, Label + `SHOW LOAD` (one row per
-label, filter behaviour, retry with a finished label), `DESC` nullability and
+label, filter behaviour, retry with a finished label; the probe reports `SKIP`
+when the build records no Stream Load job at all), `DESC` nullability and
 empty-string default parsing, `ADD COLUMN` visibility with a partially
 reconciled target and restart re-validation, multi-table first-failure. Forced
 `Publish Timeout` / `CANCELLED` / 5xx injection stays with unit/`httptest`

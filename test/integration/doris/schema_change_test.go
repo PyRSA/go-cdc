@@ -43,8 +43,10 @@ func TestIntegrationReconcileMissingColumnsOnCreate(t *testing.T) {
 	database := uniqueName("go_cdc_it")
 	createDatabase(t, db, database)
 	const table = "evolve"
+	// varchar(32) needs 96 bytes in Doris; a VARCHAR(32) target would be
+	// rejected as too narrow before the missing columns are looked at.
 	execSQL(t, db, "CREATE TABLE "+schema.Qualified(database, table)+" ("+
-		"`id` BIGINT NOT NULL, `a` VARCHAR(32) NULL"+
+		"`id` BIGINT NOT NULL, `a` VARCHAR(96) NULL"+
 		") UNIQUE KEY(`id`) DISTRIBUTED BY HASH(`id`) BUCKETS 1 "+
 		`PROPERTIES ("replication_num" = "1")`)
 
@@ -135,8 +137,8 @@ func TestIntegrationReconcileRefusesToAlterWhenTheTargetIsIncompatible(t *testin
 	if err == nil {
 		t.Fatal("a narrower target column must reject the table before any ALTER")
 	}
-	if !strings.Contains(err.Error(), "column a") {
-		t.Fatalf("rejection should name column a: %v", err)
+	if !strings.Contains(err.Error(), "column a has type") {
+		t.Fatalf("rejection should name column a and its live type: %v", err)
 	}
 	desc := describeTable(t, db, database, table)
 	if _, ok := desc["b"]; ok {

@@ -311,24 +311,26 @@ func TestIntegrationShowLoadSingleRowPerLabel(t *testing.T) {
 		}
 	}
 
+	observed := 0
 	for _, label := range labels {
 		state := waitForLoadState(t, db, database, label)
 		if state == nil {
 			t.Logf("SHOW LOAD never exposed label %s; skipping row assertions for it", label)
 			continue
 		}
-		observed := assertSingleLoadRow(t, db, database, label)
-		if observed == nil {
+		row := assertSingleLoadRow(t, db, database, label)
+		if row == nil {
 			continue
 		}
-		if observed["label"] != label {
-			t.Fatalf("SHOW LOAD row label=%q want %q", observed["label"], label)
+		observed++
+		if row["label"] != label {
+			t.Fatalf("SHOW LOAD row label=%q want %q", row["label"], label)
 		}
-		if observed["jobid"] == "" {
-			t.Fatalf("SHOW LOAD row for %s has no JobId: %v", label, observed)
+		if row["jobid"] == "" {
+			t.Fatalf("SHOW LOAD row for %s has no JobId: %v", label, row)
 		}
-		if observed["state"] == "" {
-			t.Fatalf("SHOW LOAD row for %s has no State: %v", label, observed)
+		if row["state"] == "" {
+			t.Fatalf("SHOW LOAD row for %s has no State: %v", label, row)
 		}
 	}
 
@@ -345,5 +347,12 @@ func TestIntegrationShowLoadSingleRowPerLabel(t *testing.T) {
 
 	if got := queryCount(t, db, database, table); got != 2 {
 		t.Fatalf("row count=%d want 2 (a duplicate label must not append rows)", got)
+	}
+
+	if observed == 0 {
+		// A build that records no Stream Load job cannot exhibit the duplicate
+		// label ambiguity the sink guards against. Report the probe as skipped
+		// instead of green, so CI does not claim coverage it never had.
+		t.Skipf("SHOW LOAD exposed none of %d Stream Load labels: the single-row and WHERE assertions could not run on this Doris build", len(labels))
 	}
 }
