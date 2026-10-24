@@ -108,7 +108,7 @@ bash test/integration/scripts/run-doris-scale.sh normal
 
 | Job | 矩阵 | 内容 |
 | --- | --- | --- |
-| `go-check` | — | fmt / lint / `make test` / build / **scale 单测**（`pytest scale/test_profiles.py scale/test_schemas.py scale/test_doris_schemas.py`） |
+| `go-check` | — | fmt / lint / `make test` / build / **scale 单测**（`pytest scale/`） |
 | `mysql-mysql-e2e` | MySQL **5.7** + **8.0** | 功能 + 类型 + 负载；**8.0 另跑 Kafka sink** TP-K01..K08 |
 | `mysql-scale-e2e` | 仅 MySQL **8.0** | scale `normal` / `heavy`（独立 compose 项目，宿主机端口 `13307`） |
 | `doris-e2e` | MySQL **8.0** + Doris **2.1.8** | MySQL→Doris 流水线 TP-DR01..DR07（功能 + 负载）+ sink Go 套件 + Doris 规模（[`doris-integration.yml`](../../.github/workflows/doris-integration.yml)） |
@@ -160,8 +160,10 @@ Doris 对应项。
 
 同一 `run-doris-e2e.sh` 随后跑 sink 级 Go 套件（`doris_integration`）：自动建表 /
 UNIQUE KEY、同批重复主键、空 Schema 缓存重启、额外列、类型拒绝/往返、Label +
-`SHOW LOAD`、多表首败即停。`Publish Timeout` / `CANCELLED` / 5xx 注入仍由单元 /
-`httptest` 覆盖。
+`SHOW LOAD`（单个 Label 只应有一行、过滤行为、已完成 Label 的重试）、`DESC`
+可空性与空串默认值解析、`ADD COLUMN` 可见性与“部分列已添加”状态、重启重新校验、
+多表首败即停。`Publish Timeout` / `CANCELLED` / 5xx 注入仍由单元 / `httptest`
+覆盖；“DDL 已生效但返回错误”也属于该范围。
 
 独立 workflow [`doris-integration.yml`](../../.github/workflows/doris-integration.yml)
 会启动 MySQL + Doris `2.1.8` FE+BE、调高内核参数、执行套件（功能 TP-DR01..DR04，

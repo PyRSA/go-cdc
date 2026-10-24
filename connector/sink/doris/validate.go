@@ -103,9 +103,9 @@ func validateTableModel(source schema.Table, model tableModel) error {
 }
 
 // missingColumnsError lists source columns the target does not have yet. It is
-// recoverable: the ADD COLUMN that created them is still ahead in the binlog, so
-// CreateTable accepts the table and validateEvents rejects any row that actually
-// carries an unknown column.
+// reported separately so CreateTable can decide between reconciling the target
+// (schema evolution grants add.column) and failing with an actionable message.
+// A target with missing columns is never cached as writable.
 type missingColumnsError struct {
 	Database string
 	Table    string
@@ -203,6 +203,9 @@ func isGenerated(extra string) bool {
 }
 
 // validateExistingColumn decides whether a repeated ADD COLUMN is a safe no-op.
+// It applies the same one-way nullability rule as validateTarget: a target may be
+// more permissive than the source (a nullable target accepts a NOT NULL source
+// column), but a NOT NULL target cannot receive a nullable source column.
 func validateExistingColumn(existing descColumn, column schema.Column) error {
 	mapped, err := mapColumnType(column.Type)
 	if err != nil {
@@ -212,9 +215,8 @@ func validateExistingColumn(existing descColumn, column schema.Column) error {
 		return fmt.Errorf("sink.doris: column %s already exists with type %s, source needs %s",
 			column.Name, existing.Type, mapped.Doris)
 	}
-	if existing.Nullable != column.Nullable {
-		return fmt.Errorf("sink.doris: column %s already exists with nullable=%t, source needs %t",
-			column.Name, existing.Nullable, column.Nullable)
+	if column.Nullable && !existing.Nullable {
+		return fmt.Errorf("sink.doris: column %s already exists as NOT NULL but the source column is nullable", column.Name)
 	}
 	return nil
 }

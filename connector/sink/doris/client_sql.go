@@ -230,9 +230,12 @@ type loadState struct {
 // database, so the caller passes the routed database explicitly; the label is
 // validated and escaped before it is inlined.
 //
-// Prefer WHERE Label = …; if Doris returns no row (observed on some 2.1.x
-// Stream Load paths), fall back to scanning recent SHOW LOAD rows and matching
-// the label case-insensitively.
+// Prefer WHERE Label = …; if Doris returns no matching row (observed on some
+// 2.1.x Stream Load paths), fall back to scanning recent SHOW LOAD rows. Both
+// paths filter every returned row by label: some builds ignore the WHERE clause
+// and return unrelated jobs, and a stray FINISHED row must never be reported as
+// this load's state. A label that matches more than one row is reported as an
+// error rather than resolved by row order.
 func (c *sqlClient) showLoad(ctx context.Context, database, label string) (loadState, error) {
 	if database == "" {
 		return loadState{}, fmt.Errorf("sink.doris: show load requires a database")
@@ -242,16 +245,16 @@ func (c *sqlClient) showLoad(ctx context.Context, database, label string) (loadS
 	}
 	state, err := c.showLoadQuery(ctx,
 		"SHOW LOAD FROM "+schema.Quote(database)+" WHERE Label = '"+escapeSQLString(label)+"'",
-		label, true)
+		label)
 	if err == nil || !errors.Is(err, errLoadNotFound) {
 		return state, err
 	}
 	return c.showLoadQuery(ctx,
 		"SHOW LOAD FROM "+schema.Quote(database),
-		label, false)
+		label)
 }
 
-func (c *sqlClient) showLoadQuery(ctx context.Context, statement, label string, exactFilter bool) (loadState, error) {
+func (c *sqlClient) showLoadQuery(ctx context.Context, statement, label string) (loadState, error) {
 	rows, err := c.db.QueryContext(ctx, statement)
 	if err != nil {
 		return loadState{}, fmt.Errorf("sink.doris: show load %q: %w", label, err)
@@ -280,12 +283,20 @@ func (c *sqlClient) showLoadQuery(ctx context.Context, statement, label string, 
 		for i, name := range lower {
 			row[name] = valueString(values[i])
 		}
-		if !exactFilter && !strings.EqualFold(row["label"], label) {
+		// Validate the row, not the WHERE clause: a build that ignores the filter
+		// returns unrelated jobs, and treating one of them as this label would
+		// report an unconfirmed load as finished.
+		if !strings.EqualFold(row["label"], label) {
 			continue
+		}
+		if found {
+			// More than one row for one label: picking either would report a stale
+			// FINISHED as this load's result, so refuse to guess.
+			return loadState{}, fmt.Errorf("sink.doris: SHOW LOAD returned more than one row for label %q (states %q and %q); the current load cannot be identified",
+				label, out.State, row["state"])
 		}
 		out = loadState{State: row["state"], ErrorMsg: row["errormsg"]}
 		found = true
-		// Keep scanning so the last matching row wins (latest job for the label).
 	}
 	if err := rows.Err(); err != nil {
 		return loadState{}, err

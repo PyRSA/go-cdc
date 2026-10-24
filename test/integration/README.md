@@ -129,7 +129,7 @@ Jobs:
 
 | Job | When / matrix | What |
 | --- | --- | --- |
-| `go-check` | always | `gofmt`, `golangci-lint`, `make test`, build, **scale unit tests** (`pytest scale/test_profiles.py scale/test_schemas.py scale/test_doris_schemas.py`) |
+| `go-check` | always | `gofmt`, `golangci-lint`, `make test`, build, **scale unit tests** (`pytest scale/`) |
 | `mysql-mysql-e2e` | MySQL **5.7** + **8.0** | functional + types + load; **8.0 also runs Kafka sink** TP-K01..K08 |
 | `mysql-scale-e2e` | MySQL **8.0 only** | scale `normal` or `heavy` (separate compose project / host port `13307`) |
 | `doris-e2e` | MySQL **8.0** + Doris **2.1.8** | MySQL→Doris pipeline TP-DR01..DR07 (functional + load) + sink Go suite + Doris scale ([`doris-integration.yml`](../../.github/workflows/doris-integration.yml)) |
@@ -227,9 +227,12 @@ mega-field `tpl01_large` case has no Doris equivalent.
 
 The same `run-doris-e2e.sh` then runs the sink-level Go suite (`doris_integration`):
 auto-create / UNIQUE KEY, same-batch duplicate keys, empty Schema cache restart,
-extra columns, type rejection / round-trips, Label + `SHOW LOAD`, multi-table
-first-failure. Forced `Publish Timeout` / `CANCELLED` / 5xx injection stays with
-unit/`httptest` coverage.
+extra columns, type rejection / round-trips, Label + `SHOW LOAD` (one row per
+label, filter behaviour, retry with a finished label), `DESC` nullability and
+empty-string default parsing, `ADD COLUMN` visibility with a partially
+reconciled target and restart re-validation, multi-table first-failure. Forced
+`Publish Timeout` / `CANCELLED` / 5xx injection stays with unit/`httptest`
+coverage, and so does a DDL that reports an error after taking effect.
 
 The separate [`doris-integration.yml`](../../.github/workflows/doris-integration.yml)
 workflow starts MySQL + Doris `2.1.8` FE+BE, raises kernel limits, runs the suite

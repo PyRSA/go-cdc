@@ -31,7 +31,12 @@ type fakeSQL struct {
 	load      loadState
 	loadErr   error
 	execHook  func(f *fakeSQL, statement string)
-	closed    int
+	// execErrHook runs after execHook and fails only the statements it matches.
+	execErrHook func(f *fakeSQL, statement string) error
+	// descHook runs before each DESC answer so a test can make a column appear
+	// only on a later poll, or make the structure unreadable after an ALTER.
+	descHook func(f *fakeSQL, id string)
+	closed   int
 }
 
 func newFakeSQL() *fakeSQL {
@@ -50,6 +55,9 @@ func (f *fakeSQL) Exec(_ context.Context, statement string) error {
 	if f.execHook != nil {
 		f.execHook(f, statement)
 	}
+	if f.execErrHook != nil {
+		return f.execErrHook(f, statement)
+	}
 	return nil
 }
 
@@ -60,6 +68,9 @@ func (f *fakeSQL) descTable(_ context.Context, database, table string) ([]descCo
 		return nil, f.descErr
 	}
 	id := database + "." + table
+	if f.descHook != nil {
+		f.descHook(f, id)
+	}
 	columns, ok := f.columns[id]
 	if !ok {
 		return nil, fmt.Errorf("sink.doris: table %s does not exist or has no columns", id)
@@ -223,29 +234,431 @@ func TestSinkCreateTableExistingTargetIsValidated(t *testing.T) {
 	}
 }
 
-func TestSinkCreateTableAcceptsPendingSourceColumn(t *testing.T) {
-	// A column added while the job was down is still ahead in the binlog: the
-	// pending ADD COLUMN creates it before any row that carries it. Failing at
-	// CREATE would make every restart hit the same wall.
+func TestSinkCreateTableRejectsPendingColumnWithoutSchemaChange(t *testing.T) {
+	// A source column the target lacks is never "waited for": the snapshot emits
+	// rows carrying it before any binlog DDL, and a column that reached the source
+	// catalogue before the checkpoint has no ADD COLUMN left to replay. Without a
+	// grant to alter the target the job must stop here, not at the first row.
 	f := newFakeSQL()
 	f.columns["db.orders"] = validTarget()
 	server := successServer(t, &[]string{})
-	s := testSink(t, server, f, definition.Sink{Type: "doris", AutoCreate: false})
+	// Auto-create is on: it must not imply permission to alter an existing table.
+	s := testSink(t, server, f, definition.Sink{Type: "doris", AutoCreate: true, Buckets: "auto"})
 	source := validateSource()
 	source.Columns = append(source.Columns, schema.Column{Name: "note", Type: "varchar(32)", Nullable: true})
+
+	err := s.CreateTable(source)
+	if err == nil {
+		t.Fatal("a missing column without schema evolution must fail")
+	}
+	for _, want := range []string{"note", "schema.change.enabled", "add.column"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error must mention %q: %v", want, err)
+		}
+	}
+	if len(s.tables) != 0 {
+		t.Fatalf("an unreconciled target must not be cached: %#v", s.tables)
+	}
+	for _, statement := range f.statements() {
+		if strings.Contains(statement, "ADD COLUMN") {
+			t.Fatalf("auto-create must not alter the table: %s", statement)
+		}
+	}
+}
+
+func TestSinkCreateTableRejectsPendingColumnWithoutInclude(t *testing.T) {
+	f := newFakeSQL()
+	f.columns["db.orders"] = validTarget()
+	server := successServer(t, &[]string{})
+	s := testSink(t, server, f, definition.Sink{
+		Type: "doris", SchemaChange: true, SchemaChangeInclude: []string{"drop.column"},
+	})
+	source := validateSource()
+	source.Columns = append(source.Columns, schema.Column{Name: "note", Type: "varchar(32)", Nullable: true})
+
+	if err := s.CreateTable(source); err == nil || !strings.Contains(err.Error(), "add.column") {
+		t.Fatalf("err=%v", err)
+	}
+	if len(s.tables) != 0 {
+		t.Fatalf("an unreconciled target must not be cached: %#v", s.tables)
+	}
+}
+
+func TestSinkCreateTableReconcilesMissingColumn(t *testing.T) {
+	old := schemaChangePollInterval
+	schemaChangePollInterval = time.Millisecond
+	t.Cleanup(func() { schemaChangePollInterval = old })
+
+	f := newFakeSQL()
+	f.columns["db.orders"] = validTarget()
+	f.execHook = func(f *fakeSQL, statement string) {
+		if strings.Contains(statement, "ADD COLUMN") {
+			f.columns["db.orders"] = append(f.columns["db.orders"], descColumn{Name: "note", Type: "VARCHAR(96)", Nullable: true})
+		}
+	}
+	requests := &[]string{}
+	server := successServer(t, requests)
+	s := testSink(t, server, f, definition.Sink{
+		Type: "doris", SchemaChange: true, SchemaChangeInclude: []string{"add.column"},
+		SchemaChangeWait: 100 * time.Millisecond,
+	})
+	source := validateSource()
+	source.Columns = append(source.Columns, schema.Column{Name: "note", Type: "varchar(32)", Nullable: true})
+
 	if err := s.CreateTable(source); err != nil {
-		t.Fatalf("a pending source column must not fail CREATE: %v", err)
+		t.Fatal(err)
 	}
-	if _, ok := s.tables["db.orders"]; !ok {
-		t.Fatal("the table must still be cached")
+	alters := 0
+	for _, statement := range f.statements() {
+		if strings.Contains(statement, "ADD COLUMN") {
+			alters++
+		}
 	}
-	// The invariant moves to the write path: a row that carries the missing
-	// column is rejected until the ADD COLUMN is applied.
+	if alters != 1 {
+		t.Fatalf("want exactly one ADD COLUMN, got %d: %#v", alters, f.statements())
+	}
+	cached, ok := s.tables["db.orders"]
+	if !ok {
+		t.Fatal("the reconciled table must be cached")
+	}
+	if !hasColumn(cached, "note") {
+		t.Fatalf("cached table must carry the new column: %#v", cached.Columns)
+	}
+
+	// The snapshot row that carries the column now passes. Before this change it
+	// was the first row to fail, and every restart repeated the same failure.
 	item := createEvent(1, "a")
 	item.Columns = append(item.Columns, "note")
 	item.After["note"] = "pending"
-	if err := s.Write([]event.Event{item}); err == nil || !strings.Contains(err.Error(), "not in the target table") {
+	if err := s.Write([]event.Event{item}); err != nil {
+		t.Fatal(err)
+	}
+	if len(*requests) != 1 {
+		t.Fatalf("want one Stream Load, got %#v", *requests)
+	}
+}
+
+func TestSinkCreateTableReconcilesMultipleMissingColumns(t *testing.T) {
+	old := schemaChangePollInterval
+	schemaChangePollInterval = time.Millisecond
+	t.Cleanup(func() { schemaChangePollInterval = old })
+
+	f := newFakeSQL()
+	f.columns["db.orders"] = validTarget()
+	f.execHook = func(f *fakeSQL, statement string) {
+		switch {
+		case strings.Contains(statement, "ADD COLUMN `note`"):
+			f.columns["db.orders"] = append(f.columns["db.orders"], descColumn{Name: "note", Type: "VARCHAR(96)", Nullable: true})
+		case strings.Contains(statement, "ADD COLUMN `score`"):
+			f.columns["db.orders"] = append(f.columns["db.orders"], descColumn{Name: "score", Type: "INT", Nullable: true})
+		}
+	}
+	server := successServer(t, &[]string{})
+	s := testSink(t, server, f, definition.Sink{
+		Type: "doris", SchemaChange: true, SchemaChangeInclude: []string{"add.column"},
+		SchemaChangeWait: 100 * time.Millisecond,
+	})
+	source := validateSource()
+	source.Columns = append(source.Columns,
+		schema.Column{Name: "note", Type: "varchar(32)", Nullable: true},
+		schema.Column{Name: "score", Type: "int", Nullable: true},
+	)
+
+	if err := s.CreateTable(source); err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	for _, statement := range f.statements() {
+		if !strings.Contains(statement, "ADD COLUMN") {
+			continue
+		}
+		order = append(order, statement)
+	}
+	if len(order) != 2 || !strings.Contains(order[0], "`note`") || !strings.Contains(order[1], "`score`") {
+		t.Fatalf("columns must be added in source order: %#v", order)
+	}
+}
+
+func TestSinkCreateTableRejectsNotNullColumnWithoutDefault(t *testing.T) {
+	f := newFakeSQL()
+	f.columns["db.orders"] = validTarget()
+	server := successServer(t, &[]string{})
+	s := testSink(t, server, f, definition.Sink{
+		Type: "doris", SchemaChange: true, SchemaChangeInclude: []string{"add.column"},
+	})
+	source := validateSource()
+	source.Columns = append(source.Columns, schema.Column{Name: "score", Type: "int", Nullable: false})
+
+	err := s.CreateTable(source)
+	if err == nil || !strings.Contains(err.Error(), "NOT NULL") {
 		t.Fatalf("err=%v", err)
+	}
+	for _, statement := range f.statements() {
+		if strings.Contains(statement, "ADD COLUMN") {
+			t.Fatalf("an invalid ADD COLUMN must not be sent: %s", statement)
+		}
+	}
+	if len(s.tables) != 0 {
+		t.Fatalf("a failed reconcile must not be cached: %#v", s.tables)
+	}
+}
+
+func TestSinkCreateTableTreatsConcurrentAddAsApplied(t *testing.T) {
+	old := schemaChangePollInterval
+	schemaChangePollInterval = time.Millisecond
+	t.Cleanup(func() { schemaChangePollInterval = old })
+
+	// Another writer added the same compatible column between DESC and ALTER: the
+	// Exec fails with "duplicate column", but the target is already correct.
+	f := newFakeSQL()
+	f.columns["db.orders"] = validTarget()
+	f.execErrHook = func(f *fakeSQL, statement string) error {
+		if !strings.Contains(statement, "ADD COLUMN") {
+			return nil
+		}
+		f.columns["db.orders"] = append(f.columns["db.orders"], descColumn{Name: "note", Type: "VARCHAR(96)", Nullable: true})
+		return fmt.Errorf("sink.doris: Error 1060 (HY000): Duplicate column name 'note'")
+	}
+	server := successServer(t, &[]string{})
+	s := testSink(t, server, f, definition.Sink{
+		Type: "doris", SchemaChange: true, SchemaChangeInclude: []string{"add.column"},
+		SchemaChangeWait: 100 * time.Millisecond,
+	})
+	source := validateSource()
+	source.Columns = append(source.Columns, schema.Column{Name: "note", Type: "varchar(32)", Nullable: true})
+
+	if err := s.CreateTable(source); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.tables["db.orders"]; !ok {
+		t.Fatal("a compatible concurrent add must leave the table cached")
+	}
+}
+
+func TestSinkCreateTableAcceptsColumnThatAppearsAfterDDLError(t *testing.T) {
+	old := schemaChangePollInterval
+	schemaChangePollInterval = time.Millisecond
+	t.Cleanup(func() { schemaChangePollInterval = old })
+
+	// The ALTER response was lost but Doris committed it asynchronously; the
+	// column only shows up on a later DESC, so one re-read is not enough.
+	f := newFakeSQL()
+	f.columns["db.orders"] = validTarget()
+	f.execErrHook = func(f *fakeSQL, statement string) error {
+		if strings.Contains(statement, "ADD COLUMN") {
+			return fmt.Errorf("sink.doris: read tcp: i/o timeout")
+		}
+		return nil
+	}
+	descs := 0
+	f.descHook = func(f *fakeSQL, id string) {
+		descs++
+		if descs == 3 {
+			// A nullable target column for a NOT NULL source: validateTarget
+			// accepts this direction, so the reconcile path must agree.
+			f.columns[id] = append(f.columns[id], descColumn{Name: "note", Type: "VARCHAR(96)", Nullable: true})
+		}
+	}
+	server := successServer(t, &[]string{})
+	s := testSink(t, server, f, definition.Sink{
+		Type: "doris", SchemaChange: true, SchemaChangeInclude: []string{"add.column"},
+		SchemaChangeWait: 500 * time.Millisecond,
+	})
+	source := validateSource()
+	source.Columns = append(source.Columns, schema.Column{
+		Name: "note", Type: "varchar(32)", Nullable: false, HasDefault: true, Default: "",
+	})
+
+	if err := s.CreateTable(source); err != nil {
+		t.Fatal(err)
+	}
+	cached, ok := s.tables["db.orders"]
+	if !ok {
+		t.Fatal("a column that appeared after the DDL error must be cached")
+	}
+	if !hasColumn(cached, "note") {
+		t.Fatalf("cached table must carry the new column: %#v", cached.Columns)
+	}
+	if descs < 3 {
+		t.Fatalf("a failed DDL must be resolved through repeated DESC, got %d", descs)
+	}
+}
+
+func TestSinkCreateTableFailsWhenColumnNeverAppears(t *testing.T) {
+	old := schemaChangePollInterval
+	schemaChangePollInterval = time.Millisecond
+	t.Cleanup(func() { schemaChangePollInterval = old })
+
+	f := newFakeSQL()
+	f.columns["db.orders"] = validTarget()
+	f.execErrHook = func(f *fakeSQL, statement string) error {
+		if strings.Contains(statement, "ADD COLUMN") {
+			return fmt.Errorf("sink.doris: Error 1105 (HY000): backend unavailable")
+		}
+		return nil
+	}
+	server := successServer(t, &[]string{})
+	s := testSink(t, server, f, definition.Sink{
+		Type: "doris", SchemaChange: true, SchemaChangeInclude: []string{"add.column"},
+		SchemaChangeWait: 30 * time.Millisecond,
+	})
+	source := validateSource()
+	source.Columns = append(source.Columns, schema.Column{Name: "note", Type: "varchar(32)", Nullable: true})
+
+	err := s.CreateTable(source)
+	if err == nil {
+		t.Fatal("a column that never appears must fail")
+	}
+	for _, want := range []string{"note", "did not take effect", "backend unavailable", "never became visible"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error must mention %q: %v", want, err)
+		}
+	}
+	if len(s.tables) != 0 {
+		t.Fatalf("a failed reconcile must not be cached: %#v", s.tables)
+	}
+}
+
+func TestSinkCreateTableReportsDescFailureAfterDDLError(t *testing.T) {
+	old := schemaChangePollInterval
+	schemaChangePollInterval = time.Millisecond
+	t.Cleanup(func() { schemaChangePollInterval = old })
+
+	// After the ALTER the FE stops answering DESC. An unreadable structure is
+	// not a missing column, and the original DDL error must survive.
+	f := newFakeSQL()
+	f.columns["db.orders"] = validTarget()
+	f.execErrHook = func(f *fakeSQL, statement string) error {
+		if strings.Contains(statement, "ADD COLUMN") {
+			return fmt.Errorf("sink.doris: Error 1105 (HY000): backend unavailable")
+		}
+		return nil
+	}
+	f.descHook = func(f *fakeSQL, id string) {
+		for _, statement := range f.execs {
+			if strings.Contains(statement, "ADD COLUMN") {
+				f.descErr = fmt.Errorf("sink.doris: describe %s: fe unavailable", id)
+				return
+			}
+		}
+	}
+	server := successServer(t, &[]string{})
+	s := testSink(t, server, f, definition.Sink{
+		Type: "doris", SchemaChange: true, SchemaChangeInclude: []string{"add.column"},
+		SchemaChangeWait: 30 * time.Millisecond,
+	})
+	source := validateSource()
+	source.Columns = append(source.Columns, schema.Column{Name: "note", Type: "varchar(32)", Nullable: true})
+
+	err := s.CreateTable(source)
+	if err == nil {
+		t.Fatal("an unreadable structure must fail the table")
+	}
+	for _, want := range []string{"did not take effect", "backend unavailable", "structure re-read failed", "fe unavailable"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error must mention %q: %v", want, err)
+		}
+	}
+	if len(s.tables) != 0 {
+		t.Fatalf("an unreadable target must not be cached: %#v", s.tables)
+	}
+}
+
+func TestSinkCreateTableRejectsConcurrentIncompatibleColumn(t *testing.T) {
+	f := newFakeSQL()
+	f.columns["db.orders"] = validTarget()
+	f.execErrHook = func(f *fakeSQL, statement string) error {
+		if !strings.Contains(statement, "ADD COLUMN") {
+			return nil
+		}
+		f.columns["db.orders"] = append(f.columns["db.orders"], descColumn{Name: "note", Type: "VARCHAR(4)", Nullable: true})
+		return fmt.Errorf("sink.doris: Error 1060 (HY000): Duplicate column name 'note'")
+	}
+	server := successServer(t, &[]string{})
+	s := testSink(t, server, f, definition.Sink{
+		Type: "doris", SchemaChange: true, SchemaChangeInclude: []string{"add.column"},
+		SchemaChangeWait: 100 * time.Millisecond,
+	})
+	source := validateSource()
+	source.Columns = append(source.Columns, schema.Column{Name: "note", Type: "varchar(32)", Nullable: true})
+
+	err := s.CreateTable(source)
+	if err == nil || !strings.Contains(err.Error(), "VARCHAR(4)") {
+		t.Fatalf("an existing incompatible column must fail: %v", err)
+	}
+	if len(s.tables) != 0 {
+		t.Fatalf("the table must not be cached: %#v", s.tables)
+	}
+}
+
+func TestSinkCreateTableRevalidatesAfterReconcile(t *testing.T) {
+	old := schemaChangePollInterval
+	schemaChangePollInterval = time.Millisecond
+	t.Cleanup(func() { schemaChangePollInterval = old })
+
+	// The ALTER succeeds but the column Doris created does not fit the source
+	// type: the table must be rejected, never cached.
+	f := newFakeSQL()
+	f.columns["db.orders"] = validTarget()
+	f.execHook = func(f *fakeSQL, statement string) {
+		if strings.Contains(statement, "ADD COLUMN") {
+			f.columns["db.orders"] = append(f.columns["db.orders"], descColumn{Name: "note", Type: "VARCHAR(4)", Nullable: true})
+		}
+	}
+	server := successServer(t, &[]string{})
+	s := testSink(t, server, f, definition.Sink{
+		Type: "doris", SchemaChange: true, SchemaChangeInclude: []string{"add.column"},
+		SchemaChangeWait: 100 * time.Millisecond,
+	})
+	source := validateSource()
+	source.Columns = append(source.Columns, schema.Column{Name: "note", Type: "varchar(32)", Nullable: true})
+
+	if err := s.CreateTable(source); err == nil {
+		t.Fatal("a reconciled column with the wrong type must fail")
+	}
+	if len(s.tables) != 0 {
+		t.Fatalf("the table must not be cached: %#v", s.tables)
+	}
+}
+
+func TestSinkCreateTablePartialReconcileIsNotCached(t *testing.T) {
+	old := schemaChangePollInterval
+	schemaChangePollInterval = time.Millisecond
+	t.Cleanup(func() { schemaChangePollInterval = old })
+
+	// Doris DDL has no rollback: the first column stays added when the second
+	// fails. The table must still not be cached, so the job stops instead of
+	// writing against a half-reconciled target.
+	f := newFakeSQL()
+	f.columns["db.orders"] = validTarget()
+	f.execHook = func(f *fakeSQL, statement string) {
+		if strings.Contains(statement, "ADD COLUMN `note`") {
+			f.columns["db.orders"] = append(f.columns["db.orders"], descColumn{Name: "note", Type: "VARCHAR(96)", Nullable: true})
+		}
+	}
+	f.execErrHook = func(f *fakeSQL, statement string) error {
+		if strings.Contains(statement, "ADD COLUMN `score`") {
+			return fmt.Errorf("sink.doris: Error 1105 (HY000): backend unavailable")
+		}
+		return nil
+	}
+	server := successServer(t, &[]string{})
+	s := testSink(t, server, f, definition.Sink{
+		Type: "doris", SchemaChange: true, SchemaChangeInclude: []string{"add.column"},
+		SchemaChangeWait: 100 * time.Millisecond,
+	})
+	source := validateSource()
+	source.Columns = append(source.Columns,
+		schema.Column{Name: "note", Type: "varchar(32)", Nullable: true},
+		schema.Column{Name: "score", Type: "int", Nullable: true},
+	)
+
+	err := s.CreateTable(source)
+	if err == nil || !strings.Contains(err.Error(), "score") {
+		t.Fatalf("err=%v", err)
+	}
+	if len(s.tables) != 0 {
+		t.Fatalf("a partially reconciled table must not be cached: %#v", s.tables)
 	}
 }
 
@@ -409,7 +822,8 @@ func TestSinkWriteRejectsIncompleteAfter(t *testing.T) {
 		Op: event.OpUpdate, Database: "db", Table: "orders",
 		SourceDatabase: "db", SourceTable: "orders",
 		Columns: []string{"id", "name"}, Keys: []string{"id"},
-		After: map[string]any{"id": int64(1)},
+		Before: map[string]any{"id": int64(1), "name": "a"},
+		After:  map[string]any{"id": int64(1)},
 	}
 	if err := s.Write([]event.Event{item}); err == nil || !strings.Contains(err.Error(), "missing column name") {
 		t.Fatalf("err=%v", err)
@@ -1244,6 +1658,214 @@ func TestSinkLoadLogsFatalOutcome(t *testing.T) {
 	}
 	if _, retried := capture.find(slog.LevelWarn, "doris: stream load not confirmed; retrying"); retried {
 		t.Fatal("a fatal outcome must not be retried")
+	}
+}
+
+func hasColumn(table schema.Table, name string) bool {
+	for _, column := range table.Columns {
+		if strings.EqualFold(column.Name, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func compositeTarget() []descColumn {
+	return []descColumn{
+		{Name: "tenant", Type: "VARCHAR(48)", Nullable: false, Key: true},
+		{Name: "id", Type: "BIGINT", Nullable: false, Key: true},
+		{Name: "name", Type: "VARCHAR(96)", Nullable: true},
+	}
+}
+
+func updateEvent(before, after map[string]any, columns, keys []string) event.Event {
+	return event.Event{
+		Op: event.OpUpdate, Database: "db", Table: "orders",
+		SourceDatabase: "db", SourceTable: "orders",
+		Columns: columns, Keys: keys, Before: before, After: after,
+	}
+}
+
+func TestSameKeyValue(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b any
+		want bool
+	}{
+		{"nil equals nil", nil, nil, true},
+		{"nil differs from zero", nil, int64(0), false},
+		{"nil differs from empty string", nil, "", false},
+		{"int64 equal", int64(7), int64(7), true},
+		{"int64 differ", int64(7), int64(8), false},
+		{"uint64 equal", uint64(7), uint64(7), true},
+		{"signed and unsigned stay apart", int64(7), uint64(7), false},
+		{"string equal", "gid-1", "gid-1", true},
+		{"string differs by case", "gid-1", "GID-1", false},
+		{"bytes equal", []byte("gid-1"), []byte("gid-1"), true},
+		{"bytes differ", []byte("gid-1"), []byte("gid-2"), false},
+		{"bytes are not strings", []byte("gid-1"), "gid-1", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sameKeyValue(tc.a, tc.b); got != tc.want {
+				t.Fatalf("sameKeyValue(%#v, %#v) = %t, want %t", tc.a, tc.b, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateEventsRejectsPrimaryKeyChange(t *testing.T) {
+	table := schemaFromDesc("db", "orders", validTarget())
+	item := updateEvent(
+		map[string]any{"id": int64(1), "name": "a"},
+		map[string]any{"id": int64(2), "name": "a"},
+		[]string{"id", "name"}, []string{"id"},
+	)
+	err := validateEvents([]event.Event{item}, table)
+	if err == nil {
+		t.Fatal("a primary key change must be rejected")
+	}
+	for _, want := range []string{"changed primary key id", "1 -> 2", "DELETE + INSERT", "mysql-sink"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error must mention %q: %v", want, err)
+		}
+	}
+}
+
+func TestValidateEventsRejectsCompositeKeyChange(t *testing.T) {
+	table := schemaFromDesc("db", "orders", compositeTarget())
+	item := updateEvent(
+		map[string]any{"tenant": "t1", "id": int64(1), "name": "a"},
+		map[string]any{"tenant": "t1", "id": int64(2), "name": "a"},
+		[]string{"tenant", "id", "name"}, []string{"tenant", "id"},
+	)
+	err := validateEvents([]event.Event{item}, table)
+	if err == nil || !strings.Contains(err.Error(), "changed primary key id") {
+		t.Fatalf("err=%v", err)
+	}
+	if strings.Contains(err.Error(), "changed primary key tenant") {
+		t.Fatalf("only the changed key column belongs in the error: %v", err)
+	}
+}
+
+func TestValidateEventsAllowsCompositeKeyChangeInNonKeyColumn(t *testing.T) {
+	table := schemaFromDesc("db", "orders", compositeTarget())
+	item := updateEvent(
+		map[string]any{"tenant": "t1", "id": int64(1), "name": "a"},
+		map[string]any{"tenant": "t1", "id": int64(1), "name": "b"},
+		[]string{"tenant", "id", "name"}, []string{"tenant", "id"},
+	)
+	if err := validateEvents([]event.Event{item}, table); err != nil {
+		t.Fatalf("an unchanged key must pass: %v", err)
+	}
+}
+
+func TestValidateEventsRejectsUpdateWithoutBeforeImage(t *testing.T) {
+	table := schemaFromDesc("db", "orders", validTarget())
+	// Without Before a moved primary key cannot be told apart from a value-only
+	// update, so the batch must stop instead of being written as an upsert.
+	item := event.Event{
+		Op: event.OpUpdate, Database: "db", Table: "orders",
+		SourceDatabase: "db", SourceTable: "orders",
+		Columns: []string{"id", "name"}, Keys: []string{"id"},
+		After: map[string]any{"id": int64(1), "name": "a"},
+	}
+	err := validateEvents([]event.Event{item}, table)
+	if err == nil || !strings.Contains(err.Error(), "no Before image") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateEventsRejectsNilPrimaryKey(t *testing.T) {
+	table := schemaFromDesc("db", "orders", validTarget())
+	item := createEvent(1, "a")
+	item.After["id"] = nil
+
+	err := validateEvents([]event.Event{item}, table)
+	if err == nil || !strings.Contains(err.Error(), "NULL value for primary key id") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateEventsRejectsNilCompositeKeyPart(t *testing.T) {
+	table := schemaFromDesc("db", "orders", compositeTarget())
+	item := createEvent(1, "a")
+	item.Keys = []string{"tenant", "id"}
+	item.Columns = []string{"tenant", "id", "name"}
+	item.After = map[string]any{"tenant": nil, "id": int64(1), "name": "a"}
+
+	err := validateEvents([]event.Event{item}, table)
+	if err == nil || !strings.Contains(err.Error(), "NULL value for primary key tenant") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateEventsRejectsUpdateWithoutBeforeKey(t *testing.T) {
+	table := schemaFromDesc("db", "orders", validTarget())
+	// A missing key value in Before is a broken image, not SQL NULL.
+	item := updateEvent(
+		map[string]any{"name": "a"},
+		map[string]any{"id": int64(1), "name": "a"},
+		[]string{"id", "name"}, []string{"id"},
+	)
+	err := validateEvents([]event.Event{item}, table)
+	if err == nil || !strings.Contains(err.Error(), "no Before value for primary key id") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestSinkWriteRejectsPrimaryKeyChangeWithoutStreamLoad(t *testing.T) {
+	requests := &[]string{}
+	server := successServer(t, requests)
+	s := testSink(t, server, newFakeSQL(), definition.Sink{Type: "doris"})
+	s.cacheTable(schemaFromDesc("db", "orders", validTarget()))
+
+	item := updateEvent(
+		map[string]any{"id": int64(1), "name": "a"},
+		map[string]any{"id": int64(2), "name": "a"},
+		[]string{"id", "name"}, []string{"id"},
+	)
+	if err := s.Write([]event.Event{item}); err == nil || !strings.Contains(err.Error(), "changed primary key") {
+		t.Fatalf("err=%v", err)
+	}
+	if len(*requests) != 0 {
+		t.Fatalf("no Stream Load may be sent for a key change: %#v", *requests)
+	}
+}
+
+func TestSinkWriteRejectsUpdateWithoutBeforeImageWithoutStreamLoad(t *testing.T) {
+	requests := &[]string{}
+	server := successServer(t, requests)
+	s := testSink(t, server, newFakeSQL(), definition.Sink{Type: "doris"})
+	s.cacheTable(schemaFromDesc("db", "orders", validTarget()))
+
+	item := updateEvent(nil, map[string]any{"id": int64(1), "name": "a"}, []string{"id", "name"}, []string{"id"})
+	if err := s.Write([]event.Event{item}); err == nil || !strings.Contains(err.Error(), "no Before image") {
+		t.Fatalf("err=%v", err)
+	}
+	if len(*requests) != 0 {
+		t.Fatalf("no Stream Load may be sent without a Before image: %#v", *requests)
+	}
+}
+
+func TestSinkWriteRejectsNilPrimaryKeysWithoutStreamLoad(t *testing.T) {
+	// Two NULL keys would coalesce into a single row: the batch must stop before
+	// Stream Load instead of silently dropping one of them.
+	requests := &[]string{}
+	server := successServer(t, requests)
+	s := testSink(t, server, newFakeSQL(), definition.Sink{Type: "doris"})
+	s.cacheTable(schemaFromDesc("db", "orders", validTarget()))
+
+	first := createEvent(1, "a")
+	first.After["id"] = nil
+	second := createEvent(2, "b")
+	second.After["id"] = nil
+	err := s.Write([]event.Event{first, second})
+	if err == nil || !strings.Contains(err.Error(), "NULL value for primary key id") {
+		t.Fatalf("err=%v", err)
+	}
+	if len(*requests) != 0 {
+		t.Fatalf("no Stream Load may be sent for NULL keys: %#v", *requests)
 	}
 }
 

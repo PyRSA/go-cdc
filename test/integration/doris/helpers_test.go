@@ -26,6 +26,10 @@ func integrationConfig(t *testing.T) definition.Sink {
 	t.Helper()
 	host := strings.TrimSpace(os.Getenv("DORIS_HOST"))
 	if host == "" {
+		if os.Getenv("CI") != "" {
+			// A skipped suite in CI would report success without touching Doris.
+			t.Fatal("DORIS_HOST is not set: the doris_integration suite would silently skip in CI")
+		}
 		t.Skip("DORIS_HOST not set; start test/integration/docker-compose.doris.yml first")
 	}
 	return definition.Sink{
@@ -240,7 +244,19 @@ func queryCount(t *testing.T, db *sql.DB, database, table string) int {
 	return int(count)
 }
 
-func describeColumns(t *testing.T, db *sql.DB, database, table string) map[string]string {
+// descCell keeps the raw DESC text and whether the driver returned SQL NULL.
+// The Default column needs both: NULL means "no default", while an empty
+// string means the column really defaults to the empty string (see
+// client_sql.descDefault).
+type descCell struct {
+	Text   string
+	IsNull bool
+}
+
+// describeTable returns the full DESC row for each column, keyed by the
+// lower-cased Field name. Tests read Null/Default/Key/Extra from here instead
+// of collapsing DESC to a type map.
+func describeTable(t *testing.T, db *sql.DB, database, table string) map[string]map[string]descCell {
 	t.Helper()
 	rows, err := db.Query("DESC " + schema.Qualified(database, table))
 	if err != nil {
@@ -251,19 +267,17 @@ func describeColumns(t *testing.T, db *sql.DB, database, table string) map[strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	nameAt, typeAt := -1, -1
+	fieldAt := -1
 	for i, name := range columns {
-		switch strings.ToLower(name) {
-		case "field":
-			nameAt = i
-		case "type":
-			typeAt = i
+		if strings.EqualFold(name, "Field") {
+			fieldAt = i
+			break
 		}
 	}
-	if nameAt < 0 || typeAt < 0 {
-		t.Fatalf("DESC columns %v", columns)
+	if fieldAt < 0 {
+		t.Fatalf("DESC %s.%s has no Field column: %v", database, table, columns)
 	}
-	out := map[string]string{}
+	out := map[string]map[string]descCell{}
 	for rows.Next() {
 		values := make([]any, len(columns))
 		ptrs := make([]any, len(columns))
@@ -273,10 +287,30 @@ func describeColumns(t *testing.T, db *sql.DB, database, table string) map[strin
 		if err := rows.Scan(ptrs...); err != nil {
 			t.Fatal(err)
 		}
-		out[strings.ToLower(cell(values[nameAt]))] = cell(values[typeAt])
+		row := make(map[string]descCell, len(columns))
+		for i, name := range columns {
+			row[strings.ToLower(name)] = descCell{Text: cell(values[i]), IsNull: values[i] == nil}
+		}
+		field := row["field"].Text
+		if field == "" {
+			t.Fatalf("DESC %s.%s returned an empty Field: %v", database, table, row)
+		}
+		out[strings.ToLower(field)] = row
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
+	}
+	if len(out) == 0 {
+		t.Fatalf("DESC %s.%s returned no columns", database, table)
+	}
+	return out
+}
+
+func describeColumns(t *testing.T, db *sql.DB, database, table string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for name, row := range describeTable(t, db, database, table) {
+		out[name] = row["type"].Text
 	}
 	return out
 }

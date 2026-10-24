@@ -13,6 +13,9 @@ on:
       - "test/integration/doris/**"
       - "test/integration/harness/doris_it.py"
       - "test/integration/harness/config.py"
+      - "test/integration/harness/logutil.py"
+      - "test/integration/harness/sysstat.py"
+      - "test/integration/harness/__init__.py"
       - "test/integration/harness/requirements.txt"
       - "test/integration/fixtures/seed_doris.sql"
       - "test/integration/fixtures/pipeline.doris.yaml.tpl"
@@ -28,6 +31,7 @@ on:
       - "test/integration/scale/doris_scale_it.py"
       - "test/integration/scale/doris_schemas.py"
       - "test/integration/scale/test_doris_schemas.py"
+      - "test/integration/scale/test_doris_scale_pipeline.py"
       - "test/integration/scripts/_log.sh"
       - "go.mod"
       - "go.sum"
@@ -43,6 +47,9 @@ on:
       - "test/integration/doris/**"
       - "test/integration/harness/doris_it.py"
       - "test/integration/harness/config.py"
+      - "test/integration/harness/logutil.py"
+      - "test/integration/harness/sysstat.py"
+      - "test/integration/harness/__init__.py"
       - "test/integration/harness/requirements.txt"
       - "test/integration/fixtures/seed_doris.sql"
       - "test/integration/fixtures/pipeline.doris.yaml.tpl"
@@ -58,6 +65,7 @@ on:
       - "test/integration/scale/doris_scale_it.py"
       - "test/integration/scale/doris_schemas.py"
       - "test/integration/scale/test_doris_schemas.py"
+      - "test/integration/scale/test_doris_scale_pipeline.py"
       - "test/integration/scripts/_log.sh"
       - "go.mod"
       - "go.sum"
@@ -112,6 +120,15 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+
+      - name: Vet unit and Doris integration tests
+        # Compile-checks the doris_integration suite before the heavy FE+BE pair
+        # starts, so a broken test file fails in seconds instead of after the
+        # cluster boots. golangci-lint does not see build-tagged files.
+        working-directory: ${{ github.workspace }}
+        run: |
+          go vet ./...
+          go vet -tags doris_integration ./test/integration/doris/
 
       - name: Setup Python
         uses: actions/setup-python@v5

@@ -103,6 +103,17 @@ func TestValidateTargetRejectsNarrowing(t *testing.T) {
 	}
 }
 
+func TestValidateTargetAcceptsNotNullSourceIntoNullableTarget(t *testing.T) {
+	// A nullable target column may receive a NOT NULL source column. The
+	// concurrent ADD COLUMN path (validateExistingColumn) applies the same
+	// one-way rule, so both directions are pinned on both paths.
+	source := validateSource()
+	source.Columns[1].Nullable = false
+	if err := validateTarget(source, validTarget()); err != nil {
+		t.Fatalf("a nullable target must accept a NOT NULL source column: %v", err)
+	}
+}
+
 func TestValidateTargetRejectsNullableIntoNotNull(t *testing.T) {
 	target := validTarget()
 	target[1].Nullable = false
@@ -157,8 +168,14 @@ func TestValidateExistingColumn(t *testing.T) {
 	if err := validateExistingColumn(existing, schema.Column{Name: "name", Type: "varchar(128)", Nullable: true}); err == nil {
 		t.Fatal("narrower target must fail")
 	}
-	if err := validateExistingColumn(existing, schema.Column{Name: "name", Type: "varchar(32)", Nullable: false}); err == nil {
-		t.Fatal("nullability mismatch must fail")
+	// A nullable target accepts a NOT NULL source column: validateTarget applies
+	// the same one-way rule, so both paths must agree.
+	if err := validateExistingColumn(existing, schema.Column{Name: "name", Type: "varchar(32)", Nullable: false}); err != nil {
+		t.Fatalf("a nullable target must accept a NOT NULL source column: %v", err)
+	}
+	strict := descColumn{Name: "name", Type: "VARCHAR(96)", Nullable: false}
+	if err := validateExistingColumn(strict, schema.Column{Name: "name", Type: "varchar(32)", Nullable: true}); err == nil {
+		t.Fatal("a NOT NULL target must reject a nullable source column")
 	}
 }
 

@@ -529,10 +529,10 @@ func parseSink(raw map[string]any) (Sink, error) {
 			return Sink{}, configErr("sink.username", "required")
 		}
 		if out.PartialUpdate {
-			return Sink{}, configErr("sink.partial-update.enabled", "partial column updates are not implemented in v1")
+			return Sink{}, configErr("sink.partial-update.enabled", "partial column updates are not implemented")
 		}
 		if out.DeleteEnabled {
-			return Sink{}, configErr("sink.delete.enabled", "DELETE is not implemented in v1")
+			return Sink{}, configErr("sink.delete.enabled", "DELETE is not implemented")
 		}
 		if out.DropTruncate {
 			return Sink{}, configErr("sink.schema.change.drop-truncate.enabled", "drop/truncate is not implemented for doris in v1")

@@ -80,8 +80,8 @@ type Sink struct {
 	SchemaChange        bool          // schema.change.enabled; default false
 	SchemaChangeInclude []string      // schema.change.include; v1 allows only add.column
 	SchemaChangeWait    time.Duration // schema.change.wait-timeout; ADD COLUMN visibility budget
-	PartialUpdate       bool          // partial-update.enabled; v1 must stay false
-	DeleteEnabled       bool          // delete.enabled; v1 must stay false
+	PartialUpdate       bool          // partial-update.enabled; must stay false
+	DeleteEnabled       bool          // delete.enabled; must stay false
 	Buckets             string        // buckets; "auto" or a positive integer
 	ReplicationNum      int           // replication-num; 0 omits PROPERTIES
 }

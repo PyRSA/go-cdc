@@ -133,6 +133,7 @@ func waitForLoadState(t *testing.T, db *sql.DB, database, label string) map[stri
 	filtered := "SHOW LOAD FROM " + schema.Quote(database) + " WHERE Label = '" + label + "'"
 	unfiltered := "SHOW LOAD FROM " + schema.Quote(database)
 	var last map[string]string
+	logged := ""
 	for {
 		row, ok := findLoadRow(t, db, filtered, label, true)
 		if !ok {
@@ -140,6 +141,12 @@ func waitForLoadState(t *testing.T, db *sql.DB, database, label string) map[stri
 		}
 		if ok {
 			last = row
+			seen := row["state"] + "/" + row["jobid"]
+			if seen != logged {
+				logged = seen
+				t.Logf("SHOW LOAD label=%s state=%s jobid=%s type=%s loadstarttime=%s etlstarttime=%s errormsg=%q",
+					label, row["state"], row["jobid"], row["type"], row["loadstarttime"], row["etlstarttime"], row["errormsg"])
+			}
 			state := strings.ToUpper(row["state"])
 			switch state {
 			case "FINISHED":
@@ -159,7 +166,12 @@ func waitForLoadState(t *testing.T, db *sql.DB, database, label string) map[stri
 	}
 }
 
-func findLoadRow(t *testing.T, db *sql.DB, query, label string, exactFilter bool) (map[string]string, bool) {
+// loadRows runs one SHOW LOAD statement and returns only the rows whose Label
+// matches, together with the number of rows Doris actually returned. The
+// returned count makes WHERE effectiveness observable: a filtered query that
+// returns unrelated jobs proves the build ignored the filter (the sink
+// validates every row for exactly that reason).
+func loadRows(t *testing.T, db *sql.DB, query, label string, exactFilter bool) (matched []map[string]string, returned int) {
 	t.Helper()
 	rows, err := db.Query(query)
 	if err != nil {
@@ -170,7 +182,7 @@ func findLoadRow(t *testing.T, db *sql.DB, query, label string, exactFilter bool
 	if err != nil {
 		t.Fatalf("show load columns: %v", err)
 	}
-	var match map[string]string
+	ignored := 0
 	for rows.Next() {
 		values := make([]any, len(columns))
 		ptrs := make([]any, len(columns))
@@ -184,13 +196,154 @@ func findLoadRow(t *testing.T, db *sql.DB, query, label string, exactFilter bool
 		for i, name := range columns {
 			row[strings.ToLower(name)] = cell(values[i])
 		}
-		if !exactFilter && !strings.EqualFold(row["label"], label) {
+		returned++
+		if !strings.EqualFold(row["label"], label) {
+			ignored++
 			continue
 		}
-		match = row
+		matched = append(matched, row)
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatalf("show load rows: %v", err)
 	}
-	return match, match != nil
+	if exactFilter && ignored > 0 {
+		t.Logf("SHOW LOAD WHERE Label=%q returned %d unrelated row(s) out of %d: Doris ignored the filter; the sink validates every row anyway",
+			label, ignored, returned)
+	}
+	return matched, returned
+}
+
+func filteredLoadRows(t *testing.T, db *sql.DB, database, label string) ([]map[string]string, int) {
+	t.Helper()
+	query := "SHOW LOAD FROM " + schema.Quote(database) + " WHERE Label = '" + label + "'"
+	return loadRows(t, db, query, label, true)
+}
+
+// findLoadRow returns the only row for label. A second row is a hard failure:
+// the sink refuses to guess in that case (client_sql.showLoadQuery) and a test
+// helper that silently kept the last row would hide exactly the ambiguity M-4
+// is about.
+func findLoadRow(t *testing.T, db *sql.DB, query, label string, exactFilter bool) (map[string]string, bool) {
+	t.Helper()
+	matched, _ := loadRows(t, db, query, label, exactFilter)
+	switch len(matched) {
+	case 0:
+		return nil, false
+	case 1:
+		return matched[0], true
+	default:
+		t.Fatalf("SHOW LOAD returned %d rows for label %q; the sink treats a duplicate label as fatal: %v",
+			len(matched), label, matched)
+		return nil, false
+	}
+}
+
+// assertSingleLoadRow reports how many rows SHOW LOAD exposes for one label.
+// Zero rows is logged rather than failed (no ambiguity is possible then, and
+// the sink retries the same label); anything above one fails, because that is
+// the condition the sink refuses to resolve by row order.
+func assertSingleLoadRow(t *testing.T, db *sql.DB, database, label string) map[string]string {
+	t.Helper()
+	filtered, filteredReturned := filteredLoadRows(t, db, database, label)
+	unfiltered := "SHOW LOAD FROM " + schema.Quote(database)
+	scanned, scannedReturned := loadRows(t, db, unfiltered, label, false)
+	t.Logf("SHOW LOAD label=%s: filtered rows=%d (returned %d), full scan rows=%d (scanned %d)",
+		label, len(filtered), filteredReturned, len(scanned), scannedReturned)
+	if len(filtered) > 1 {
+		t.Fatalf("SHOW LOAD WHERE Label=%q returned %d rows; the sink treats a duplicate label as fatal: %v",
+			label, len(filtered), filtered)
+	}
+	if len(scanned) > 1 {
+		t.Fatalf("SHOW LOAD FROM %s returned %d rows for label %q; the sink treats a duplicate label as fatal: %v",
+			database, len(scanned), label, scanned)
+	}
+	if len(filtered) == 0 && len(scanned) == 1 {
+		t.Logf("SHOW LOAD WHERE Label=%q returned no rows; the sink falls back to a full scan, which found the one row", label)
+	}
+	if len(scanned) == 0 {
+		t.Logf("SHOW LOAD exposes no row for label %q; duplicate-label ambiguity cannot occur, but the sink cannot confirm this load's state", label)
+		return nil
+	}
+	return scanned[0]
+}
+
+func dorisVersion(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	if row, ok, err := queryOptionalRow(db, "SHOW FRONTENDS"); err == nil && ok && row["version"] != "" {
+		return row["version"]
+	}
+	if row, ok, err := queryOptionalRow(db, "SELECT VERSION() AS version"); err == nil && ok && row["version"] != "" {
+		return row["version"]
+	}
+	return "unavailable"
+}
+
+// TestIntegrationShowLoadSingleRowPerLabel is the P0 probe for M-4: one
+// Stream Load must surface as exactly one SHOW LOAD row, the label filter must
+// not leak another job, and a retry with the same label must not add a second
+// row. Two labels in one database make an ignored WHERE clause observable.
+func TestIntegrationShowLoadSingleRowPerLabel(t *testing.T) {
+	cfg := integrationConfig(t)
+	db := openDB(t, cfg)
+	t.Logf("Doris FE version: %s", dorisVersion(t, db))
+	database := uniqueName("go_cdc_it")
+	createDatabase(t, db, database)
+	const table = "load_labels"
+
+	sk := openSink(t, cfg)
+	if err := sk.CreateTable(ordersTable(database, table)); err != nil {
+		t.Fatalf("create %s: %v", table, err)
+	}
+
+	stamp := time.Now().UnixNano()
+	labels := []string{
+		fmt.Sprintf("go_cdc_it_%d_a", stamp),
+		fmt.Sprintf("go_cdc_it_%d_b", stamp),
+	}
+	for i, label := range labels {
+		body := []byte(fmt.Sprintf(`{"id":%d,"name":"row-%d"}`, i+1, i+1) + "\n")
+		resp := rawStreamLoad(t, cfg, database, table, label, body)
+		if resp.Status != "Success" {
+			t.Fatalf("stream load %s status=%q message=%q", label, resp.Status, resp.Message)
+		}
+		if resp.Label != "" && resp.Label != label {
+			t.Fatalf("stream load %s response Label=%q", label, resp.Label)
+		}
+	}
+
+	for _, label := range labels {
+		state := waitForLoadState(t, db, database, label)
+		if state == nil {
+			t.Logf("SHOW LOAD never exposed label %s; skipping row assertions for it", label)
+			continue
+		}
+		observed := assertSingleLoadRow(t, db, database, label)
+		if observed == nil {
+			continue
+		}
+		if observed["label"] != label {
+			t.Fatalf("SHOW LOAD row label=%q want %q", observed["label"], label)
+		}
+		if observed["jobid"] == "" {
+			t.Fatalf("SHOW LOAD row for %s has no JobId: %v", label, observed)
+		}
+		if observed["state"] == "" {
+			t.Fatalf("SHOW LOAD row for %s has no State: %v", label, observed)
+		}
+	}
+
+	// Retrying a label that already finished is the one path that can add a
+	// second SHOW LOAD row for the same label. Production treats that as fatal,
+	// so it must stay at one row here.
+	dup := rawStreamLoad(t, cfg, database, table, labels[0], []byte(`{"id":1,"name":"row-1"}`+"\n"))
+	t.Logf("duplicate label %s response: status=%q existing_job_status=%q", labels[0], dup.Status, dup.ExistingJobStatus)
+	if dup.Status == "Label Already Exists" && dup.ExistingJobStatus != "" &&
+		!strings.EqualFold(dup.ExistingJobStatus, "FINISHED") {
+		t.Fatalf("duplicate label %s ExistingJobStatus=%q", labels[0], dup.ExistingJobStatus)
+	}
+	assertSingleLoadRow(t, db, database, labels[0])
+
+	if got := queryCount(t, db, database, table); got != 2 {
+		t.Fatalf("row count=%d want 2 (a duplicate label must not append rows)", got)
+	}
 }

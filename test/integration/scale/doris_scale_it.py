@@ -39,6 +39,7 @@ from harness.config import (
     DORIS_HOST,
     DORIS_HTTP_PORT,
     DORIS_PASSWORD,
+    DORIS_REPLICATION_NUM,
     DORIS_SQL_PORT,
     DORIS_USER,
     MYSQL_HOST,
@@ -186,6 +187,19 @@ def ensure_databases(profile: Profile) -> None:
             cur.execute("FLUSH PRIVILEGES")
 
 
+def _doris_databases() -> set[str]:
+    """Existing Doris databases (empty set tolerated on a clean run)."""
+    conn = doris_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SHOW DATABASES")
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    key = "Database"
+    return {str(r[key] if key in r else next(iter(r.values()))) for r in rows}
+
+
 def ensure_tables(profile: Profile) -> None:
     """DROP+CREATE source tables; drop any leftover Doris sink tables."""
     src_dbs = sorted({t.src_db for t in profile.tables})
@@ -205,8 +219,12 @@ def ensure_tables(profile: Profile) -> None:
                 cur.execute(f"USE `{t.src_db}`")
                 cur.execute(create_table_sql(t.template, t.name))
 
-    # Best-effort sink wipe; missing databases/tables are expected on a clean run.
+    # Best-effort sink wipe; sink databases are created by the sink itself, so a
+    # clean run has none of them and DROP on an unknown database is expected noise.
+    existing = _doris_databases()
     for t in profile.tables:
+        if t.snk_db not in existing:
+            continue
         try:
             conn = doris_conn()
             try:
@@ -407,6 +425,9 @@ def render_pipeline_yaml(profile: Profile, path: Path) -> None:
         f"  username: {DORIS_USER}",
         f'  password: "{DORIS_PASSWORD}"',
         "  auto-create-table: true",
+        # Without this property the FE applies its own default of 3 replicas, which
+        # a single-BE CI cluster rejects at table creation, so pass the env value.
+        f"  replication-num: {DORIS_REPLICATION_NUM}",
         "  write-batch-size: 1000",
         "  write-batch-interval: 500ms",
         "  max-retries: 3",

@@ -127,6 +127,9 @@ func addColumnSQL(database, table string, column schema.Column) (string, error) 
 		if _, ok, err := defaultClause(column, mapped); err != nil {
 			return "", fmt.Errorf("column %s: %w", column.Name, err)
 		} else if !ok {
+			if column.AutoIncrement {
+				return "", fmt.Errorf("doris: add column %s is AUTO_INCREMENT and NOT NULL; Doris has no auto-increment value column, so it needs a literal default on the source or must be added manually", column.Name)
+			}
 			return "", fmt.Errorf("doris: add column %s is NOT NULL without a usable literal default; Doris requires a default for a new value column", column.Name)
 		}
 	}

@@ -1,6 +1,7 @@
 package doris
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -85,18 +86,12 @@ func (s *Sink) Open(ctx context.Context) error {
 func (s *Sink) CreateTable(table schema.Table) (err error) {
 	table = s.withDatabase(table)
 	var live schema.Table
-	var pendingColumns []string
 	defer func() {
 		if err != nil {
 			// A rejected target is never cached as writable, so this is the only
 			// structured record of why it cannot be written to.
 			s.logger().Warn("doris: target table rejected",
 				"database", table.Database, "table", table.Table, "error", err)
-			return
-		}
-		if len(pendingColumns) > 0 {
-			s.logger().Warn("doris: target table accepted with pending source columns; a replayed ADD COLUMN must create them before the first row",
-				"database", live.Database, "table", live.Table, "columns", pendingColumns)
 			return
 		}
 		s.logger().Info("doris: target table validated",
@@ -144,17 +139,146 @@ func (s *Sink) CreateTable(table schema.Table) (err error) {
 		if !errors.As(err, &missing) {
 			return err
 		}
-		// A column added while the job was down is still ahead in the binlog:
-		// the pending ADD COLUMN creates it before any row that carries it.
-		// Failing here would make every restart hit the same wall, so accept
-		// the table and let validateEvents enforce the invariant on real rows.
-		pendingColumns = missing.Columns
+		// A missing source column is never waited for: a column that reached the
+		// source catalogue before the checkpoint has no ADD COLUMN left to replay,
+		// and the snapshot path emits rows carrying it before any binlog DDL. The
+		// table is reconciled now, or the job stops with an actionable error.
+		columns, err = s.reconcileMissingColumns(table, missing.Columns)
+		if err != nil {
+			return err
+		}
+		// Doris cannot roll back an ALTER that already ran, so a partially
+		// reconciled table is re-validated as a whole before it is cached.
+		if err := validateTarget(table, columns); err != nil {
+			return fmt.Errorf("sink.doris: target %s is still not compatible after adding the missing columns: %w",
+				schema.Qualified(table.Database, table.Table), err)
+		}
 	}
 	// Cache the live DESC shape (Doris types + key casing) so Write/encode
 	// always see one dialect after create or restart.
 	live = schemaFromDesc(table.Database, table.Table, columns)
 	s.cacheTable(live)
 	return nil
+}
+
+// reconcileMissingColumns brings an existing target up to the source catalogue
+// shape. This is the only ALTER path besides ApplySchema, and it runs only when
+// schema evolution is enabled and grants add.column: auto-create-table covers
+// creation only and never authorises changing an existing table.
+//
+// Doris DDL has no rollback. When column N fails, the columns added before it
+// stay, so the error names the failing column and the table is returned as not
+// validated (and therefore not cached) to stop the job at that table.
+func (s *Sink) reconcileMissingColumns(table schema.Table, missing []string) ([]descColumn, error) {
+	qualified := schema.Qualified(table.Database, table.Table)
+	if !s.cfg.SchemaChange || !contains(s.cfg.SchemaChangeInclude, "add.column") {
+		return nil, fmt.Errorf("sink.doris: target %s is missing column %s and this sink may not alter an existing table: set sink.schema.change.enabled: true with sink.schema.change.include: [add.column], or run ALTER TABLE %s ADD COLUMN ... manually",
+			qualified, strings.Join(missing, ", "), qualified)
+	}
+	byName := make(map[string]schema.Column, len(table.Columns))
+	for _, column := range table.Columns {
+		byName[strings.ToLower(column.Name)] = column
+	}
+	for _, name := range missing {
+		column, ok := byName[strings.ToLower(name)]
+		if !ok {
+			return nil, fmt.Errorf("sink.doris: target %s is missing column %s but the source definition has no such column",
+				qualified, name)
+		}
+		if err := s.addMissingColumn(table, column); err != nil {
+			return nil, err
+		}
+	}
+	// Re-read the structure instead of assuming the ALTER result: the caller
+	// re-validates the whole target before caching it.
+	return s.sql.descTable(context.Background(), table.Database, table.Table)
+}
+
+// addMissingColumn runs one ADD COLUMN and proves it took effect. Doris applies
+// schema changes asynchronously, so the DESC poll after Exec doubles as the
+// visibility check. A failed Exec is reconciled through DESC first: another
+// writer may have added the same compatible column, which is a success here.
+func (s *Sink) addMissingColumn(table schema.Table, column schema.Column) error {
+	statement, err := addColumnSQL(table.Database, table.Table, column)
+	if err != nil {
+		return fmt.Errorf("sink.doris: target %s cannot be reconciled: %w",
+			schema.Qualified(table.Database, table.Table), err)
+	}
+	s.logger().Info("doris: adding missing column",
+		"database", table.Database, "table", table.Table,
+		"column", column.Name, "statement", statement)
+	if execErr := s.sql.Exec(context.Background(), statement); execErr != nil {
+		return s.awaitColumnAfterDDLError(table.Database, table.Table, column, execErr)
+	}
+	return s.waitForColumn(table.Database, table.Table, column)
+}
+
+// awaitColumnAfterDDLError resolves a failed ADD COLUMN. A rejected response does
+// not prove the DDL did not run: the FE may have committed it and lost the
+// response, and Doris applies schema changes asynchronously. The column is
+// therefore polled for the same bounded budget ApplySchema uses.
+//
+// A DESC failure is never read as "column missing": when the wait expires the
+// error keeps the original DDL failure, the number of polls, and whether the
+// structure was readable but the column never appeared.
+func (s *Sink) awaitColumnAfterDDLError(database, table string, column schema.Column, ddlErr error) error {
+	timeout := s.schemaChangeWait()
+	interval := schemaChangePollInterval
+	if interval <= 0 {
+		interval = 500 * time.Millisecond
+	}
+	deadline := time.Now().Add(timeout)
+	polls := 0
+	var lastDescErr error
+	notVisible := false
+	for {
+		polls++
+		existing, ok, descErr := s.lookupColumn(database, table, column.Name)
+		switch {
+		case descErr != nil:
+			lastDescErr = descErr
+		case ok:
+			if compatErr := validateExistingColumn(existing, column); compatErr != nil {
+				return fmt.Errorf("sink.doris: add column %s.%s.%s failed (%v) and the column now present is not the source definition: %w",
+					database, table, column.Name, ddlErr, compatErr)
+			}
+			// The DDL did take effect despite the failed response.
+			s.logger().Info("doris: missing column was already added",
+				"database", database, "table", table, "column", column.Name,
+				"polls", polls, "ddl_error", ddlErr)
+			return nil
+		default:
+			notVisible = true
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		if remaining > interval {
+			remaining = interval
+		}
+		time.Sleep(remaining)
+	}
+	detail := ""
+	if lastDescErr != nil {
+		detail += fmt.Sprintf("; the structure re-read failed: %v", lastDescErr)
+	}
+	if notVisible {
+		detail += "; DESC succeeded but the column never became visible"
+	}
+	return fmt.Errorf("sink.doris: add column %s.%s.%s did not take effect within %s (%d polls): %w%s",
+		database, table, column.Name, timeout, polls, ddlErr, detail)
+}
+
+// lookupColumn re-reads DESC to tell a concurrent ADD COLUMN apart from a real
+// failure.
+func (s *Sink) lookupColumn(database, table, name string) (descColumn, bool, error) {
+	columns, err := s.sql.descTable(context.Background(), database, table)
+	if err != nil {
+		return descColumn{}, false, err
+	}
+	existing, ok := findColumn(columns, name)
+	return existing, ok, nil
 }
 
 // ApplySchema executes a Doris ADD COLUMN generated from structured metadata.
@@ -525,7 +649,7 @@ func validateEvents(batch []event.Event, table schema.Table) error {
 		switch item.Op {
 		case event.OpRead, event.OpCreate, event.OpUpdate:
 		case event.OpDelete:
-			return fmt.Errorf("sink.doris: %s DELETE is not supported in v1 (delete.enabled=false)", item.SinkID())
+			return fmt.Errorf("sink.doris: %s DELETE is not supported (delete.enabled=false)", item.SinkID())
 		default:
 			return fmt.Errorf("sink.doris: %s unsupported event op %q", item.SinkID(), item.Op)
 		}
@@ -535,10 +659,28 @@ func validateEvents(batch []event.Event, table schema.Table) error {
 		if len(item.Keys) == 0 {
 			return fmt.Errorf("sink.doris: %s event has no primary key", item.SinkID())
 		}
+		if item.Op == event.OpUpdate {
+			if item.Before == nil {
+				// Without the Before image a moved primary key cannot be told apart
+				// from a value-only update, and writing After as an upsert would
+				// leave the old key behind. Refuse instead of guessing.
+				return fmt.Errorf("sink.doris: %s UPDATE has no Before image, so a primary key change cannot be ruled out: Doris v1 cannot retract the old row; a sink supporting DELETE + INSERT (for example mysql-sink) is required for such events",
+					item.SinkID())
+			}
+			if err := checkPrimaryKeyUnchanged(item); err != nil {
+				return err
+			}
+		}
 		actualKeys := make(map[string]struct{}, len(item.Keys))
 		for _, key := range item.Keys {
-			if _, ok := mapValueCI(item.After, key); !ok {
+			value, ok := mapValueCI(item.After, key)
+			if !ok {
 				return fmt.Errorf("sink.doris: %s has no primary key value for %s", item.SinkID(), key)
+			}
+			if value == nil {
+				// A NULL key is not deduplicable: coalesce would fold every NULL
+				// key of the batch into one row and drop the others silently.
+				return fmt.Errorf("sink.doris: %s has a NULL value for primary key %s; a NULL key cannot be deduplicated", item.SinkID(), key)
 			}
 			actualKeys[strings.ToLower(key)] = struct{}{}
 		}
@@ -559,6 +701,87 @@ func validateEvents(batch []event.Event, table schema.Table) error {
 		}
 	}
 	return nil
+}
+
+// checkPrimaryKeyUnchanged rejects an UPDATE whose primary key moved. Doris v1
+// has no DELETE, so writing the After image would insert a new row and leave the
+// Before row behind: the target would silently hold both. The source always
+// sends a full Before image (binlog_row_image=FULL), so a key that is absent
+// from Before is a broken image and is reported as such instead of being read as
+// SQL NULL.
+func checkPrimaryKeyUnchanged(item event.Event) error {
+	for _, key := range item.Keys {
+		before, ok := mapValueCI(item.Before, key)
+		if !ok {
+			return fmt.Errorf("sink.doris: %s UPDATE has no Before value for primary key %s", item.SinkID(), key)
+		}
+		if before == nil {
+			return fmt.Errorf("sink.doris: %s UPDATE has a NULL value for primary key %s in Before", item.SinkID(), key)
+		}
+		after, ok := mapValueCI(item.After, key)
+		if !ok {
+			return fmt.Errorf("sink.doris: %s UPDATE has no After value for primary key %s", item.SinkID(), key)
+		}
+		if after == nil {
+			return fmt.Errorf("sink.doris: %s UPDATE has a NULL value for primary key %s in After", item.SinkID(), key)
+		}
+		if sameKeyValue(before, after) {
+			continue
+		}
+		return fmt.Errorf("sink.doris: %s UPDATE changed primary key %s (%s -> %s); Doris v1 cannot retract the old row, so a key change cannot be applied as an upsert: use a sink that supports DELETE + INSERT (for example mysql-sink), or do not modify primary keys on the source",
+			item.SinkID(), key, formatKeyValue(before), formatKeyValue(after))
+	}
+	return nil
+}
+
+// sameKeyValue compares one primary-key value from Before and After. Both
+// images are built by connector/source/mysql.Normalize, so one column keeps one
+// Go type across them: int64, uint64, string (decimals and temporals), []byte
+// (binaries) or nil. Equality is therefore decided per concrete type rather than
+// by fmt.Sprint, which would equate 1, 1.0 and "1" and could hide a real key
+// change. nil is only equal to nil.
+func sameKeyValue(a, b any) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	if left, ok := a.([]byte); ok {
+		right, ok := b.([]byte)
+		return ok && bytes.Equal(left, right)
+	}
+	switch left := a.(type) {
+	case int64:
+		right, ok := b.(int64)
+		return ok && left == right
+	case uint64:
+		right, ok := b.(uint64)
+		return ok && left == right
+	case string:
+		right, ok := b.(string)
+		return ok && left == right
+	case bool:
+		right, ok := b.(bool)
+		return ok && left == right
+	default:
+		// Normalize folds every unknown type into a string, so this branch only
+		// sees values that bypassed it. Two of those are never proven equal:
+		// claiming equality could hide a real primary key change.
+		return false
+	}
+}
+
+// formatKeyValue renders a key value for an error message without dumping raw
+// bytes at the operator.
+func formatKeyValue(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return "NULL"
+	case []byte:
+		return fmt.Sprintf("%q", string(typed))
+	case string:
+		return fmt.Sprintf("%q", typed)
+	default:
+		return fmt.Sprint(typed)
+	}
 }
 
 // coalesce keeps the last event per primary key. Doris Stream Load does not

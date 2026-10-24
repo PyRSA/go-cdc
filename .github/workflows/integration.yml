@@ -116,7 +116,7 @@ jobs:
         working-directory: test/integration
         run: |
           python3 -m pip install -r harness/requirements.txt
-          python3 -m pytest -q scale/test_profiles.py scale/test_schemas.py
+          python3 -m pytest -q scale/
 
       - name: Build go-cdc binary
         run: make build
