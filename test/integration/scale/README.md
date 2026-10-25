@@ -66,7 +66,7 @@ Optional overrides (env or CLI flags on `scale_it`):
 | `SCALE_PEAK_WORKERS` | same as `workers` | **heavy only**: peak writer threads |
 | `SCALE_PEAK_BATCH` | `200` | **heavy only**: rows per peak INSERT batch |
 
-**Heavy hotspot stress** (after mutate catch-up): one hotspot table per source DB (`min(ordinal)`), then burst → timed peak → hotspot count convergence (≤1%, timeout 3600s) → full checksum verify. Normal profile skips this.
+**Heavy hotspot stress** (after mutate catch-up): one hotspot table per source DB (`min(ordinal)`), then burst → timed peak → hotspot count convergence (src/sink `COUNT(*)` must be exactly equal; the delta shown in logs is trend-only) → eventual-consistency checksum verify (`COUNT + SUM(id) + name_crc`, retried every 15s). Both phases share ONE 3600s deadline created when peak catch-up starts (no stacked timeouts); fetch/SQL errors and a dead go-cdc process fail fast instead of being retried. Normal profile skips this.
 
 Dry topology (no MySQL):
 
