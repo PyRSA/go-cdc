@@ -43,6 +43,11 @@ CDC_SERVER_ID_SCALE = os.environ.get("CDC_SERVER_ID_SCALE", "5616")
 SCALE_BURST_ROWS_PER_HOT = int(os.environ.get("SCALE_BURST_ROWS_PER_HOT", "50000"))
 SCALE_PEAK_SECONDS = int(os.environ.get("SCALE_PEAK_SECONDS", "45"))
 SCALE_PEAK_BATCH = int(os.environ.get("SCALE_PEAK_BATCH", "200"))
+# Shared budget (seconds) spanning hotspot count convergence + final checksum
+# verify. One deadline is created at peak-catchup start and reused by both so
+# the two phases never re-time independently (no 3600s + 3600s stacking). This
+# mirrors the existing 3600s phase timeout; it is not a new tunable.
+PEAK_CATCHUP_BUDGET_S = 3600.0
 
 __all__ = [
     "ROOT_USER",
@@ -56,6 +61,8 @@ __all__ = [
     "seed_all",
     "fetch_checksum",
     "verify_pair",
+    "verify_pair_eventual",
+    "wait_hotspot_convergence",
     "render_pipeline_yaml",
     "start_job",
     "stop_job",
@@ -186,12 +193,17 @@ def fetch_checksum(
     return (int(row["cnt"]), int(row["sum_id"]), int(row["name_crc"]))
 
 
-def verify_pair(profile: Profile, phase: str) -> list[str]:
-    """Compare source vs sink checksums; empty list means pass.
+def _checksum_diff(
+    profile: Profile, phase: str
+) -> tuple[list[str], list[str]]:
+    """Compare src vs sink (cnt, sum_id, name_crc) triples for every table.
 
-    Failure strings look like ``db.table: reason``.
+    Returns (mismatches, fetch_errors); failure strings look like
+    ``db.table: reason``. Kept separate so callers can tell a still-draining
+    sink (retryable) apart from a DB / SQL fault (not retryable).
     """
-    failures: list[str] = []
+    mismatches: list[str] = []
+    fetch_errors: list[str] = []
     for t in profile.tables:
         label = f"{t.src_db}.{t.name}"
         try:
@@ -200,14 +212,75 @@ def verify_pair(profile: Profile, phase: str) -> list[str]:
                 SINK_USER, SINK_PASSWORD, t.snk_db, t.sink_name, t.template
             )
         except Exception as exc:  # noqa: BLE001
-            failures.append(f"{label}: {phase} fetch error: {exc}")
+            fetch_errors.append(f"{label}: {phase} fetch error: {exc}")
             continue
         if src != snk:
-            failures.append(
+            mismatches.append(
                 f"{label}: {phase} mismatch src(cnt,sum_id,name_crc)={src} "
                 f"sink={snk}"
             )
-    return failures
+    return mismatches, fetch_errors
+
+
+def verify_pair(profile: Profile, phase: str) -> list[str]:
+    """Compare source vs sink checksums; empty list means pass.
+
+    Failure strings look like ``db.table: reason``.
+    """
+    mismatches, fetch_errors = _checksum_diff(profile, phase)
+    return fetch_errors + mismatches
+
+
+def verify_pair_eventual(
+    profile: Profile,
+    deadline: float,
+    interval: float = 15.0,
+    proc: subprocess.Popen | None = None,
+    phase: str = "final",
+) -> list[str]:
+    """Poll the exact (cnt, sum_id, name_crc) verify until it passes or ``deadline``.
+
+    Tolerates the tail of CDC drain after heavy hotspot writes: a count-equal
+    but content-lagging sink is a mismatch and keeps being retried, so the
+    single-shot race between hotspot convergence and the exact final verify is
+    gone. ``deadline`` is an absolute time.time() value shared with
+    wait_hotspot_convergence (one budget, not a fresh 3600s here). Not
+    tolerated, to avoid masking real faults:
+      - fetch / SQL / connection errors -> raised immediately (never retried);
+      - go-cdc exit -> raised immediately via _assert_cdc_alive;
+      - deadline reached with mismatches -> returned so the caller reports FAIL
+        with the last-seen src/sink triples per table.
+    On success also runs verify_update_markers once and returns its failures.
+    """
+    t0 = time.time()
+    last_log = 0.0
+    last_failures: list[str] = []
+    while True:
+        _assert_cdc_alive(proc, "final verify")
+        mismatches, fetch_errors = _checksum_diff(profile, phase)
+        if fetch_errors:
+            raise RuntimeError(
+                "final checksum fetch failed (not retried so a real fault is "
+                "never masked as a transient mismatch):\n"
+                + "\n".join(fetch_errors)
+            )
+        now = time.time()
+        if now - last_log >= interval or not mismatches or now >= deadline:
+            sample = "; ".join(mismatches[:3]) if mismatches else "ok"
+            log(
+                f"    final verify {now - t0:.0f}s: "
+                f"mismatches={len(mismatches)} {sample}",
+                flush=True,
+            )
+            last_log = now
+        if not mismatches:
+            elapsed = time.time() - t0
+            log(f"TIMING  wait [final_verify] done in {elapsed:.1f}s", flush=True)
+            return verify_update_markers(profile, phase)
+        last_failures = mismatches
+        if now >= deadline:
+            return last_failures
+        time.sleep(interval)
 
 
 def _yaml_path(profile: Profile) -> Path:
@@ -792,15 +865,30 @@ def peak_write_hotspots(
     return elapsed, rows
 
 
+def _hotspot_pair_counts(h: TableSpec) -> tuple[int, int]:
+    """Return (src, sink) row counts for one hotspot table."""
+    return (
+        _count_rows(SRC_USER, SRC_PASSWORD, h.src_db, h.name),
+        _count_rows(SINK_USER, SINK_PASSWORD, h.snk_db, h.sink_name),
+    )
+
+
 def wait_hotspot_convergence(
     hotspots: list[TableSpec],
-    timeout: float = 3600,
+    deadline: float,
     interval: float = 15.0,
     proc: subprocess.Popen | None = None,
 ) -> float:
-    """Poll until each hotspot src/sink COUNT converges within 1%."""
+    """Poll until each hotspot src/sink row COUNT matches exactly.
+
+    ``deadline`` is an absolute time.time() budget shared with
+    verify_pair_eventual (created once at peak-catchup start). Counts must be
+    equal — no percentage tolerance — but content equality is deliberately NOT
+    checked here (cheap COUNT only); verify_pair_eventual does the exact
+    (cnt, sum_id, name_crc) check afterwards within the remaining budget. The
+    delta percent in the progress log is trend display only.
+    """
     t0 = time.time()
-    deadline = t0 + timeout
     last_log = 0.0
     format_cpu_mem()  # baseline /proc/stat so the first periodic line has cpu=%
     while time.time() < deadline:
@@ -808,13 +896,12 @@ def wait_hotspot_convergence(
         ok = True
         lines: list[str] = []
         for h in hotspots:
-            src_n = _count_rows(SRC_USER, SRC_PASSWORD, h.src_db, h.name)
-            snk_n = _count_rows(SINK_USER, SINK_PASSWORD, h.snk_db, h.sink_name)
+            src_n, snk_n = _hotspot_pair_counts(h)
             delta = abs(src_n - snk_n) / max(src_n, 1)
             lines.append(
                 f"{h.src_db}.{h.name} src={src_n} snk={snk_n} delta={delta:.2%}"
             )
-            if delta > 0.01:
+            if src_n != snk_n:
                 ok = False
         now = time.time()
         if now - last_log >= interval or ok:
@@ -1058,6 +1145,7 @@ def run_profile(profile: Profile, until: str) -> int:
         log(f"TIMING cdc_catchup {catch_s:.1f}s", flush=True)
 
         hotspot_extra: dict[str, object] = {}
+        final_failures: list[str] = []
         if profile.name == "heavy" and until == "all":
             hotspots = hotspot_tables(profile)
             burst_s, next_ids = burst_hotspots(profile, hotspots, proc=proc)
@@ -1073,13 +1161,22 @@ def run_profile(profile: Profile, until: str) -> int:
                 f"{h.src_db}.{h.name}" for h in hotspots
             ]
 
+            # One budget shared by count convergence + exact checksum verify.
+            # Source is static now (peak writes have stopped); only CDC drain
+            # remains, so both phases count down the same deadline.
+            catchup_deadline = time.time() + PEAK_CATCHUP_BUDGET_S
             catch_peak_s = wait_hotspot_convergence(
-                hotspots, timeout=3600, interval=15.0, proc=proc
+                hotspots, catchup_deadline, interval=15.0, proc=proc
             )
             timings["peak_catchup"] = catch_peak_s
-
-        final_failures = verify_pair(profile, "final")
-        final_failures.extend(verify_update_markers(profile, "final"))
+            fv0 = time.time()
+            final_failures = verify_pair_eventual(
+                profile, catchup_deadline, interval=15.0, proc=proc
+            )
+            timings["final_verify"] = time.time() - fv0
+        else:
+            final_failures = verify_pair(profile, "final")
+            final_failures.extend(verify_update_markers(profile, "final"))
         all_failures.extend(final_failures)
         if final_failures:
             for msg in final_failures:
