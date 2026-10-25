@@ -362,13 +362,20 @@ def canonical_date(ct: ColumnType, value: Any) -> str:
 
 
 def canonical_time(value: Any) -> str:
+    """Mirror document.go canonicalTime: ``[-]H:MM:SS.ffffff`` (hours unpadded).
+
+    pymysql returns MySQL TIME as a ``timedelta`` and Python normalizes negative
+    values as ``-1 day + positive seconds + microseconds``: -01:02:03.000001 is
+    ``days=-1, seconds=82676, microseconds=999999``. The sign and the fractional
+    part therefore have to come from the same total; reading ``value.microseconds``
+    directly yields 999999 for a value whose sub-second part is .000001.
+    """
     if isinstance(value, dt.timedelta):
-        total = int(value.total_seconds())
-        sign = "-" if total < 0 else ""
-        total = abs(total)
-        hours, rem = divmod(total, 3600)
+        total_us = (value.days * 86400 + value.seconds) * 1_000_000 + value.microseconds
+        sign = "-" if total_us < 0 else ""
+        total_seconds, micros = divmod(abs(total_us), 1_000_000)
+        hours, rem = divmod(total_seconds, 3600)
         minutes, seconds = divmod(rem, 60)
-        micros = abs(value.microseconds)
         if hours == 0 and minutes == 0 and seconds == 0 and micros == 0:
             sign = ""
         return f"{sign}{hours}:{minutes:02d}:{seconds:02d}.{micros:06d}"

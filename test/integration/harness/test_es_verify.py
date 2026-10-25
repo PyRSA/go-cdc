@@ -101,8 +101,44 @@ class TestCanonicalValues(unittest.TestCase):
 
     def test_time_keeps_mysql_semantics(self):
         self.assertEqual(v.canonical_time("-01:02:03.000001"), "-1:02:03.000001")
+        self.assertEqual(
+            v.canonical_time("-01:02:03.000001"),
+            v.canonical_time(dt.timedelta(days=-1, seconds=82676, microseconds=999999)),
+        )
         self.assertEqual(v.canonical_time(dt.timedelta(hours=838, minutes=59, seconds=59)), "838:59:59.000000")
         self.assertEqual(v.canonical_time(dt.timedelta(0)), "0:00:00.000000")
+
+    def test_time_hours_are_not_zero_padded(self):
+        # document.go canonicalTime formats hours with %d, so both capture paths
+        # write 1:02:03.000001 rather than 01:02:03.000001.
+        self.assertEqual(v.canonical_time("01:02:03.000001"), "1:02:03.000001")
+        self.assertEqual(
+            v.canonical_time(dt.timedelta(hours=1, minutes=2, seconds=3, microseconds=1)),
+            "1:02:03.000001",
+        )
+
+    def test_time_negative_timedelta_crossing_midnight(self):
+        # Regression for the E2E oracle: MySQL -01:02:03.000001 arrives from
+        # pymysql as days=-1, seconds=82676, microseconds=999999.
+        self.assertEqual(
+            v.canonical_time(dt.timedelta(days=-1, seconds=82676, microseconds=999999)),
+            "-1:02:03.000001",
+        )
+        self.assertEqual(v.canonical_time(dt.timedelta(seconds=-3723)), "-1:02:03.000000")
+        self.assertEqual(
+            v.canonical_time(dt.timedelta(days=-1, seconds=82675, microseconds=999999)),
+            "-1:02:04.000001",
+        )
+
+    def test_time_above_one_day(self):
+        self.assertEqual(v.canonical_time(dt.timedelta(hours=25)), "25:00:00.000000")
+        self.assertEqual(
+            v.canonical_time(dt.timedelta(hours=25, microseconds=1)), "25:00:00.000001"
+        )
+        self.assertEqual(
+            v.canonical_time(dt.timedelta(hours=838, minutes=59, seconds=59, microseconds=999999)),
+            "838:59:59.999999",
+        )
 
     def test_enum_and_set_labels(self):
         enum = v.parse_column_type("enum('new','done')")
@@ -185,6 +221,9 @@ class TestCompare(unittest.TestCase):
             ("datetime(6)", dt.datetime(2024, 1, 2, 3, 4, 5, 123456), "2024-01-02 03:04:05.123456", True),
             ("date", dt.date(2024, 1, 2), "2024-01-02", True),
             ("time(6)", dt.timedelta(hours=12, minutes=34, seconds=56, microseconds=123456), "12:34:56.123456", True),
+            ("time(6)", dt.timedelta(days=-1, seconds=82676, microseconds=999999), "-1:02:03.000001", True),
+            ("time(6)", dt.timedelta(days=-1, seconds=82676, microseconds=999999), "-1:02:03.999999", False),
+            ("time(6)", dt.timedelta(days=-1, seconds=82676, microseconds=999999), "1:02:03.000001", False),
             ("enum('new','done')", "done", "done", True),
             ("set('a','b','c')", "a,c", "a,c", True),
             ("year", 2024, "2024", True),

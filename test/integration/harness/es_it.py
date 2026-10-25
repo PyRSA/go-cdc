@@ -317,7 +317,7 @@ def wait_alive(log_path: Path, *, timeout_s: float = 60.0, ready_after_s: float 
     raise TimeoutError(f"timeout waiting for {desc} to stay alive:\n{_tail(log_path)}")
 
 
-def wait_exit(*, timeout_s: float = 120.0, desc: str = "go-cdc") -> int:
+def wait_exit(*, timeout_s: float = 120.0, desc: str = "go-cdc", log_path: Path | None = None) -> int:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         if proc is None:
@@ -326,7 +326,8 @@ def wait_exit(*, timeout_s: float = 120.0, desc: str = "go-cdc") -> int:
         if code is not None:
             return code
         time.sleep(0.25)
-    raise TimeoutError(f"timeout waiting for {desc} to exit")
+    detail = f": {_tail_on_one_line(log_path)}" if log_path is not None else ""
+    raise TimeoutError(f"timeout waiting for {desc} to exit{detail}")
 
 
 def stop_job() -> None:
@@ -349,6 +350,19 @@ def _tail(path: Path, limit: int = 3000) -> str:
     if not path.exists():
         return "(no log)"
     return path.read_text(encoding="utf-8", errors="replace")[-limit:]
+
+
+def _tail_on_one_line(path: Path, count: int = 3, limit: int = 600) -> str:
+    """The last non-empty log lines joined on one line, for exception text.
+
+    A multi-line tail would be cut by record() (it prints only the lines that
+    carry a verdict) and would break the markdown table in the report.
+    """
+    if not path.exists():
+        return "(no log)"
+    text = path.read_text(encoding="utf-8", errors="replace")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return (" ; ".join(lines[-count:]) or "(empty log)")[-limit:]
 
 
 def log_text(path: Path) -> str:
@@ -823,21 +837,28 @@ def tp_e08_binlog_catalog() -> None:
 
 
 def tp_e09_ddl_fails() -> None:
-    """A schema change must fail the job instead of silently diverging."""
+    """A schema change on a projected column must fail the job, not diverge.
+
+    The DDL has to touch a column the projection keeps: ``schemaevol.Decide``
+    deliberately ignores column DDL outside the projection (policy_test.go:
+    "excluded column should not be executed"), so an Elasticsearch sink never
+    sees it and the job keeps running. ``name`` is in the ``tpe01_users``
+    projection, so this reaches ``Sink.ApplySchema`` and must stop the job.
+    """
     users_index = index_for("tpe01_users")
     mapping_before = ES.get_mapping(users_index)
-    exec_sql(f"ALTER TABLE `{SRC_DB}`.tpe01_users ADD COLUMN tag VARCHAR(16) NULL")
-    code = wait_exit(timeout_s=120, desc="go-cdc after DDL")
+    exec_sql(f"ALTER TABLE `{SRC_DB}`.tpe01_users MODIFY COLUMN name VARCHAR(128) NOT NULL")
+    code = wait_exit(timeout_s=120, desc="go-cdc after DDL", log_path=LOG_BINLOG)
     text = log_text(LOG_BINLOG)
     mapping_after = ES.get_mapping(users_index)
-    has_tag = "tag" in verify.mapping_properties(mapping_after)
+    name_field = verify.field_mapping(mapping_after, "name")
     mentions = "schema change" in text and "not supported" in text
-    ok = code != 0 and mentions and mapping_before == mapping_after and not has_tag
+    ok = code != 0 and mentions and mapping_before == mapping_after
     detail = (
         "| Check | Actual | Verdict |\n| --- | --- | --- |\n"
         f"| job exit code | {code} | {verdict(code != 0)} |\n"
         f"| log explains the rejection | {mentions} | {verdict(mentions)} |\n"
-        f"| index mapping unchanged | tag present={has_tag} | {verdict(mapping_before == mapping_after and not has_tag)} |\n"
+        f"| index mapping unchanged | name={name_field} | {verdict(mapping_before == mapping_after)} |\n"
         f"| index still exists | {ES.index_exists(users_index)} | {verdict(ES.index_exists(users_index))} |\n"
         f"| log tail | `{_tail(LOG_BINLOG, 400).splitlines()[-1] if _tail(LOG_BINLOG, 400) else ''}` | |\n"
     )
@@ -845,13 +866,13 @@ def tp_e09_ddl_fails() -> None:
         TPResult(
             id="TP-E09",
             title="unsupported DDL fails the pipeline",
-            action="ALTER TABLE tpe01_users ADD COLUMN tag",
+            action="ALTER TABLE tpe01_users MODIFY COLUMN name VARCHAR(128)",
             expected_desc="non-zero exit, schema-change rejection in the log, mapping untouched",
             passed=ok,
             detail_md=detail,
         )
     )
-    exec_sql(f"ALTER TABLE `{SRC_DB}`.tpe01_users DROP COLUMN tag")
+    exec_sql(f"ALTER TABLE `{SRC_DB}`.tpe01_users MODIFY COLUMN name VARCHAR(64) NOT NULL")
 
 
 def tp_e10_mapping_conflict() -> None:
@@ -865,7 +886,7 @@ def tp_e10_mapping_conflict() -> None:
     )
     cfg.render_template("pipeline.es.yaml.tpl", YAML)
     start_job(YAML, LOG, reset_ckpt=CK, expect_exit=True)
-    code = wait_exit(timeout_s=120, desc="go-cdc with an incompatible mapping")
+    code = wait_exit(timeout_s=120, desc="go-cdc with an incompatible mapping", log_path=LOG)
     text = log_text(LOG)
     mentions = "cannot be written to mapping type" in text and orders_index in text
     ok = code != 0 and mentions
