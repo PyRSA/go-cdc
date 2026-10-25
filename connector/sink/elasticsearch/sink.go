@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +39,9 @@ type Sink struct {
 	timeout      time.Duration
 	maxRetries   int
 	bulkMaxBytes int
+	// serverZone is source.server-time-zone, set by the process wiring through
+	// SetServerTimeZone. nil leaves TIMESTAMP values untouched.
+	serverZone *time.Location
 
 	mu     sync.Mutex
 	client client.Client
@@ -86,6 +90,52 @@ func bulkMaxBytesOrDefault(configured int) int {
 		return DefaultBulkMaxBytes
 	}
 	return configured
+}
+
+// SetServerTimeZone tells the sink which zone the source rendered MySQL
+// TIMESTAMP wall clocks in (source.server-time-zone), so documents can carry the
+// same instant in UTC. An unset, empty or UTC zone means the values are already
+// UTC and are written verbatim. DATETIME, DATE and YEAR are never shifted.
+func (s *Sink) SetServerTimeZone(zone string) error {
+	loc, err := serverTimeZone(zone)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.serverZone = loc
+	for _, meta := range s.tables {
+		meta.serverZone = loc
+	}
+	return nil
+}
+
+// serverTimeZone mirrors the source-side mapping of source.server-time-zone to a
+// Go location. UTC (and the unset default) returns nil: there is nothing to shift.
+func serverTimeZone(zone string) (*time.Location, error) {
+	if zone == "" || strings.EqualFold(zone, "UTC") || zone == "Z" {
+		return nil, nil
+	}
+	if strings.HasPrefix(zone, "+") || strings.HasPrefix(zone, "-") {
+		sign := 1
+		raw := zone
+		if strings.HasPrefix(raw, "-") {
+			sign = -1
+			raw = raw[1:]
+		}
+		hours, minutes, ok := strings.Cut(raw, ":")
+		h, err1 := strconv.Atoi(hours)
+		m, err2 := strconv.Atoi(minutes)
+		if !ok || err1 != nil || err2 != nil {
+			return nil, fmt.Errorf("elasticsearch: server time zone %q", zone)
+		}
+		return time.FixedZone(zone, sign*(h*3600+m*60)), nil
+	}
+	loc, err := time.LoadLocation(zone)
+	if err != nil {
+		return nil, fmt.Errorf("elasticsearch: server time zone %q: %w", zone, err)
+	}
+	return loc, nil
 }
 
 // SetClient injects a client (tests) or replaces the client before Open.
@@ -164,6 +214,7 @@ func (s *Sink) CreateTable(table schema.Table) error {
 		return err
 	}
 	s.mu.Lock()
+	meta.serverZone = s.serverZone
 	s.tables[meta.scope] = meta
 	s.mu.Unlock()
 	return nil

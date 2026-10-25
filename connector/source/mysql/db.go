@@ -153,6 +153,18 @@ func sinkDSN(cfg definition.Source) (string, error) {
 	for key, value := range cfg.JDBCProperties {
 		driver.Params[key] = value
 	}
+	// Quoted so every pooled connection starts in source.server-time-zone. A bare
+	// `SET time_zone` pins only the connection that ran it, so a snapshot read on
+	// another connection renders TIMESTAMP in the server default zone and disagrees
+	// with the binlog path, which formats it in source.server-time-zone.
+	zone := cfg.TimeZone
+	if zone == "" || strings.EqualFold(zone, "UTC") || zone == "Z" {
+		zone = "+00:00"
+	}
+	if !safeTimeZone(zone) {
+		return "", fmt.Errorf("source.server-time-zone: %q", cfg.TimeZone)
+	}
+	driver.Params["time_zone"] = "'" + zone + "'"
 	return driver.FormatDSN(), nil
 }
 

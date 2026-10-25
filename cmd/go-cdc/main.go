@@ -221,6 +221,11 @@ func openSink(ctx context.Context, pipe *definition.Pipeline) (sink.Sink, error)
 		if err != nil {
 			return nil, err
 		}
+		// The source emits TIMESTAMP as the wall clock of source.server-time-zone;
+		// the sink needs that zone to store the same instant in UTC.
+		if err := sk.SetServerTimeZone(pipe.Source.TimeZone); err != nil {
+			return nil, err
+		}
 		if err := sk.Open(ctx); err != nil {
 			// Open already released the client it created on failure.
 			return nil, err

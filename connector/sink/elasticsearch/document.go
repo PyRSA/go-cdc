@@ -29,6 +29,9 @@ type tableMeta struct {
 	columns []columnMeta
 	byName  map[string]columnMeta
 	keys    []columnMeta
+	// serverZone is the zone the source rendered MySQL TIMESTAMP wall clocks in
+	// (source.server-time-zone). nil means "already UTC": values are written as-is.
+	serverZone *time.Location
 }
 
 type columnMeta struct {
@@ -209,7 +212,7 @@ func (m *tableMeta) document(row map[string]any) ([]byte, error) {
 				"elasticsearch: table %s: column %q is missing from the event; check projection and primary-keys",
 				m.scope, column.name)
 		}
-		encoded, err := jsonValue(column, value)
+		encoded, err := jsonValue(column, value, m.serverZone)
 		if err != nil {
 			return nil, fmt.Errorf("elasticsearch: table %s: column %q: %w", m.scope, column.name, err)
 		}
@@ -222,7 +225,7 @@ func (m *tableMeta) document(row map[string]any) ([]byte, error) {
 	return body, nil
 }
 
-func jsonValue(column columnMeta, value any) (json.RawMessage, error) {
+func jsonValue(column columnMeta, value any, serverZone *time.Location) (json.RawMessage, error) {
 	if value == nil {
 		return json.RawMessage("null"), nil
 	}
@@ -240,6 +243,12 @@ func jsonValue(column columnMeta, value any) (json.RawMessage, error) {
 	text, err := canonicalValue(column, value)
 	if err != nil {
 		return nil, err
+	}
+	if column.kind == kindDate && column.ct.Base == "timestamp" {
+		text, err = timestampUTC(text, serverZone)
+		if err != nil {
+			return nil, err
+		}
 	}
 	switch column.kind {
 	case kindInteger, kindFloat:
@@ -474,6 +483,22 @@ func canonicalDecimal(text string, scale int) (string, error) {
 		out = "-" + out
 	}
 	return out, nil
+}
+
+// timestampUTC turns the wall clock of a MySQL TIMESTAMP into the same instant
+// in UTC. The source hands over the wall clock of source.server-time-zone and an
+// Elasticsearch date field whose format carries no offset is a UTC instant, so the
+// shift happens exactly once, here, on the way out. A nil zone means the source
+// already emitted UTC, so the value is returned untouched.
+func timestampUTC(text string, serverZone *time.Location) (string, error) {
+	if serverZone == nil || serverZone == time.UTC {
+		return text, nil
+	}
+	parsed, err := time.ParseInLocation("2006-01-02 15:04:05.000000", text, serverZone)
+	if err != nil {
+		return "", fmt.Errorf("value %q is not a valid TIMESTAMP", text)
+	}
+	return parsed.UTC().Format("2006-01-02 15:04:05.000000"), nil
 }
 
 // canonicalDate pads dates and datetimes to the fixed width used by the
