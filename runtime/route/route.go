@@ -45,9 +45,13 @@ func Compile(rules []definition.Route, mode string) (*Set, error) {
 }
 
 // Apply returns one event per matching sink table.
-// No match keeps the source names.
+// No match keeps the source names. A match sets Routed so sinks can tell a
+// rewrite that keeps the source database name (identity route, table-only
+// rename) from no match at all.
 func (s *Set) Apply(in event.Event) []event.Event {
 	if s == nil || len(s.rules) == 0 {
+		// Clear any stale mark so a reused event never looks routed.
+		in.Routed = false
 		return []event.Event{in}
 	}
 	db, table := in.SourceDatabase, in.SourceTable
@@ -67,12 +71,15 @@ func (s *Set) Apply(in event.Event) []event.Event {
 		}
 		cloned.Database = rule.sinkDB
 		cloned.Table = sinkTable
+		cloned.Routed = true
 		out = append(out, cloned)
 		if s.mode == definition.RouteFirstMatch {
 			break
 		}
 	}
 	if len(out) == 0 {
+		// Clear any stale mark so a reused event never looks routed.
+		in.Routed = false
 		return []event.Event{in}
 	}
 	return out

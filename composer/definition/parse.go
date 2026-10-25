@@ -54,6 +54,12 @@ const (
 	// programmatic configs against the same range.
 	MinBulkMaxBytes = 1024
 	MaxBulkMaxBytes = 100 << 20
+	// PostgreSQL sink defaults; applied only when the sink type is postgresql
+	// because parseSink sets the shared defaults before the type is known.
+	defaultPostgresPort           = 5432
+	defaultPostgresSchema         = "public"
+	defaultPostgresSSLMode        = "prefer"
+	defaultPostgresConnectTimeout = 30 * time.Second
 )
 
 // ResolveElasticsearchVersion maps sink.version to the client major version.
@@ -109,6 +115,46 @@ var (
 		"auto-create-table": {},
 	}
 )
+
+// postgresSSLModes lists the sslmode values libpq (and pgx) accepts.
+var postgresSSLModes = map[string]struct{}{
+	"disable":     {},
+	"allow":       {},
+	"prefer":      {},
+	"require":     {},
+	"verify-ca":   {},
+	"verify-full": {},
+}
+
+// mysqlOnlySinkFields are rejected for postgresql: this release does not
+// create tables or apply table-level DDL.
+var mysqlOnlySinkFields = []string{
+	"schema.change.drop-truncate.enabled",
+}
+
+// kafkaOnlySinkFields are rejected for postgresql.
+var kafkaOnlySinkFields = []string{
+	"brokers",
+	"topic",
+	"source-name",
+	"client-id",
+	"schema.change.emit.enabled",
+	"allow.auto.create.topics",
+	"producer-batch-max-bytes",
+	"flush-timeout",
+}
+
+// postgresNamespaceFields are rejected for stdout, mysql, kafka, and doris:
+// none of those sinks has a schema, TLS mode, or connect timeout, so accepting
+// them would silently drop the setting.
+// database is deliberately absent. Only doris and postgresql read it, but mysql,
+// kafka, and stdout parsed it as a no-op long before postgresql existed, so
+// rejecting it there would break working configurations.
+var postgresNamespaceFields = []string{
+	"schema",
+	"sslmode",
+	"connect-timeout",
+}
 
 var startupModes = map[string]struct{}{
 	StartupInitial:        {},
@@ -589,6 +635,16 @@ func parseSink(raw map[string]any) (Sink, error) {
 				return Sink{}, configErr("sink.replication-num", "must be >= 0")
 			}
 			out.ReplicationNum = n
+		case "schema":
+			out.Schema = strings.TrimSpace(fmt.Sprint(value))
+		case "sslmode":
+			out.SSLMode = strings.TrimSpace(fmt.Sprint(value))
+		case "connect-timeout":
+			d, err := asDuration(value)
+			if err != nil || d < minConnectTimeout {
+				return Sink{}, configf("sink.connect-timeout", "must be a duration >= %s", minConnectTimeout)
+			}
+			out.ConnectTimeout = d
 		default:
 			return Sink{}, configErr("sink."+key, "unknown field")
 		}
@@ -601,8 +657,14 @@ func parseSink(raw map[string]any) (Sink, error) {
 		if err := rejectKeysForSinkType(out.Type, used, dorisOnlySinkKeys, requestTimeoutSinkKeys); err != nil {
 			return Sink{}, err
 		}
+		if err := rejectSinkFields(raw, out.Type, postgresNamespaceFields...); err != nil {
+			return Sink{}, err
+		}
 	case "mysql":
 		if err := rejectKeysForSinkType(out.Type, used, dorisOnlySinkKeys, requestTimeoutSinkKeys); err != nil {
+			return Sink{}, err
+		}
+		if err := rejectSinkFields(raw, out.Type, postgresNamespaceFields...); err != nil {
 			return Sink{}, err
 		}
 		if out.Hostname == "" {
@@ -616,6 +678,9 @@ func parseSink(raw map[string]any) (Sink, error) {
 		}
 	case "kafka":
 		if err := rejectKeysForSinkType(out.Type, used, dorisOnlySinkKeys, requestTimeoutSinkKeys); err != nil {
+			return Sink{}, err
+		}
+		if err := rejectSinkFields(raw, out.Type, postgresNamespaceFields...); err != nil {
 			return Sink{}, err
 		}
 		if len(out.Brokers) == 0 {
@@ -633,6 +698,10 @@ func parseSink(raw map[string]any) (Sink, error) {
 			return Sink{}, configErr("sink.topic", "must not contain whitespace")
 		}
 	case "doris":
+		// schema / sslmode / connect-timeout belong to the PostgreSQL sink only.
+		if err := rejectSinkFields(raw, out.Type, postgresNamespaceFields...); err != nil {
+			return Sink{}, err
+		}
 		if out.Hostname == "" {
 			return Sink{}, configErr("sink.hostname", "required")
 		}
@@ -674,6 +743,10 @@ func parseSink(raw map[string]any) (Sink, error) {
 				return Sink{}, configErr("sink.buckets", "must be auto or a positive integer")
 			}
 		}
+	case "postgresql":
+		if err := parsePostgresSink(&out, raw); err != nil {
+			return Sink{}, err
+		}
 	case "elasticsearch":
 		// request-timeout is shared with Doris; every other Doris-only key has
 		// no meaning here and must not be silently ignored.
@@ -707,10 +780,21 @@ func validateSinkKeys(sinkType string, used map[string]struct{}) error {
 		if _, ok := kafkaOnlySinkKeys[key]; ok && sinkType != "kafka" {
 			return configf("sink."+key, "only valid for sink.type kafka")
 		}
-		if _, ok := mysqlOnlySinkKeys[key]; ok && sinkType != "mysql" && sinkType != "doris" {
-			// auto-create-table is shared by the MySQL and Doris sinks; the
-			// Elasticsearch sink opts into index creation with auto-create.
+		if _, ok := mysqlOnlySinkKeys[key]; ok && sinkType != "mysql" && sinkType != "doris" && sinkType != "postgresql" {
+			// auto-create-table is shared by the MySQL, Doris and PostgreSQL
+			// sinks; the Elasticsearch sink opts into index creation with
+			// auto-create.
 			return configf("sink."+key, "only valid for sink.type mysql or doris")
+		}
+	}
+	return nil
+}
+
+// rejectSinkFields fails when the config sets a field the sink type does not accept.
+func rejectSinkFields(raw map[string]any, sinkType string, fields ...string) error {
+	for _, field := range fields {
+		if _, ok := raw[field]; ok {
+			return configf("sink."+field, "is not supported for sink type %s", sinkType)
 		}
 	}
 	return nil
@@ -808,6 +892,64 @@ func validateElasticsearchIndexName(name string) error {
 	}
 	if strings.ContainsAny(name, `\/*?"<>| ,#:`) {
 		return errors.New(`must not contain a reserved character (\ / * ? " < > | space , # :)`)
+	}
+	return nil
+}
+
+// parsePostgresSink applies PostgreSQL defaults and validation. parseSink fills
+// MySQL-oriented defaults (port 3306, auto-create-table true) before the type is
+// known, so those two are recomputed here and explicit config always wins.
+func parsePostgresSink(out *Sink, raw map[string]any) error {
+	if err := rejectSinkFields(raw, out.Type, mysqlOnlySinkFields...); err != nil {
+		return err
+	}
+	if err := rejectSinkFields(raw, out.Type, kafkaOnlySinkFields...); err != nil {
+		return err
+	}
+	// Doris-only keys stay rejected here too: this sink has no DDL or Stream Load
+	// equivalent, so accepting them would silently drop the setting.
+	if err := rejectSinkFields(raw, out.Type, dorisOnlySinkKeys...); err != nil {
+		return err
+	}
+	if _, ok := raw["auto-create-table"]; ok && out.AutoCreate {
+		return configErr("sink.auto-create-table", "must not be true: the postgresql sink does not create tables in this release")
+	}
+	out.AutoCreate = false
+	if _, ok := raw["port"]; !ok {
+		out.Port = defaultPostgresPort
+	}
+	if _, ok := raw["schema"]; !ok {
+		out.Schema = defaultPostgresSchema
+	}
+	if _, ok := raw["sslmode"]; !ok {
+		out.SSLMode = defaultPostgresSSLMode
+	}
+	if _, ok := raw["connect-timeout"]; !ok {
+		out.ConnectTimeout = defaultPostgresConnectTimeout
+	}
+	if out.Hostname == "" {
+		return configErr("sink.hostname", "required")
+	}
+	if out.Username == "" {
+		return configErr("sink.username", "required")
+	}
+	if out.Password == "" {
+		return configErr("sink.password", "required")
+	}
+	if out.Database == "" {
+		return configErr("sink.database", "required")
+	}
+	if strings.Contains(out.Database, ".") {
+		return configErr("sink.database", "must be a single database name without dots")
+	}
+	if out.Port < 1 || out.Port > 65535 {
+		return configErr("sink.port", "must be in 1..65535")
+	}
+	if out.Schema == "" || strings.Contains(out.Schema, ".") {
+		return configErr("sink.schema", "must be a single schema name without dots")
+	}
+	if _, ok := postgresSSLModes[out.SSLMode]; !ok {
+		return configf("sink.sslmode", "unknown mode %s", out.SSLMode)
 	}
 	return nil
 }

@@ -64,8 +64,10 @@ Full job: [`configs/demo-doris.yaml`](../../configs/demo-doris.yaml).
 | `delete.enabled` | no | `false` | Boolean | `true` is rejected at parse time (not implemented) |
 | `schema.change.drop-truncate.enabled` | no | `false` | Boolean | `true` is rejected for Doris in v1 |
 
-`kafka`-only options (`brokers`, `topic`, …) and MySQL's `3306` default do not
-apply here: the parser keeps the two Doris ports separate.
+The PostgreSQL-only `schema`, `sslmode`, and `connect-timeout` are rejected here;
+`database` is shared with the PostgreSQL sink and stays valid. `kafka`-only
+options (`brokers`, `topic`, …) and MySQL's `3306` default do not apply here: the
+parser keeps the two Doris ports separate.
 
 ## Delivery semantics (at-least-once)
 

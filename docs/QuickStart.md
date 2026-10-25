@@ -6,7 +6,7 @@ What you get today:
 
 - End-to-end YAML jobs (source → transform / route → sink)
 - MySQL source: snapshot + binlog
-- Sinks: stdout (JSON lines), MySQL, Kafka (at-least-once), Doris (UNIQUE KEY + Stream Load, at-least-once), and Elasticsearch 7/8/9
+- Sinks: stdout (JSON lines), MySQL, Kafka (at-least-once), Doris (UNIQUE KEY + Stream Load, at-least-once), Elasticsearch 7/8/9, and PostgreSQL (current-state DML; target tables must already exist)
 - Column projection, row filter, table route, schema-change policy, file checkpoints
 
 ## Requirements
@@ -39,6 +39,7 @@ Libraries linked into the binary (no separate connector packages to install):
 | Kafka | Sink | [connectors/kafka-sink.md](connectors/kafka-sink.md) |
 | Doris | Sink | [connectors/doris-sink.md](connectors/doris-sink.md) |
 | Elasticsearch | Sink | [connectors/elasticsearch-sink.md](connectors/elasticsearch-sink.md) |
+| PostgreSQL | Sink | [connectors/postgresql-sink.md](connectors/postgresql-sink.md) |
 
 Pipeline concepts (transform, projection, route, schema evolution): [pipeline.md](pipeline.md).
 
@@ -123,6 +124,7 @@ Stop with `Ctrl+C` (SIGINT) or SIGTERM; go-cdc flushes and saves the checkpoint 
 | Publish to Kafka | [Kafka Sink](connectors/kafka-sink.md) and [`configs/demo-kafka.yaml`](../configs/demo-kafka.yaml) |
 | Write current state to Doris | [Doris Sink](connectors/doris-sink.md) and [`configs/demo-doris.yaml`](../configs/demo-doris.yaml) |
 | Index documents in Elasticsearch 7/8/9 | [Elasticsearch Sink](connectors/elasticsearch-sink.md) and [`configs/demo-elasticsearch.yaml`](../configs/demo-elasticsearch.yaml) |
+| Write current state to PostgreSQL | [PostgreSQL Sink](connectors/postgresql-sink.md) |
 | Source options (startup mode, chunks, …) | [MySQL Source](connectors/mysql-source.md) |
 | Projection / filter / route / schema evolution | [Pipeline](pipeline.md) |
 
@@ -137,3 +139,4 @@ Stop with `Ctrl+C` (SIGINT) or SIGTERM; go-cdc flushes and saves the checkpoint 
   - [Kafka Sink](connectors/kafka-sink.md)
   - [Doris Sink](connectors/doris-sink.md)
   - [Elasticsearch Sink](connectors/elasticsearch-sink.md)
+  - [PostgreSQL Sink](connectors/postgresql-sink.md)
