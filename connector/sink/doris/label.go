@@ -1,25 +1,51 @@
 package doris
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"hash/fnv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// labelSequence makes labels unique within one process. Cross-process
-// uniqueness comes from the timestamp; it is not a replay key after a restart.
+// nonceBytes is the width of the per-instance random component. Eight bytes
+// drawn from crypto/rand make two instances of the same process type colliding
+// on a label an unreachable event, which a clock alone never was.
+const nonceBytes = 8
+
+// labelSequence builds labels that name exactly one submission by one instance.
+// The nonce is drawn once per instance and the counter is atomic, so a label is
+// unique inside the instance and, together with the nonce, across instances and
+// restarts.
 type labelSequence struct {
 	value atomic.Uint64
+	once  sync.Once
+	nonce string
 }
 
-// next builds a Doris label. The label is stable for one sub-batch retry and
-// never contains credentials or arbitrary table text.
+// next builds a Doris label as go-cdc_<table hash>_<instance nonce>_<sequence>.
+// One call returns one label and the caller keeps it for every retry of that
+// sub-batch, so a retry never invents a new label. The three fixed-width
+// components cost at most 7+16+1+16+1+20 bytes, well inside Doris' 128 byte
+// label limit, and the table name only ever enters as a hash, never as text.
 func (s *labelSequence) next(table string) string {
+	s.once.Do(func() { s.nonce = newInstanceNonce() })
 	hash := fnv.New64a()
 	_, _ = hash.Write([]byte(table))
-	return fmt.Sprintf("go-cdc_%x_%d_%d", hash.Sum64(), time.Now().UnixNano(), s.value.Add(1))
+	return fmt.Sprintf("go-cdc_%016x_%s_%d", hash.Sum64(), s.nonce, s.value.Add(1))
+}
+
+// newInstanceNonce renders the random component as lowercase hex, which is
+// inside the character set Doris accepts for a label. crypto/rand.Read always
+// fills the buffer on the supported platforms, so a nonce can never degrade to
+// the all-zero value that every instance would then share.
+func newInstanceNonce() string {
+	var raw [nonceBytes]byte
+	_, _ = rand.Read(raw[:])
+	return hex.EncodeToString(raw[:])
 }
 
 // loadStatus values from the Doris 2.1 Stream Load manual. `Success` and

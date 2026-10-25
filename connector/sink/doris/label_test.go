@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -237,19 +238,121 @@ func TestClassifyLoadState(t *testing.T) {
 	}
 }
 
+// labelPattern pins the shipped label shape: a fixed-width table hash, a
+// fixed-width random instance nonce, then the per-instance counter.
+var labelPattern = regexp.MustCompile(`^go-cdc_[0-9a-f]{16}_[0-9a-f]{16}_[1-9][0-9]*$`)
+
+// labelNonce extracts the instance component so a test can state plainly which
+// part of the label carries cross-instance uniqueness.
+func labelNonce(t *testing.T, label string) string {
+	t.Helper()
+	parts := strings.Split(label, "_")
+	if len(parts) != 4 {
+		t.Fatalf("label %q does not have four _-separated components", label)
+	}
+	return parts[2]
+}
+
 func TestLabelSequence(t *testing.T) {
-	pattern := regexp.MustCompile(`^go-cdc_[0-9a-f]+_[0-9]+_[0-9]+$`)
 	var seq labelSequence
 	first := seq.next("db.orders")
 	second := seq.next("db.orders")
 	if first == second {
 		t.Fatal("labels must be unique")
 	}
-	if !pattern.MatchString(first) || !pattern.MatchString(second) {
+	if !labelPattern.MatchString(first) || !labelPattern.MatchString(second) {
 		t.Fatalf("labels %q %q", first, second)
 	}
 	if !validLabel(first) {
 		t.Fatalf("generated label is not valid: %q", first)
+	}
+	// The nonce belongs to the instance, not to the label: drawing a fresh one
+	// per call would make the counter meaningless as a within-instance key.
+	if labelNonce(t, first) != labelNonce(t, second) {
+		t.Fatalf("one instance must keep one nonce: %q vs %q", first, second)
+	}
+	if !strings.HasPrefix(first, "go-cdc_") {
+		t.Fatalf("label must name the job that wrote it: %q", first)
+	}
+}
+
+// A Stream Load response saying the label already exists is read as "this batch
+// landed" only because no other submitter can have created that label. Two
+// instances of the same process type writing the same routed table must therefore
+// never agree on a label, whatever the clock says.
+func TestLabelUniqueAcrossInstances(t *testing.T) {
+	const table = "db.orders"
+	seen := map[string]int{}
+	for i := 0; i < 64; i++ {
+		var seq labelSequence
+		label := seq.next(table)
+		if owner, ok := seen[label]; ok {
+			t.Fatalf("instances %d and %d generated the same label %q", i, owner, label)
+		}
+		seen[label] = i
+	}
+
+	// A restart of the same table name is a different instance, and the counter
+	// restarts at one, so the nonce is the only component separating them.
+	var before, after labelSequence
+	if before.next(table) == after.next(table) {
+		t.Fatal("two instances must not reuse the first label of the same table")
+	}
+}
+
+func TestLabelSequenceConcurrent(t *testing.T) {
+	var seq labelSequence
+	const goroutines, perCall = 8, 100
+	got := make([][]string, goroutines)
+	wg := sync.WaitGroup{}
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			// Failures are collected instead of reported from the worker: calling
+			// t.Fatalf off the test goroutine would exit the worker silently.
+			for i := 0; i < perCall; i++ {
+				got[index] = append(got[index], seq.next("db.orders"))
+			}
+		}(g)
+	}
+	wg.Wait()
+	seen := make(map[string]struct{}, goroutines*perCall)
+	nonce := ""
+	for _, labels := range got {
+		for _, label := range labels {
+			if _, ok := seen[label]; ok {
+				t.Fatalf("duplicate label %q", label)
+			}
+			seen[label] = struct{}{}
+			if nonce == "" {
+				if !labelPattern.MatchString(label) {
+					t.Fatalf("label shape drifted: %q", label)
+				}
+				nonce = labelNonce(t, label)
+			} else if nonce != labelNonce(t, label) {
+				t.Fatalf("concurrent calls changed the nonce: %q vs %q", nonce, labelNonce(t, label))
+			}
+		}
+	}
+	if len(seen) != goroutines*perCall {
+		t.Fatalf("got %d labels, want %d", len(seen), goroutines*perCall)
+	}
+}
+
+// The label components are fixed width, so the 128 byte Doris limit cannot be
+// reached by a long routed database or table name.
+func TestLabelWithinDorisLengthLimit(t *testing.T) {
+	var seq labelSequence
+	label := seq.next(strings.Repeat("a_very_long_database_name.", 40) + "orders")
+	if len(label) > 128 {
+		t.Fatalf("label is %d bytes, Doris accepts 128: %q", len(label), label)
+	}
+	if !validLabel(label) {
+		t.Fatalf("label is not valid: %q", label)
+	}
+	if !labelPattern.MatchString(label) {
+		t.Fatalf("label shape drifted: %q", label)
 	}
 }
 
