@@ -26,6 +26,7 @@ import zlib
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Callable, Iterable
+from zoneinfo import ZoneInfo
 
 INDEX_HASH_BYTES = 6  # 12 hex characters, same as Go
 MAX_INDEX_NAME_BYTES = 255
@@ -33,6 +34,15 @@ DATE_FORMAT = "yyyy-MM-dd"
 DATETIME_FORMAT = "yyyy-MM-dd HH:mm:ss.SSSSSS"
 YEAR_FORMAT = "yyyy"
 KEYWORD_MAX_CHARS = 512
+
+# source.server-time-zone of the Elasticsearch pipelines under test. The reading
+# sessions in es_it.py / es_load_it.py / es_scale_it.py pin the same wall clock
+# (SET time_zone = '+08:00'). A MySQL TIMESTAMP is an instant and an
+# Elasticsearch date field declared with `yyyy-MM-dd HH:mm:ss.SSSSSS` (no offset)
+# keeps it in UTC, so compare_value renders the expectation in that zone's UTC
+# terms. Only TIMESTAMP: DATETIME/DATE/YEAR stay literals and `_id` does not use
+# this rule at all.
+SERVER_TIME_ZONE = "Asia/Shanghai"
 
 
 # --------------------------------------------------------------------- types
@@ -347,6 +357,42 @@ def canonical_decimal(text: str, scale: int) -> str:
     return ("-" + out) if negative else out
 
 
+def server_zone(zone: str) -> dt.tzinfo:
+    """Resolve a `server-time-zone` value: ""/UTC/Z, +HH:MM, or a named region."""
+    text = (zone or "").strip()
+    if not text or text.upper() in ("UTC", "Z", "GMT"):
+        return dt.timezone.utc
+    if text[0] in "+-":
+        sign = -1 if text[0] == "-" else 1
+        raw = text[1:]
+        hours, _, minutes = raw.partition(":")
+        offset = dt.timedelta(hours=int(hours), minutes=int(minutes or 0))
+        return dt.timezone(sign * offset, text)
+    return ZoneInfo(text)
+
+
+def canonical_timestamp_utc(value: Any, zone: str = SERVER_TIME_ZONE) -> str:
+    """Render a MySQL TIMESTAMP as the same instant expressed in UTC.
+
+    `value` is what a session pinned to `zone` handed back (a pymysql datetime,
+    or text carrying no offset), so it is a wall clock of that zone. An
+    Elasticsearch date field whose format has no offset is a UTC instant, so this
+    step is what makes the two comparable. Six fractional digits are kept, and a
+    value that already carries an offset describes the instant itself and is used
+    as given. A value that is neither raises, and the caller reports it unequal.
+    """
+    if isinstance(value, dt.datetime):
+        moment = value
+    else:
+        text = str(value).strip().replace("T", " ")
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        moment = dt.datetime.fromisoformat(text)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=server_zone(zone))
+    return moment.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+
+
 def canonical_date(ct: ColumnType, value: Any) -> str:
     if isinstance(value, dt.datetime):
         return value.strftime("%Y-%m-%d %H:%M:%S.%f")
@@ -518,12 +564,15 @@ def _json_canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-def compare_value(column_type: str, mysql_value: Any, es_value: Any) -> bool:
+def compare_value(
+    column_type: str, mysql_value: Any, es_value: Any, zone: str = SERVER_TIME_ZONE
+) -> bool:
     """Compare one MySQL column value with the value Elasticsearch returned.
 
     Elasticsearch hands back JSON scalars (numbers, strings, objects), while
     MySQL hands back pymysql types (int, Decimal, date, timedelta, str, bytes).
-    Both sides are reduced to the sink's canonical form before comparing.
+    Both sides are reduced to the sink's canonical form before comparing; `zone`
+    is the zone `mysql_value` was read in and only describes a TIMESTAMP instant.
     """
     ct = parse_column_type(column_type)
     kind = value_kind(ct)
@@ -544,6 +593,8 @@ def compare_value(column_type: str, mysql_value: Any, es_value: Any) -> bool:
             if isinstance(expected, (str, bytes, bytearray)):
                 expected = json.loads(expected)
             return _json_canonical(expected) == _json_canonical(es_value)
+        if kind == "date" and ct.base == "timestamp":
+            return canonical_timestamp_utc(mysql_value, zone) == str(es_value)
         return canonical_text(column_type, mysql_value) == str(es_value)
     except (TypeError, ValueError):
         return False
@@ -599,6 +650,14 @@ def mapping_problems(columns: dict[str, str], mapping: dict, *, allow_extra: boo
             continue
         want = derived_field(column_type)
         got_type = str(field.get("type", ""))
+        properties = field.get("properties")
+        if not got_type and isinstance(properties, dict) and properties:
+            # Elasticsearch omits the implicit object type on read: an object
+            # field is reported through its "properties" (and "dynamic") only.
+            # This is the rule decodeMappingField (connector/sink/elasticsearch/
+            # mapping.go) already applies, and an empty type without properties
+            # stays an error there -- so it stays an error here.
+            got_type = "object"
         if got_type != want["type"]:
             problems.append(f"{name}: mapping type {got_type!r} != {want['type']!r}")
             continue

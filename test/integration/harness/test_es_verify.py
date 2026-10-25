@@ -158,6 +158,100 @@ class TestCanonicalValues(unittest.TestCase):
         self.assertEqual(v.canonical_text("varbinary(32)", bytes([0x00, 0xFF, 0x10])), "AP8Q")
 
 
+class TestTimestampComparison(unittest.TestCase):
+    """A MySQL TIMESTAMP is an instant, so the comparison renders it in UTC.
+
+    Elasticsearch keeps a `date` field whose format carries no offset as a UTC
+    instant, while the harness reads the wall clock of `source.server-time-zone`,
+    so `compare_value` bridges the two. The rule lives in the comparison only:
+    DATETIME/DATE/YEAR stay literals and the `_id` canonical form is untouched.
+    """
+
+    def test_plus_08_expectation_becomes_the_utc_instant(self):
+        moment = dt.datetime(2024, 6, 15, 1, 30, 0, 123456)
+        self.assertEqual(
+            v.canonical_timestamp_utc(moment, "+08:00"), "2024-06-14 17:30:00.123456"
+        )
+        # TP-EL01 cross-day case: an early-morning wall clock belongs to the
+        # previous UTC day.
+        self.assertEqual(
+            v.canonical_timestamp_utc(dt.datetime(2024, 6, 15, 0, 0, 0, 1), "+08:00"),
+            "2024-06-14 16:00:00.000001",
+        )
+        # Six fractional digits survive a value that arrives as text.
+        self.assertEqual(
+            v.canonical_timestamp_utc("2024-06-15 01:30:00", "+08:00"),
+            "2024-06-14 17:30:00.000000",
+        )
+
+    def test_named_server_time_zone_matches_the_numeric_offset(self):
+        self.assertEqual(v.SERVER_TIME_ZONE, "Asia/Shanghai")
+        moment = dt.datetime(2024, 6, 15, 1, 30, 0, 123456)
+        try:
+            zone = v.server_zone("Asia/Shanghai")
+        except Exception:  # noqa: BLE001 - a runner without tzdata cannot check this
+            self.skipTest("no tzdata for Asia/Shanghai")
+        self.assertEqual(zone.utcoffset(moment), dt.timedelta(hours=8))
+        self.assertEqual(
+            v.canonical_timestamp_utc(moment, "Asia/Shanghai"),
+            v.canonical_timestamp_utc(moment, "+08:00"),
+        )
+
+    def test_a_utc_expectation_and_an_explicit_offset_are_not_moved(self):
+        self.assertEqual(
+            v.canonical_timestamp_utc(dt.datetime(2024, 6, 15, 1, 30, 0, 123456), "UTC"),
+            "2024-06-15 01:30:00.123456",
+        )
+        # A value that already carries an offset describes the instant itself.
+        self.assertEqual(
+            v.canonical_timestamp_utc("2024-06-14T17:30:00.123456Z", "+08:00"),
+            "2024-06-14 17:30:00.123456",
+        )
+
+    def test_compare_value_accepts_the_instant_and_rejects_wrong_ones(self):
+        moment = dt.datetime(2024, 6, 15, 1, 30, 0, 123456)
+        self.assertIs(
+            v.compare_value("timestamp(6)", moment, "2024-06-14 17:30:00.123456", "+08:00"), True
+        )
+        # The un-shifted wall clock must not pass: a naive string match would
+        # accept the wrong instant, so this is the TP-EL01 failure itself.
+        self.assertIs(
+            v.compare_value("timestamp(6)", moment, "2024-06-15 01:30:00.123456", "+08:00"), False
+        )
+        self.assertIs(
+            v.compare_value("timestamp(6)", moment, "2024-06-14 17:30:00.123455", "+08:00"), False
+        )
+        # An unreadable value fails instead of being skipped.
+        self.assertIs(
+            v.compare_value("timestamp(6)", "not-a-timestamp", "2024-06-14 17:30:00.123456", "+08:00"),
+            False,
+        )
+        self.assertIs(
+            v.compare_value("timestamp(6)", moment, "2024-06-15 01:30:00.123456", "UTC"), True
+        )
+
+    def test_datetime_date_and_year_stay_literals(self):
+        moment = dt.datetime(2024, 6, 15, 1, 30, 0, 123456)
+        for zone in ("UTC", "+08:00", "Asia/Shanghai"):
+            with self.subTest(zone=zone):
+                self.assertIs(
+                    v.compare_value("datetime(6)", moment, "2024-06-15 01:30:00.123456", zone), True
+                )
+                self.assertIs(
+                    v.compare_value("datetime(6)", moment, "2024-06-14 17:30:00.123456", zone), False
+                )
+        self.assertIs(v.compare_value("date", dt.date(2024, 6, 15), "2024-06-15", "+08:00"), True)
+        self.assertIs(v.compare_value("year", 2024, "2024", "+08:00"), True)
+
+    def test_the_zone_rule_does_not_reach_canonical_text_or_the_id(self):
+        moment = dt.datetime(2024, 6, 15, 1, 30, 0, 123456)
+        self.assertEqual(v.canonical_text("timestamp(6)", moment), "2024-06-15 01:30:00.123456")
+        self.assertEqual(
+            v.expected_doc_id("snk", "tbl", {"ts": "timestamp(6)"}, {"ts": moment}),
+            v.doc_id("snk.tbl", [("ts", "2024-06-15 01:30:00.123456")]),
+        )
+
+
 class TestMapping(unittest.TestCase):
     def test_derived_matrix(self):
         cases = {
@@ -201,6 +295,39 @@ class TestMapping(unittest.TestCase):
     def test_field_lookup_is_case_insensitive(self):
         mapping = {"properties": {"ID": {"type": "long"}}}
         self.assertEqual(v.field_mapping(mapping, "id"), {"type": "long"})
+
+    def test_implicit_object_type_is_accepted(self):
+        # Elasticsearch reports an object field through its "properties" only,
+        # dropping the type it was created with (see decodeMappingField in
+        # connector/sink/elasticsearch/mapping.go).
+        mapping = {
+            "properties": {
+                "c_json": {
+                    "dynamic": "true",
+                    "properties": {"id": {"type": "long"}, "k": {"type": "text"}},
+                }
+            }
+        }
+        self.assertEqual(v.mapping_problems({"c_json": "json"}, mapping), [])
+
+    def test_a_non_object_type_is_still_rejected(self):
+        mapping = {"properties": {"c_json": {"type": "keyword"}}}
+        problems = v.mapping_problems({"c_json": "json"}, mapping)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("c_json", problems[0])
+
+    def test_missing_field_and_bare_empty_type_are_rejected(self):
+        # A field absent from the mapping keeps failing, and an empty type with
+        # no properties is not treated as an object (decodeMappingField rejects
+        # that shape too).
+        problems = v.mapping_problems(
+            {"c_json": "json"}, {"properties": {"id": {"type": "long"}}}
+        )
+        self.assertEqual(problems, ["c_json: missing from mapping"])
+        problems = v.mapping_problems(
+            {"c_json": "json"}, {"properties": {"c_json": {"dynamic": "true"}}}
+        )
+        self.assertEqual(problems, ["c_json: mapping type '' != 'object'"])
 
 
 class TestCompare(unittest.TestCase):
