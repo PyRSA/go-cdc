@@ -433,7 +433,16 @@ func fieldEntry(t *testing.T, props map[string]any, name string) map[string]any 
 
 func fieldType(t *testing.T, props map[string]any, name string) string {
 	t.Helper()
-	typ, _ := fieldEntry(t, props, name)["type"].(string)
+	entry := fieldEntry(t, props, name)
+	typ, _ := entry["type"].(string)
+	// Elasticsearch omits the implicit object type on read: an object field is
+	// reported through its nested "properties" (and "dynamic") only. This
+	// mirrors decodeMappingField, which the production compatibility check uses.
+	if typ == "" {
+		if _, ok := entry["properties"]; ok {
+			return "object"
+		}
+	}
 	return typ
 }
 
