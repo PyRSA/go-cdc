@@ -2,6 +2,8 @@
 // An update is a single record: Before and After are siblings, not two events.
 package event
 
+import "github.com/PyRSA/go-cdc/common/schema"
+
 // Op is the source operation. Stdout prints CRUD letters; MySQL upserts current state.
 type Op string
 
@@ -35,6 +37,10 @@ type Event struct {
 	// SourceTSMs is the binlog event time in Unix milliseconds when known.
 	// Zero means unavailable; sinks must not invent a wall-clock substitute.
 	SourceTSMs int64
+	// Change carries structured DDL metadata the source recovered from catalog
+	// queries. Nil for non-DDL events and when no metadata is available; sinks
+	// must not infer column definitions from DDL text instead.
+	Change *schema.Change
 }
 
 // SourceID returns the capturing table as database.table.
@@ -53,6 +59,10 @@ func (e Event) Clone() Event {
 	e.After = cloneMap(e.After)
 	e.Columns = append([]string(nil), e.Columns...)
 	e.Keys = append([]string(nil), e.Keys...)
+	if e.Change != nil {
+		change := e.Change.Clone()
+		e.Change = &change
+	}
 	return e
 }
 

@@ -9,5 +9,6 @@ checkpoints/
 .cursor/
 .vscode/
 .claude/
+.qoder/
 .superpowers/
 /bin/

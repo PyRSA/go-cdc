@@ -6,7 +6,7 @@ What you get today:
 
 - End-to-end YAML jobs (source → transform / route → sink)
 - MySQL source: snapshot + binlog
-- Sinks: stdout (JSON lines), MySQL, and Kafka (at-least-once)
+- Sinks: stdout (JSON lines), MySQL, Kafka (at-least-once), and Doris (UNIQUE KEY + Stream Load, at-least-once)
 - Column projection, row filter, table route, schema-change policy, file checkpoints
 
 ## Requirements
@@ -37,6 +37,7 @@ Libraries linked into the binary (no separate connector packages to install):
 | MySQL | Sink | [connectors/mysql-sink.md](connectors/mysql-sink.md) |
 | Stdout | Sink | [connectors/stdout-sink.md](connectors/stdout-sink.md) |
 | Kafka | Sink | [connectors/kafka-sink.md](connectors/kafka-sink.md) |
+| Doris | Sink | [connectors/doris-sink.md](connectors/doris-sink.md) |
 
 Pipeline concepts (transform, projection, route, schema evolution): [pipeline.md](pipeline.md).
 
@@ -119,6 +120,7 @@ Stop with `Ctrl+C` (SIGINT) or SIGTERM; go-cdc flushes and saves the checkpoint 
 | --- | --- |
 | Sync to another MySQL | [MySQL Sink](connectors/mysql-sink.md) and [`configs/demo-mysql.yaml`](../configs/demo-mysql.yaml) |
 | Publish to Kafka | [Kafka Sink](connectors/kafka-sink.md) and [`configs/demo-kafka.yaml`](../configs/demo-kafka.yaml) |
+| Write current state to Doris | [Doris Sink](connectors/doris-sink.md) and [`configs/demo-doris.yaml`](../configs/demo-doris.yaml) |
 | Source options (startup mode, chunks, …) | [MySQL Source](connectors/mysql-source.md) |
 | Projection / filter / route / schema evolution | [Pipeline](pipeline.md) |
 
@@ -131,3 +133,4 @@ Stop with `Ctrl+C` (SIGINT) or SIGTERM; go-cdc flushes and saves the checkpoint 
   - [MySQL Sink](connectors/mysql-sink.md)
   - [Stdout Sink](connectors/stdout-sink.md)
   - [Kafka Sink](connectors/kafka-sink.md)
+  - [Doris Sink](connectors/doris-sink.md)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -81,6 +82,15 @@ func (c *Capture) resumeWithOptionalSnapshot(ctx context.Context, out chan<- sou
 
 	c.restrictNewTables(live, snapshotting)
 
+	// Doris needs a source catalogue on resume so CreateTable can re-run the
+	// full compatibility check before the first write. Other sinks leave
+	// ReemitCapturedSchemas false and keep the previous resume behaviour.
+	if c.ReemitCapturedSchemas {
+		if err := c.emitCapturedSchemas(ctx, out, live, snapshotting); err != nil {
+			return err
+		}
+	}
+
 	route := map[string]bool{}
 	for id := range snapshotting {
 		route[id] = true
@@ -112,6 +122,45 @@ func (c *Capture) resumeWithOptionalSnapshot(ctx context.Context, out chan<- sou
 	close(errCh)
 	for err := range errCh {
 		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// emitCapturedSchemas sends the current catalogue for captured tables that are
+// not being snapshotted (snapshotTable emits its own Schema). Called only when
+// ReemitCapturedSchemas is true. A table dropped at the source is skipped with a
+// warning: its remaining binlog events still need the target, and no source
+// definition is left to validate against. Any other catalogue error fails the
+// job, because skipping it would silently weaken the compatibility check this
+// feature exists to enforce.
+func (c *Capture) emitCapturedSchemas(ctx context.Context, out chan<- source.Message, live, snapshotting map[string]struct{}) error {
+	ids := make([]string, 0, len(live))
+	for id := range live {
+		if _, ok := snapshotting[id]; ok {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		parts := strings.SplitN(id, ".", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		table, err := c.DB.DescribeTable(ctx, parts[0], parts[1])
+		if err != nil {
+			if !errors.Is(err, ErrTableNotFound) {
+				return fmt.Errorf("source.mysql: resume schema for %s: %w", id, err)
+			}
+			c.warn("resume: captured table no longer exists; sink compatibility is not revalidated", "table", id)
+			continue
+		}
+		if err := c.send(ctx, out, source.Message{Schema: cloneTable(table)}); err != nil {
 			return err
 		}
 	}
