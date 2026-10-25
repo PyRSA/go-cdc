@@ -165,6 +165,9 @@ class TPResult:
     passed: bool = False
     detail_md: str = ""
     extra: dict[str, object] = field(default_factory=dict)
+    # Concrete mismatches; logged on failure because the report file is a CI
+    # artifact that pull-request runs never upload.
+    failures: list[str] = field(default_factory=list)
 
 
 # ------------------------------------------------------------------- MySQL
@@ -416,6 +419,13 @@ def verdict(ok: bool) -> str:
 def record(tp: TPResult) -> None:
     results.append(tp)
     log(f"{'PASS' if tp.passed else 'FAIL'} {tp.id} {tp.title}", flush=True)
+    if not tp.passed and tp.failures:
+        # The report is a git-ignored artifact that pull-request runs never
+        # upload, so a failure has to explain itself in the job log too.
+        for item in tp.failures[:10]:
+            log(f"    reason: {item}", flush=True)
+        if len(tp.failures) > 10:
+            log(f"    reason: ... and {len(tp.failures) - 10} more (see the report)", flush=True)
 
 
 # -------------------------------------------------------------- mutations
@@ -562,15 +572,19 @@ def tp_el01_snapshot() -> float:
     counts = es_counts()
     rows_md = "| Index | MySQL rows | ES docs | |\n| --- | ---: | ---: | --- |\n"
     counts_ok = True
+    count_problems: list[str] = []
     for table in TABLES:
         src_n = count_rows(table)
         ok = counts[table] == src_n
         counts_ok = counts_ok and ok
+        if not ok:
+            count_problems.append(f"{table} count: mysql={src_n} es={counts[table]}")
         rows_md += f"| `{index_for(table)}` | {src_n} | {counts[table]} | {verdict(ok)} |\n"
+    all_problems = problems + count_problems
     rows_md += f"| mappings (derived types/formats) | - | - | {verdict(not mapping_issues)} |\n"
-    rows_md += f"| Summary | | | **{verdict(not problems)}** |\n"
-    if problems:
-        rows_md += "\nMismatches:\n" + "\n".join(f"- `{item}`" for item in problems[:10]) + "\n"
+    rows_md += f"| Summary | | | **{verdict(not all_problems)}** |\n"
+    if all_problems:
+        rows_md += "\nMismatches:\n" + "\n".join(f"- `{item}`" for item in all_problems[:10]) + "\n"
     record(
         TPResult(
             id="TP-EL01",
@@ -583,6 +597,7 @@ def tp_el01_snapshot() -> float:
             passed=not problems and counts_ok,
             detail_md=rows_md,
             extra={"snapshot_seconds": elapsed},
+            failures=all_problems,
         )
     )
     return elapsed
