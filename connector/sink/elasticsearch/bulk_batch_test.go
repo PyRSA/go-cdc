@@ -683,3 +683,137 @@ func TestWriteRetryStaysWithinTheByteBudget(t *testing.T) {
 		}
 	}
 }
+
+// indexOpFor builds one index operation for a document identified by id.
+func indexOpFor(index, id, doc string) client.BulkOperation {
+	return client.BulkOperation{Action: client.ActionIndex, Index: index, ID: id, Document: []byte(doc)}
+}
+
+// deleteOpFor builds one delete operation for a document identified by id.
+func deleteOpFor(index, id string) client.BulkOperation {
+	return client.BulkOperation{Action: client.ActionDelete, Index: index, ID: id}
+}
+
+// Two operations for one document must never share a request: a retry resends
+// only the failed items, so a resent update could overtake a later update.
+func TestBulkSplitsRepeatedDocumentIntoSeparateRequests(t *testing.T) {
+	s, fake := sinkWithBulkBudget(t, 5<<20)
+	ops := []client.BulkOperation{
+		indexOpFor("shop.types", "doc-1", `{"v":1}`),
+		indexOpFor("shop.types", "doc-1", `{"v":2}`),
+		indexOpFor("shop.types", "doc-1", `{"v":3}`),
+	}
+	if err := s.bulk(context.Background(), ops); err != nil {
+		t.Fatalf("bulk: %v", err)
+	}
+	if len(fake.BulkCalls) != len(ops) {
+		t.Fatalf("bulk requests = %d, want %d", len(fake.BulkCalls), len(ops))
+	}
+	for i, call := range fake.BulkCalls {
+		if len(call.Ops) != 1 {
+			t.Fatalf("request %d carries %d operation(s), want 1", i+1, len(call.Ops))
+		}
+	}
+	assertOpsInOrder(t, flattenOps(fake.BulkCalls), ops)
+}
+
+// The document's final state must follow the source order across actions.
+func TestBulkKeepsDocumentOrderAcrossActions(t *testing.T) {
+	cases := []struct {
+		name string
+		ops  []client.BulkOperation
+	}{
+		{"update then delete", []client.BulkOperation{
+			indexOpFor("shop.types", "doc-1", `{"v":2}`),
+			deleteOpFor("shop.types", "doc-1"),
+		}},
+		{"delete then insert", []client.BulkOperation{
+			deleteOpFor("shop.types", "doc-1"),
+			indexOpFor("shop.types", "doc-1", `{"v":1}`),
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, fake := sinkWithBulkBudget(t, 5<<20)
+			if err := s.bulk(context.Background(), tc.ops); err != nil {
+				t.Fatalf("bulk: %v", err)
+			}
+			if len(fake.BulkCalls) != len(tc.ops) {
+				t.Fatalf("bulk requests = %d, want %d", len(fake.BulkCalls), len(tc.ops))
+			}
+			assertOpsInOrder(t, flattenOps(fake.BulkCalls), tc.ops)
+		})
+	}
+}
+
+// The same _id in different indexes is a different document, so it must not
+// split the request.
+func TestBulkKeepsSameIDInDifferentIndexesTogether(t *testing.T) {
+	s, fake := sinkWithBulkBudget(t, 5<<20)
+	ops := []client.BulkOperation{
+		indexOpFor("shop.a", "doc-1", `{"v":1}`),
+		indexOpFor("shop.b", "doc-1", `{"v":2}`),
+	}
+	if err := s.bulk(context.Background(), ops); err != nil {
+		t.Fatalf("bulk: %v", err)
+	}
+	if len(fake.BulkCalls) != 1 {
+		t.Fatalf("bulk requests = %d, want 1", len(fake.BulkCalls))
+	}
+	assertOpsInOrder(t, fake.BulkCalls[0].Ops, ops)
+}
+
+// The retry of an earlier request must finish before a later request for the
+// same document is sent, otherwise the retry could land last.
+func TestBulkRetriesEarlierRequestBeforeTheNextOne(t *testing.T) {
+	s, fake := sinkWithBulkBudget(t, 5<<20)
+	ops := []client.BulkOperation{
+		indexOpFor("shop.types", "doc-1", `{"v":1}`),
+		indexOpFor("shop.types", "doc-1", `{"v":2}`),
+	}
+	calls := 0
+	fake.BulkHook = func(batch client.BulkBatch) (client.BulkResult, error) {
+		calls++
+		items := okItems(batch.Ops)
+		if calls == 1 {
+			items[0].Status = http.StatusTooManyRequests
+			items[0].ErrType = "es_rejected_execution_exception"
+		}
+		return client.BulkResult{Items: items}, nil
+	}
+	if err := s.bulk(context.Background(), ops); err != nil {
+		t.Fatalf("bulk: %v", err)
+	}
+	if len(fake.BulkCalls) != 3 {
+		t.Fatalf("bulk requests = %d, want 3 (request, its retry, then the next request)", len(fake.BulkCalls))
+	}
+	wantDocs := []string{`{"v":1}`, `{"v":1}`, `{"v":2}`}
+	for i, want := range wantDocs {
+		if got := string(fake.BulkCalls[i].Ops[0].Document); got != want {
+			t.Fatalf("request %d document = %s, want %s", i+1, got, want)
+		}
+	}
+}
+
+// Splitting a repeated document must still respect the byte budget.
+func TestBulkDuplicateSplitRespectsByteBudget(t *testing.T) {
+	const budget = 8 << 10
+	s, fake := sinkWithBulkBudget(t, budget)
+	ops := []client.BulkOperation{
+		opOfEncodedSize(t, "doc-1", 3<<10),
+		opOfEncodedSize(t, "doc-1", 3<<10),
+		opOfEncodedSize(t, "doc-2", 3<<10),
+	}
+	if err := s.bulk(context.Background(), ops); err != nil {
+		t.Fatalf("bulk: %v", err)
+	}
+	if len(fake.BulkCalls) != 2 {
+		t.Fatalf("bulk requests = %d, want 2", len(fake.BulkCalls))
+	}
+	for i, call := range fake.BulkCalls {
+		if size := len(call.Body); size > budget {
+			t.Fatalf("request %d body = %d bytes, over the %d-byte budget", i+1, size, budget)
+		}
+	}
+	assertOpsInOrder(t, flattenOps(fake.BulkCalls), ops)
+}

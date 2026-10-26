@@ -691,7 +691,7 @@ func TestPrepareCatalogStopsAtFirstFailure(t *testing.T) {
 	}
 }
 
-func TestPrepareCatalogSkipsUnchangedTables(t *testing.T) {
+func TestPrepareCatalogReverifiesUnchangedTables(t *testing.T) {
 	s, fake := newTestSink(t, func(cfg *definition.Sink) { cfg.AutoCreate = true })
 	table := typesTable()
 	if err := s.PrepareCatalog([]schema.Table{table}); err != nil {
@@ -703,12 +703,16 @@ func TestPrepareCatalogSkipsUnchangedTables(t *testing.T) {
 		return true, nil
 	}
 	// The startup catalog and the snapshot Schema message describe the same
-	// table; the second pass must not hit the cluster again.
+	// table. The plan is reused, but the index is external state and must still
+	// be read back before the sink trusts it.
 	if err := s.PrepareCatalog([]schema.Table{table}); err != nil {
 		t.Fatalf("second PrepareCatalog: %v", err)
 	}
-	if checks != 0 {
-		t.Fatalf("unchanged table was re-checked: %d lookups", checks)
+	if checks != 1 {
+		t.Fatalf("unchanged table was not re-verified: %d lookups", checks)
+	}
+	if len(fake.Created) != 1 {
+		t.Fatalf("Created = %d, want 1", len(fake.Created))
 	}
 }
 
@@ -733,5 +737,64 @@ func TestPrepareCatalogRechecksChangedSchema(t *testing.T) {
 	}
 	if checks != 1 {
 		t.Fatalf("changed schema was not re-checked: %d lookups", checks)
+	}
+}
+
+// A cached plan must not hide an index dropped outside the sink, and the sink
+// must not recreate it: a fresh index cannot bring back the documents.
+func TestCachedSchemaReportsMissingIndex(t *testing.T) {
+	s, fake := newTestSink(t, func(cfg *definition.Sink) { cfg.AutoCreate = true })
+	table := typesTable()
+	if err := s.CreateTable(table); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	fake.Mu.Lock()
+	delete(fake.Indices, "shop.types")
+	fake.Mu.Unlock()
+	err := s.CreateTable(table)
+	if err == nil || !strings.Contains(err.Error(), "is missing") {
+		t.Fatalf("error = %v, want a missing-index failure", err)
+	}
+	if !strings.Contains(err.Error(), "shop.types") {
+		t.Fatalf("error %q does not name the index", err)
+	}
+	if len(fake.Created) != 1 {
+		t.Fatalf("Created = %d, want the original create only; the missing index was recreated", len(fake.Created))
+	}
+}
+
+// A cached plan must not hide a mapping changed outside the sink.
+func TestCachedSchemaReportsIncompatibleMapping(t *testing.T) {
+	s, fake := newTestSink(t, func(cfg *definition.Sink) { cfg.AutoCreate = true })
+	table := typesTable()
+	if err := s.CreateTable(table); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	mappings := mappingsFor(t, table)
+	mappings["properties"].(map[string]any)["ID"] = map[string]any{"type": "integer"}
+	fake.AddIndex("shop.types", mappings)
+	err := s.CreateTable(table)
+	if err == nil || !strings.Contains(err.Error(), "range") {
+		t.Fatalf("error = %v, want a mapping conflict for bigint unsigned", err)
+	}
+	if len(fake.Created) != 1 {
+		t.Fatalf("Created = %d, want the original create only", len(fake.Created))
+	}
+}
+
+// The cached plan must surface an existence-check failure instead of creating.
+func TestCachedSchemaReportsExistenceError(t *testing.T) {
+	s, fake := newTestSink(t, func(cfg *definition.Sink) { cfg.AutoCreate = true })
+	table := typesTable()
+	if err := s.CreateTable(table); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	fake.ExistsErr = errors.New("cluster unavailable")
+	err := s.CreateTable(table)
+	if err == nil || !strings.Contains(err.Error(), "cluster unavailable") {
+		t.Fatalf("error = %v, want the existence failure", err)
+	}
+	if len(fake.Created) != 1 {
+		t.Fatalf("Created = %d, want the original create only", len(fake.Created))
 	}
 }

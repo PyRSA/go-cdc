@@ -87,16 +87,31 @@ func (s *Sink) bulk(ctx context.Context, ops []client.BulkOperation) error {
 	return nil
 }
 
+// documentRef identifies one document across the operations of a Write.
+// Operations written to the same document must not share a bulk request: a
+// retry resends only the failed items, so an earlier update resent after a
+// later one already succeeded would win and leave a stale value.
+type documentRef struct {
+	index string
+	id    string
+}
+
 // planBulk encodes every operation once and groups the results so no request
 // body exceeds the byte budget. Splitting must be decided on the encoded bytes
 // (action line + document + newlines), because that is what the request carries.
 // The count cap stays the runner's write-batch-size: splitting never merges
 // requests, so it can only make a batch smaller. One operation over the budget
 // cannot be split and fails here, before anything is sent.
+//
+// A document already present in the current batch closes it and moves to the
+// next one, so two operations for the same (index, _id) never share a request.
+// Batches are sent in order and a request, including its retries, completes
+// before the next one starts, which keeps the source order for every document.
 func (s *Sink) planBulk(ops []client.BulkOperation) ([]client.BulkBatch, error) {
 	limit := s.bulkMaxBytes
 	batches := make([]client.BulkBatch, 0, 1)
 	var current client.BulkBatch
+	seen := make(map[documentRef]struct{}, len(ops))
 	for _, op := range ops {
 		encoded, err := client.EncodeBulkOperation(op)
 		if err != nil {
@@ -107,12 +122,18 @@ func (s *Sink) planBulk(ops []client.BulkOperation) ([]client.BulkBatch, error) 
 				"elasticsearch: bulk: %s %s/%s needs %d bytes, over the %d-byte sink.bulk-max-bytes limit; a document cannot be split",
 				op.Action, op.Index, op.ID, len(encoded), limit)
 		}
-		if len(current.Ops) > 0 && len(current.Body)+len(encoded) > limit {
-			batches = append(batches, current)
-			current = client.BulkBatch{}
+		ref := documentRef{index: op.Index, id: op.ID}
+		if len(current.Ops) > 0 {
+			_, repeated := seen[ref]
+			if repeated || len(current.Body)+len(encoded) > limit {
+				batches = append(batches, current)
+				current = client.BulkBatch{}
+				seen = make(map[documentRef]struct{}, len(ops))
+			}
 		}
 		current.Ops = append(current.Ops, op)
 		current.Body = append(current.Body, encoded...)
+		seen[ref] = struct{}{}
 	}
 	if len(current.Ops) > 0 {
 		batches = append(batches, current)
@@ -154,10 +175,9 @@ func (s *Sink) sendBatch(ctx context.Context, batch client.BulkBatch) error {
 				len(result.Items), len(pending.Ops))
 		}
 		retryOps, retryFailures, permanent := classifyItems(pending.Ops, result.Items)
-		// Known gap, tracked as a separate data-correctness fix: when the same _id
-		// appears again later in this request and that later operation already
-		// succeeded, resending the failed operation makes the older value win.
-		// Requests are sent serially, so duplicates split across requests are safe.
+		// planBulk never puts two operations for the same (index, _id) in one
+		// request, so a resent item cannot overtake a later operation for the
+		// same document.
 		if len(permanent) > 0 {
 			// A permanent rejection cannot be retried away, and the batch as a
 			// whole must fail so the runner keeps its checkpoint.

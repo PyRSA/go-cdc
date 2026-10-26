@@ -198,9 +198,11 @@ func (s *Sink) CreateTable(table schema.Table) error {
 		return fmt.Errorf("elasticsearch: table %s.%s has no columns to map", table.Database, table.Table)
 	}
 	// The startup catalog and the snapshot Schema message describe the same
-	// table; the cached plan already passed every check for that schema.
+	// table, so the cached plan skips the plan checks. The index is external
+	// state and may have been dropped or remapped since then, so it is still
+	// verified against the cached plan.
 	if cached, ok := s.metaFor(table.Database + "." + table.Table); ok && cached.samePlan(table) {
-		return nil
+		return s.verifyCachedIndex(cached)
 	}
 	index := indexNameFor(s.cfg.IndexName, table.Database, table.Table)
 	if err := validateIndexName(index); err != nil {
@@ -342,6 +344,25 @@ func (s *Sink) ensureIndex(meta *tableMeta) error {
 		return fmt.Errorf("elasticsearch: index %q: create: %w", meta.index, err)
 	}
 	// A concurrent creator wins the race; the mapping check below decides.
+	return s.verifyMapping(meta)
+}
+
+// verifyCachedIndex re-checks the index behind an unchanged plan. It only reads
+// the cluster: a missing index is reported instead of recreated, even when
+// auto-create is on, because a fresh index cannot bring back the documents the
+// previous one held.
+func (s *Sink) verifyCachedIndex(meta *tableMeta) error {
+	ctx, cancel := s.requestContext()
+	exists, err := s.client.IndexExists(ctx, meta.index)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("elasticsearch: index %q: check existence: %w", meta.index, err)
+	}
+	if !exists {
+		return fmt.Errorf(
+			"elasticsearch: index %q for table %s is missing while its schema is unchanged; v1 does not recreate an index that may have held data",
+			meta.index, meta.scope)
+	}
 	return s.verifyMapping(meta)
 }
 
