@@ -1,6 +1,9 @@
 package definition
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Startup modes accepted from scan.startup.mode.
 const (
@@ -52,7 +55,7 @@ type Source struct {
 	JDBCProperties        map[string]string
 }
 
-// Sink is stdout, MySQL, Kafka, or Doris for this release.
+// Sink is stdout, MySQL, Kafka, Doris, or Elasticsearch for this release.
 type Sink struct {
 	Type            string
 	Hostname        string
@@ -76,7 +79,6 @@ type Sink struct {
 	// Doris
 	SQLPort             int           // sql-port; FE MySQL protocol; default 9030 via parseSink
 	Database            string        // database; optional default target database
-	RequestTimeout      time.Duration // request-timeout; Stream Load HTTP timeout
 	SchemaChange        bool          // schema.change.enabled; default false
 	SchemaChangeInclude []string      // schema.change.include; v1 allows only add.column
 	SchemaChangeWait    time.Duration // schema.change.wait-timeout; ADD COLUMN visibility budget
@@ -84,6 +86,16 @@ type Sink struct {
 	DeleteEnabled       bool          // delete.enabled; must stay false
 	Buckets             string        // buckets; "auto" or a positive integer
 	ReplicationNum      int           // replication-num; 0 omits PROPERTIES
+
+	// Elasticsearch. AutoCreate defaults to false for this sink; mapping-file is
+	// read and validated at parse time and kept as the Create Index body.
+	Hosts       []string
+	IndexName   string
+	MappingFile string
+	Mapping     json.RawMessage
+	// RequestTimeout is shared by Doris and Elasticsearch: request-timeout; the
+	// HTTP timeout for Stream Load and the Bulk API respectively.
+	RequestTimeout time.Duration
 }
 
 // Route sends one source table pattern to a sink table.

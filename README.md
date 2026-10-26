@@ -4,12 +4,12 @@
 
 ## Introduction
 
-go-cdc is a YAML-driven Change Data Capture (CDC) tool. You describe one sync job in a single YAML file: capture full and incremental changes from MySQL, apply optional transform and route, then write to **stdout**, **MySQL**, **Kafka**, or **Doris** (Kafka / Doris at-least-once). One process, one config, one binary: `go-cdc`.
+go-cdc is a YAML-driven Change Data Capture (CDC) tool. You describe one sync job in a single YAML file: capture full and incremental changes from MySQL, apply optional transform and route, then write to **stdout**, **MySQL**, **Kafka**, **Doris**, or **Elasticsearch 8** (Kafka / Doris at-least-once; Elasticsearch uses the Bulk API with idempotent writes). One process, one config, one binary: `go-cdc`.
 
 Features in this release:
 
 - MySQL source (snapshot + binlog)
-- Stdout sink (newline-delimited JSON), MySQL sink, Kafka sink, and Doris sink (UNIQUE KEY + Stream Load, at-least-once)
+- Stdout sink (newline-delimited JSON), MySQL sink, Kafka sink (at-least-once), Doris sink (UNIQUE KEY + Stream Load, at-least-once), and Elasticsearch 8 sink
 - Projection, filter, table route, schema-change policy, file checkpoints
 - **Note:** stdout JSON now uses the shared Debezium-inspired envelope (`source.db` / `source.table`); older top-level `database` / `table` fields are gone
 
@@ -104,6 +104,7 @@ See the guides under `[docs/](docs/)`:
   - [Stdout Sink](docs/connectors/stdout-sink.md)
   - [Kafka Sink](docs/connectors/kafka-sink.md)
   - [Doris Sink](docs/connectors/doris-sink.md)
+  - [Elasticsearch Sink](docs/connectors/elasticsearch-sink.md)
 
 **Minimal run (MySQL → stdout):**
 
@@ -116,6 +117,7 @@ See the guides under `[docs/](docs/)`:
 
 3. For MySQL → MySQL, use `[configs/demo-mysql.yaml](configs/demo-mysql.yaml)`.
 4. For MySQL → Doris, use `[configs/demo-doris.yaml](configs/demo-doris.yaml)`.
+5. For MySQL → Elasticsearch, use `[configs/demo-elasticsearch.yaml](configs/demo-elasticsearch.yaml)`.
 
 
 

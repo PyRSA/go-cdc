@@ -35,8 +35,8 @@ Writes results. Supported types:
 | `mysql` | [connectors/mysql-sink.md](connectors/mysql-sink.md) |
 | `kafka` | [connectors/kafka-sink.md](connectors/kafka-sink.md) |
 | `doris` | [connectors/doris-sink.md](connectors/doris-sink.md) |
+| `elasticsearch` | [connectors/elasticsearch-sink.md](connectors/elasticsearch-sink.md) |
 
-`elasticsearch` is **not** available in this release (startup fails if configured).
 Doris v1 targets **2.1.x** with `UNIQUE KEY` tables and Stream Load JSON Lines;
 DELETE, partial-column updates, and DROP/TRUNCATE are rejected.
 
@@ -150,6 +150,7 @@ DDL comes from the source when `source.schema-change.enabled` is `true` (default
 | --- | --- |
 | Stdout | Always prints `"op":"ddl"` when source emits DDL |
 | Kafka | Emits `"op":"ddl"` only when `schema.change.emit.enabled: true`; topic follows the same route rules as DML (see [Kafka Sink](connectors/kafka-sink.md)) |
+| Elasticsearch | **No schema evolution**: any reached DDL fails the job instead of changing the index mapping (see [Elasticsearch Sink](connectors/elasticsearch-sink.md)) |
 
 **Doris** only applies whitelisted column additions, and only when enabled:
 
@@ -161,7 +162,7 @@ DDL comes from the source when `source.schema-change.enabled` is `true` (default
 | CREATE TABLE | Applied through `auto-create-table` / the inferred schema, then validated |
 | Other / unprojected columns | Ignored when no Doris action is required |
 
-Details: [MySQL Source](connectors/mysql-source.md), [MySQL Sink](connectors/mysql-sink.md), [Stdout Sink](connectors/stdout-sink.md), [Kafka Sink](connectors/kafka-sink.md), [Doris Sink](connectors/doris-sink.md).
+Details: [MySQL Source](connectors/mysql-source.md), [MySQL Sink](connectors/mysql-sink.md), [Stdout Sink](connectors/stdout-sink.md), [Kafka Sink](connectors/kafka-sink.md), [Doris Sink](connectors/doris-sink.md), [Elasticsearch Sink](connectors/elasticsearch-sink.md).
 
 ---
 
@@ -191,7 +192,7 @@ source:
   type: mysql
   # … see mysql-source.md
 sink:
-  type: mysql   # or stdout / kafka / doris — see sink docs
+  type: mysql   # or stdout / kafka / doris / elasticsearch — see sink docs
   # …
 transform:
   - source-table: demo_db\.orders
@@ -221,3 +222,4 @@ checkpoint:
   - [Stdout Sink](connectors/stdout-sink.md)
   - [Kafka Sink](connectors/kafka-sink.md)
   - [Doris Sink](connectors/doris-sink.md)
+  - [Elasticsearch Sink](connectors/elasticsearch-sink.md)

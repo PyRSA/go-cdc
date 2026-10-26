@@ -112,6 +112,7 @@ bash test/integration/scripts/run-doris-scale.sh normal
 | `mysql-mysql-e2e` | MySQL **5.7** + **8.0** | 功能 + 类型 + 负载；**8.0 另跑 Kafka sink** TP-K01..K08 |
 | `mysql-scale-e2e` | 仅 MySQL **8.0** | scale `normal` / `heavy`（独立 compose 项目，宿主机端口 `13307`） |
 | `doris-e2e` | MySQL **8.0** + Doris **2.1.8** | MySQL→Doris 流水线 TP-DR01..DR07（功能 + 负载）+ sink Go 套件 + Doris 规模（[`doris-integration.yml`](../../.github/workflows/doris-integration.yml)） |
+| `elasticsearch-e2e` | MySQL **8.0** + compose ES8 | ES sink：Go IT（`esintegration`）+ E2E + 负载 + scale `normal` |
 
 **负载分档**（`LOAD_ROWS_PER_TABLE`）：PR / `main` / `master` / `release-*` → **100000**（`LOAD_PROFILE=full`）；其他分支 push → **30000**（`normal`）。峰值：5.7 / 8.0 均为 **60s×4**。Doris `doris-e2e` 使用同一分档（5 张批量表）；`workflow_dispatch` 可显式选 `normal` / `full`。
 
@@ -171,3 +172,37 @@ UNIQUE KEY、同批重复主键、空 Schema 缓存重启、额外列、类型�
 会启动 MySQL + Doris `2.1.8` FE+BE、调高内核参数、执行套件（功能 TP-DR01..DR04，
 再跑负载 TP-DR05..DR07，最后跑 Doris 规模套件），并上传 Markdown 报告与
 `cdc-doris*.log`、compose 日志。
+## Elasticsearch 8 sink 套件
+
+ES8 sink 与 MySQL sink 对齐的四层测试。共用 MySQL compose、造数器（`harness/load_it.py`、`scale/scale_it.py`）与同名 knob，差异只在目标端：`harness/es_client.py`（HTTP）、`harness/es_verify.py`（独立 oracle）。
+
+```bash
+bash test/integration/scripts/mysql-up.sh
+bash test/integration/scripts/es-up.sh          # compose 服务 elasticsearch（8.15.3）
+
+bash test/integration/scripts/run-es-integration.sh   # Go sink/runner IT（tag esintegration）
+bash test/integration/scripts/run-es-e2e.sh           # MySQL binlog -> runner -> ES8
+bash test/integration/scripts/run-es-load.sh          # 每表 5 万行 + 峰值写入
+bash test/integration/scripts/run-es-scale.sh normal  # 5 库 / 20 表
+bash test/integration/scripts/run-es-scale.sh heavy   # 10 库 / 50 表 + 热点 burst/peak
+```
+
+对应 Make 目标：`make integration-es-up`、`integration-es-integration`、`integration-es-e2e`、`integration-es-load`、`integration-es-scale-normal`、`integration-es-scale-heavy`（`test/integration/Makefile` 中另有短写 `make es-*`）。
+
+| 层级 | 入口 | 报告 |
+| --- | --- | --- |
+| Integration | `go test -tags esintegration ./connector/sink/elasticsearch/`（真实 ES8） | `go test` 输出 |
+| E2E | `harness/es_it.py`（TP-E01..） | `docs/test/reports/mysql-elasticsearch.md` |
+| Load | `harness/es_load_it.py`（TP-EL01..EL05） | `docs/test/reports/mysql-elasticsearch-load.md` |
+| Scale | `scale/es_scale_it.py`（normal / heavy） | `docs/test/reports/mysql-elasticsearch-scale-{profile}.md` |
+
+隔离与 knob：
+
+- 每个套件有独立索引命名空间，既是命名前缀也是清理前缀：`ES_INDEX_PREFIX`（默认 `db_tp_es_snk`）、`ES_LOAD_INDEX_PREFIX`（默认 `db_tp_es_load_snk`）、`ES_SCALE_INDEX_PREFIX`（默认 `db_tp_scale_snk_*`）。compose 开了 `action.destructive_requires_name`，清理时逐索引删除。
+- `ES_URL`（默认 `http://127.0.0.1:19200`）、`ES_USERNAME` / `ES_PASSWORD`（一次性节点为空）、`ES_REQUEST_TIMEOUT`（秒）。
+- 负载批量扫描：TP-EL02 用 `ES_LOAD_BATCH_SIZE` / `ES_LOAD_BATCH_INTERVAL`（默认 `1000` / `500ms`），TP-EL03 重启用 `ES_LOAD_SMALL_BATCH` / `ES_LOAD_SMALL_INTERVAL`（默认 `100` / `100ms`）；`LOAD_*` 与 MySQL 负载套件共用。
+- 规模复用 `SCALE_TOTAL_ROWS` / `SCALE_WORKERS` / `SCALE_TOTAL_TIMEOUT`（默认 `1800`）与 `ES_SCALE_RESTART_ROWS`（默认 `100`）。
+- 造数后删除 `tpl01_typed.c_bit`：sink v1 明确拒绝 BIT 列。
+- `write-batch-size` / `write-batch-interval` 是 runner 级 knob：一次 `Sink.Write` 对应一个 bulk，按大小、按间隔、以及任何 split / position / watermark / captured 消息触发 flush（`composer/runner.go`），快照分块与 binlog 事件走同一条路径。
+
+校验原则：不把 bulk HTTP 200 当数据正确性证据；`_count` 只做进度门槛，内容一致性用分页（scroll，1000 条/页）流式算出 `(COUNT, SUM(id), SUM(CRC32))` 与 MySQL 比对，并额外做整文档字段比对（NULL / DECIMAL / JSON / 二进制 / 日期时间）。

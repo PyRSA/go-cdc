@@ -1,4 +1,11 @@
-from scale.schemas import checksum_sql, create_table_sql, insert_batch, large_payload_sizes
+from scale.schemas import (
+    checksum_column,
+    checksum_sql,
+    create_table_sql,
+    insert_batch,
+    large_payload_sizes,
+    table_columns,
+)
 
 
 def test_create_basic_has_pk():
@@ -82,3 +89,34 @@ def test_insert_batch_chunks_executemany():
     assert calls == [500, 500, 200]
     assert conn.committed
 
+
+def test_checksum_column_matches_the_sql():
+    for template in ("basic", "wide", "indexed", "large"):
+        column = checksum_column(template)
+        assert f"CRC32(`{column}`)" in checksum_sql(template, "db", "tbl")
+
+
+def test_table_columns_stay_in_sync_with_the_ddl():
+    for template in ("basic", "wide", "indexed", "large"):
+        columns = table_columns(template)
+        ddl = create_table_sql(template, "tbl")
+        for name in columns:
+            assert f"`{name}`" in ddl, (template, name)
+        assert "id" in columns and columns["id"] == "bigint"
+
+
+def test_table_columns_normalize_mysql_types():
+    basic = table_columns("basic")
+    assert basic["amount"] == "decimal(18,4)"
+    assert basic["description"] == "varchar(512)"
+    assert basic["created_at"] == "datetime(6)"
+
+    wide = table_columns("wide")
+    assert wide["c_text"] == "text"
+    assert wide["c_json"] == "json"
+    assert wide["c_time"] == "time"
+    assert wide["c_timestamp"] == "timestamp"
+
+    indexed = table_columns("indexed")
+    assert list(indexed) == ["id", "tenant_id", "user_id", "external_id", "status", "amount", "created_at", "updated_at"]
+    assert "uk_external_id" not in indexed and "idx_tenant_id" not in indexed

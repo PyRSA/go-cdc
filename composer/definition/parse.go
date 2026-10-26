@@ -2,7 +2,12 @@ package definition
 
 import (
 	"crypto/md5"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
+	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -24,6 +29,7 @@ const (
 	minProducerBatchMaxBytes = 512
 	maxProducerBatchMaxBytes = 100 << 20 // 104857600
 	defaultFlushTimeout      = 30 * time.Second
+	defaultRequestTimeout    = 30 * time.Second
 	defaultDorisHTTPPort     = 8030
 	defaultDorisSQLPort      = 9030
 	defaultDorisTimeout      = 30 * time.Second
@@ -33,6 +39,22 @@ const (
 	// new column appears or the budget runs out. Exported because the sink also
 	// defaults a directly constructed definition.Sink.
 	DefaultDorisSchemaChangeWait = 5 * time.Second
+)
+
+// Sink keys that only make sense for one sink type. Rejecting them keeps a
+// mistyped key from being silently ignored.
+var (
+	esOnlySinkKeys = map[string]struct{}{
+		"hosts": {}, "auto-create": {}, "index-name": {}, "mapping-file": {},
+	}
+	kafkaOnlySinkKeys = map[string]struct{}{
+		"brokers": {}, "topic": {}, "source-name": {}, "client-id": {},
+		"schema.change.emit.enabled": {}, "allow.auto.create.topics": {},
+		"producer-batch-max-bytes": {}, "flush-timeout": {},
+	}
+	mysqlOnlySinkKeys = map[string]struct{}{
+		"auto-create-table": {},
+	}
 )
 
 var startupModes = map[string]struct{}{
@@ -53,10 +75,11 @@ var rejectedExact = map[string]struct{}{
 }
 
 // dorisOnlySinkKeys are parsed for every sink type but only meaningful for
-// Doris. mysql / kafka / stdout reject them so a typo cannot silently no-op.
+// Doris. mysql / kafka / stdout / elasticsearch reject them so a typo cannot
+// silently no-op. request-timeout is not listed here: Doris and Elasticsearch
+// both honour it (see requestTimeoutSinkKeys).
 var dorisOnlySinkKeys = []string{
 	"sql-port",
-	"request-timeout",
 	"buckets",
 	"replication-num",
 	"schema.change.enabled",
@@ -66,10 +89,16 @@ var dorisOnlySinkKeys = []string{
 	"delete.enabled",
 }
 
-func rejectKeysForSinkType(sinkType string, seen map[string]struct{}, keys []string) error {
-	for _, key := range keys {
-		if _, ok := seen[key]; ok {
-			return configf("sink."+key, "not supported for sink.type %s", sinkType)
+// requestTimeoutSinkKeys is the only Doris option Elasticsearch shares. It is
+// rejected for the sinks that have no request to bound.
+var requestTimeoutSinkKeys = []string{"request-timeout"}
+
+func rejectKeysForSinkType(sinkType string, seen map[string]struct{}, keyLists ...[]string) error {
+	for _, keys := range keyLists {
+		for _, key := range keys {
+			if _, ok := seen[key]; ok {
+				return configf("sink."+key, "not supported for sink.type %s", sinkType)
+			}
 		}
 	}
 	return nil
@@ -336,9 +365,9 @@ func parseSink(raw map[string]any) (Sink, error) {
 		out.SchemaChangeInclude = []string{"add.column"}
 		out.SchemaChangeWait = DefaultDorisSchemaChangeWait
 	}
-	seen := make(map[string]struct{}, len(raw))
+	used := make(map[string]struct{}, len(raw))
 	for key, value := range raw {
-		seen[key] = struct{}{}
+		used[key] = struct{}{}
 		switch key {
 		case "type":
 			out.Type = fmt.Sprint(value)
@@ -360,6 +389,28 @@ func parseSink(raw map[string]any) (Sink, error) {
 				return Sink{}, configf("sink.auto-create-table", "%v", err)
 			}
 			out.AutoCreate = b
+		case "auto-create":
+			b, err := asBool(value)
+			if err != nil {
+				return Sink{}, configf("sink.auto-create", "%v", err)
+			}
+			out.AutoCreate = b
+		case "hosts":
+			list, err := asStringList(value)
+			if err != nil {
+				return Sink{}, configf("sink.hosts", "%v", err)
+			}
+			out.Hosts = list
+		case "index-name":
+			out.IndexName = strings.TrimSpace(fmt.Sprint(value))
+		case "mapping-file":
+			out.MappingFile = strings.TrimSpace(fmt.Sprint(value))
+		case "request-timeout":
+			d, err := asDuration(value)
+			if err != nil || d <= 0 {
+				return Sink{}, configErr("sink.request-timeout", "must be a positive duration")
+			}
+			out.RequestTimeout = d
 		case "write-batch-size":
 			n, err := asInt(value)
 			if err != nil || n < 1 {
@@ -428,12 +479,6 @@ func parseSink(raw map[string]any) (Sink, error) {
 			out.SQLPort = n
 		case "database":
 			out.Database = strings.TrimSpace(fmt.Sprint(value))
-		case "request-timeout":
-			d, err := asDuration(value)
-			if err != nil || d <= 0 {
-				return Sink{}, configErr("sink.request-timeout", "must be a positive duration")
-			}
-			out.RequestTimeout = d
 		case "schema.change.enabled":
 			b, err := asBool(value)
 			if err != nil {
@@ -476,13 +521,16 @@ func parseSink(raw map[string]any) (Sink, error) {
 			return Sink{}, configErr("sink."+key, "unknown field")
 		}
 	}
+	if err := validateSinkKeys(out.Type, used); err != nil {
+		return Sink{}, err
+	}
 	switch out.Type {
 	case "stdout":
-		if err := rejectKeysForSinkType(out.Type, seen, dorisOnlySinkKeys); err != nil {
+		if err := rejectKeysForSinkType(out.Type, used, dorisOnlySinkKeys, requestTimeoutSinkKeys); err != nil {
 			return Sink{}, err
 		}
 	case "mysql":
-		if err := rejectKeysForSinkType(out.Type, seen, dorisOnlySinkKeys); err != nil {
+		if err := rejectKeysForSinkType(out.Type, used, dorisOnlySinkKeys, requestTimeoutSinkKeys); err != nil {
 			return Sink{}, err
 		}
 		if out.Hostname == "" {
@@ -495,7 +543,7 @@ func parseSink(raw map[string]any) (Sink, error) {
 			return Sink{}, configErr("sink.password", "required")
 		}
 	case "kafka":
-		if err := rejectKeysForSinkType(out.Type, seen, dorisOnlySinkKeys); err != nil {
+		if err := rejectKeysForSinkType(out.Type, used, dorisOnlySinkKeys, requestTimeoutSinkKeys); err != nil {
 			return Sink{}, err
 		}
 		if len(out.Brokers) == 0 {
@@ -555,7 +603,14 @@ func parseSink(raw map[string]any) (Sink, error) {
 			}
 		}
 	case "elasticsearch":
-		return Sink{}, configf("sink.type", "%s is not implemented in this release", out.Type)
+		// request-timeout is shared with Doris; every other Doris-only key has
+		// no meaning here and must not be silently ignored.
+		if err := rejectKeysForSinkType(out.Type, used, dorisOnlySinkKeys); err != nil {
+			return Sink{}, err
+		}
+		if err := validateElasticsearch(&out, used); err != nil {
+			return Sink{}, err
+		}
 	default:
 		if out.Type == "" {
 			return Sink{}, configErr("sink.type", "required")
@@ -563,6 +618,118 @@ func parseSink(raw map[string]any) (Sink, error) {
 		return Sink{}, configf("sink.type", "unknown type %s", out.Type)
 	}
 	return out, nil
+}
+
+// validateSinkKeys rejects sink keys that belong to another sink type. The
+// first offending key in sorted order is reported, so messages are stable.
+func validateSinkKeys(sinkType string, used map[string]struct{}) error {
+	keys := make([]string, 0, len(used))
+	for key := range used {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if _, ok := esOnlySinkKeys[key]; ok && sinkType != "elasticsearch" {
+			return configf("sink."+key, "only valid for sink.type elasticsearch")
+		}
+		if _, ok := kafkaOnlySinkKeys[key]; ok && sinkType != "kafka" {
+			return configf("sink."+key, "only valid for sink.type kafka")
+		}
+		if _, ok := mysqlOnlySinkKeys[key]; ok && sinkType != "mysql" && sinkType != "doris" {
+			// auto-create-table is shared by the MySQL and Doris sinks; the
+			// Elasticsearch sink opts into index creation with auto-create.
+			return configf("sink."+key, "only valid for sink.type mysql or doris")
+		}
+	}
+	return nil
+}
+
+// validateElasticsearch applies the ES-only defaults and validation. auto-create
+// defaults to false here (unlike the MySQL sink): creating an index is a side
+// effect that must be opted into.
+func validateElasticsearch(out *Sink, used map[string]struct{}) error {
+	if _, ok := used["auto-create"]; !ok {
+		out.AutoCreate = false
+	}
+	if len(out.Hosts) == 0 {
+		return configErr("sink.hosts", "required")
+	}
+	for i, host := range out.Hosts {
+		if err := validateElasticsearchHost(host); err != nil {
+			return configf("sink.hosts", "entry %d: %v", i, err)
+		}
+	}
+	if (out.Username == "") != (out.Password == "") {
+		return configErr("sink.username", "username and password must be configured together")
+	}
+	if out.RequestTimeout <= 0 {
+		out.RequestTimeout = defaultRequestTimeout
+	}
+	if out.IndexName != "" {
+		if err := validateElasticsearchIndexName(out.IndexName); err != nil {
+			return configf("sink.index-name", "%v", err)
+		}
+	}
+	if out.MappingFile == "" {
+		return nil
+	}
+	body, err := os.ReadFile(out.MappingFile)
+	if err != nil {
+		return configf("sink.mapping-file", "read %s: %v", out.MappingFile, err)
+	}
+	if !json.Valid(body) {
+		return configf("sink.mapping-file", "%s is not valid JSON", out.MappingFile)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil || doc == nil {
+		return configf("sink.mapping-file", "%s must be a JSON object", out.MappingFile)
+	}
+	out.Mapping = append(json.RawMessage(nil), body...)
+	return nil
+}
+
+// validateElasticsearchHost checks a host entry without echoing credentials
+// that may be embedded in the URL.
+func validateElasticsearchHost(value string) error {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return errors.New("must not be empty")
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return errors.New("invalid URL")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("unsupported scheme %q, want http or https", parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return errors.New("missing host")
+	}
+	return nil
+}
+
+// validateElasticsearchIndexName enforces the Elasticsearch index naming rules
+// for an explicit sink.index-name.
+func validateElasticsearchIndexName(name string) error {
+	if name == "" {
+		return errors.New("must not be empty")
+	}
+	if name == "." || name == ".." {
+		return errors.New(`must not be "." or ".."`)
+	}
+	if len(name) > 255 {
+		return errors.New("must not exceed 255 bytes")
+	}
+	if name != strings.ToLower(name) {
+		return errors.New("must be lowercase")
+	}
+	if strings.HasPrefix(name, "_") || strings.HasPrefix(name, "-") || strings.HasPrefix(name, "+") {
+		return fmt.Errorf("must not start with %q", name[:1])
+	}
+	if strings.ContainsAny(name, `\/*?"<>| ,#:`) {
+		return errors.New(`must not contain a reserved character (\ / * ? " < > | space , # :)`)
+	}
+	return nil
 }
 
 func parseRoutes(raw any) ([]Route, error) {

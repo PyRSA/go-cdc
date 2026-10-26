@@ -21,6 +21,9 @@ REPORT_TYPES = REPORT_DIR / "mysql-mysql-types.md"
 REPORT_LOAD = REPORT_DIR / "mysql-mysql-load.md"
 REPORT_KAFKA = REPORT_DIR / "mysql-kafka.md"
 REPORT_DORIS = REPORT_DIR / "mysql-doris.md"
+REPORT_ES = REPORT_DIR / "mysql-elasticsearch.md"
+REPORT_ES_LOAD = REPORT_DIR / "mysql-elasticsearch-load.md"
+REPORT_ES_SCALE_TMPL = "mysql-elasticsearch-scale-{profile}.md"
 
 
 def env(name: str, default: str = "") -> str:
@@ -43,6 +46,11 @@ TYPES_SRC_DB = env("TYPES_SRC_DB", "db_tp_types_src")
 TYPES_SNK_DB = env("TYPES_SNK_DB", "db_tp_types_snk")
 LOAD_SRC_DB = env("LOAD_SRC_DB", "db_tp_load_src")
 LOAD_SNK_DB = env("LOAD_SNK_DB", "db_tp_load_snk")
+# Elasticsearch suites: source DB is MySQL, the ``snk`` DB is only a logical
+# namespace - it becomes the index name (``snk_db.table`` normalized).
+ES_SRC_DB = env("ES_SRC_DB", "db_tp_es_src")
+ES_SNK_DB = env("ES_SNK_DB", "db_tp_es_snk")
+ES_LOAD_SNK_DB = env("ES_LOAD_SNK_DB", "db_tp_es_load_snk")
 
 # Back-compat aliases used by functional harness.
 SRC_DB = env("SRC_DB", FUNC_SRC_DB)
@@ -57,6 +65,12 @@ CDC_SERVER_ID_KAFKA_LOAD = env("CDC_SERVER_ID_KAFKA_LOAD", "5617")
 CDC_SERVER_ID_DORIS = env("CDC_SERVER_ID_DORIS", "5618")
 CDC_SERVER_ID_DORIS_LOAD = env("CDC_SERVER_ID_DORIS_LOAD", "5619")
 CDC_SERVER_ID_DORIS_SCALE = env("CDC_SERVER_ID_DORIS_SCALE", "5620")
+# Elasticsearch suites keep their own ids so a Doris and an Elasticsearch job can
+# run side by side without a duplicate server-id.
+CDC_SERVER_ID_ES = env("CDC_SERVER_ID_ES", "5621")
+CDC_SERVER_ID_ES_RESTART = env("CDC_SERVER_ID_ES_RESTART", "5622")
+CDC_SERVER_ID_ES_LOAD = env("CDC_SERVER_ID_ES_LOAD", "5623")
+CDC_SERVER_ID_ES_SCALE = env("CDC_SERVER_ID_ES_SCALE", "5624")
 
 KAFKA_BROKERS = env("KAFKA_BROKERS", "127.0.0.1:19092")
 KAFKA_DEFAULT_TOPIC = env("KAFKA_DEFAULT_TOPIC", "cdc_default")
@@ -70,6 +84,26 @@ DORIS_USER = env("DORIS_USER", "root")
 DORIS_PASSWORD = env("DORIS_PASSWORD", "")
 DORIS_REPLICATION_NUM = env("DORIS_REPLICATION_NUM", "1")
 DORIS_SNK_DB = env("DORIS_SNK_DB", "db_tp_doris_snk")
+
+# Elasticsearch 8 (compose service ``elasticsearch``; security disabled).
+ES_HOST_PORT = env("ES_HOST_PORT", "19200")
+ES_URL = env("ES_URL", f"http://127.0.0.1:{ES_HOST_PORT}")
+ES_USERNAME = env("ES_USERNAME", "")
+ES_PASSWORD = env("ES_PASSWORD", "")
+# Index cleanup pattern: derived indices are ``<snk_db>.<table>[-hash]``, so the
+# suite namespace doubles as the isolation prefix.
+ES_INDEX_PREFIX = env("ES_INDEX_PREFIX", ES_SNK_DB)
+ES_LOAD_INDEX_PREFIX = env("ES_LOAD_INDEX_PREFIX", ES_LOAD_SNK_DB)
+ES_REQUEST_TIMEOUT = float(env("ES_REQUEST_TIMEOUT", "30"))
+# Scale suite: every final table lives under ``db_tp_scale_snk_<nn>``, which is
+# both the index-name namespace and the cleanup prefix.
+ES_SCALE_INDEX_PREFIX = env("ES_SCALE_INDEX_PREFIX", "db_tp_scale_snk_*")
+
+# Elasticsearch load suite: CDC bulk size / interval sweep (one bulk per Write).
+ES_LOAD_BATCH_SIZE = env("ES_LOAD_BATCH_SIZE", "1000")
+ES_LOAD_BATCH_INTERVAL = env("ES_LOAD_BATCH_INTERVAL", "500ms")
+ES_LOAD_SMALL_BATCH = env("ES_LOAD_SMALL_BATCH", "100")
+ES_LOAD_SMALL_INTERVAL = env("ES_LOAD_SMALL_INTERVAL", "100ms")
 
 
 def it_rel_path(path: str | Path) -> str:
@@ -113,6 +147,13 @@ CHECKPOINT_DORIS_LOAD_DIR = _abs_under_it(
 CHECKPOINT_DORIS_SCALE_DIR = _abs_under_it(
     env("CHECKPOINT_DORIS_SCALE_DIR", str(WORKDIR / "ckpts-doris-scale"))
 )
+CHECKPOINT_ES_DIR = _abs_under_it(env("CHECKPOINT_ES_DIR", str(WORKDIR / "ckpts-es")))
+CHECKPOINT_ES_RESTART_DIR = _abs_under_it(
+    env("CHECKPOINT_ES_RESTART_DIR", str(WORKDIR / "ckpts-es-restart"))
+)
+CHECKPOINT_ES_LOAD_DIR = _abs_under_it(
+    env("CHECKPOINT_ES_LOAD_DIR", str(WORKDIR / "ckpts-es-load"))
+)
 
 PIPELINE_NAME = "tp_func_pipeline"
 PIPELINE_STDOUT_NAME = "tp_func_stdout"
@@ -122,6 +163,9 @@ PIPELINE_KAFKA_NAME = "tp_kafka_pipeline"
 PIPELINE_KAFKA_LOAD_NAME = "tp_kafka_load_pipeline"
 PIPELINE_DORIS_NAME = "tp_doris_pipeline"
 PIPELINE_DORIS_LOAD_NAME = "tp_doris_load_pipeline"
+PIPELINE_ES_NAME = "tp_es_pipeline"
+PIPELINE_ES_RESTART_NAME = "tp_es_restart"
+PIPELINE_ES_LOAD_NAME = "tp_es_load_pipeline"
 
 ASSERT_TIME_ZONE = env("ASSERT_TIME_ZONE", "+08:00")
 
@@ -209,6 +253,9 @@ CHECKPOINT_DORIS_PATH = checkpoint_file(CHECKPOINT_DORIS_DIR, PIPELINE_DORIS_NAM
 CHECKPOINT_DORIS_LOAD_PATH = checkpoint_file(
     CHECKPOINT_DORIS_LOAD_DIR, PIPELINE_DORIS_LOAD_NAME
 )
+CHECKPOINT_ES_PATH = checkpoint_file(CHECKPOINT_ES_DIR, PIPELINE_ES_NAME)
+CHECKPOINT_ES_RESTART_PATH = checkpoint_file(CHECKPOINT_ES_RESTART_DIR, PIPELINE_ES_RESTART_NAME)
+CHECKPOINT_ES_LOAD_PATH = checkpoint_file(CHECKPOINT_ES_LOAD_DIR, PIPELINE_ES_LOAD_NAME)
 
 
 def render_template(tpl_name: str, out_path: Path, extra: dict | None = None) -> Path:
@@ -237,6 +284,26 @@ def render_template(tpl_name: str, out_path: Path, extra: dict | None = None) ->
         "CDC_SERVER_ID_KAFKA_LOAD": CDC_SERVER_ID_KAFKA_LOAD,
         "CDC_SERVER_ID_DORIS": CDC_SERVER_ID_DORIS,
         "CDC_SERVER_ID_DORIS_LOAD": CDC_SERVER_ID_DORIS_LOAD,
+        "CDC_SERVER_ID_ES": CDC_SERVER_ID_ES,
+        "CDC_SERVER_ID_ES_RESTART": CDC_SERVER_ID_ES_RESTART,
+        "CDC_SERVER_ID_ES_LOAD": CDC_SERVER_ID_ES_LOAD,
+        "ES_URL": ES_URL,
+        "ES_SRC_DB": ES_SRC_DB,
+        "ES_SNK_DB": ES_SNK_DB,
+        "ES_LOAD_SNK_DB": ES_LOAD_SNK_DB,
+        "ES_INDEX_PREFIX": ES_INDEX_PREFIX,
+        "ES_LOAD_INDEX_PREFIX": ES_LOAD_INDEX_PREFIX,
+        "ES_SCALE_INDEX_PREFIX": ES_SCALE_INDEX_PREFIX,
+        "ES_LOAD_BATCH_SIZE": ES_LOAD_BATCH_SIZE,
+        "ES_LOAD_BATCH_INTERVAL": ES_LOAD_BATCH_INTERVAL,
+        "ES_LOAD_SMALL_BATCH": ES_LOAD_SMALL_BATCH,
+        "ES_LOAD_SMALL_INTERVAL": ES_LOAD_SMALL_INTERVAL,
+        "CHECKPOINT_ES_DIR": it_rel_path(CHECKPOINT_ES_DIR),
+        "CHECKPOINT_ES_RESTART_DIR": it_rel_path(CHECKPOINT_ES_RESTART_DIR),
+        "CHECKPOINT_ES_LOAD_DIR": it_rel_path(CHECKPOINT_ES_LOAD_DIR),
+        "PIPELINE_ES_NAME": PIPELINE_ES_NAME,
+        "PIPELINE_ES_RESTART_NAME": PIPELINE_ES_RESTART_NAME,
+        "PIPELINE_ES_LOAD_NAME": PIPELINE_ES_LOAD_NAME,
         "CHECKPOINT_DIR": it_rel_path(CHECKPOINT_DIR),
         "CHECKPOINT_STDOUT_DIR": it_rel_path(CHECKPOINT_STDOUT_DIR),
         "CHECKPOINT_TYPES_DIR": it_rel_path(CHECKPOINT_TYPES_DIR),
