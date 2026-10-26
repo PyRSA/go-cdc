@@ -1,0 +1,54 @@
+# Quick start: MySQL → Elasticsearch 8
+# Edit hostname / hosts / tables, then:
+#   ./bin/go-cdc configs/demo-elasticsearch.yaml
+#
+# The index for a routed table is derived from database.table unless
+# sink.index-name is set. auto-create defaults to false, so the index (or the
+# matching mapping-file) must exist before the first run.
+
+source:
+  type: mysql
+  hostname: 127.0.0.1
+  port: 3306
+  username: root
+  password: secret
+  tables: demo_db\..*
+  server-id: 5404
+  server-time-zone: Asia/Shanghai
+  scan.startup.mode: initial
+
+sink:
+  type: elasticsearch
+  hosts:
+    - http://127.0.0.1:9200
+  # Optional Basic auth. Username and password must be set together.
+  # username: elastic
+  # password: secret
+  auto-create: true
+  request-timeout: 30s
+  write-batch-size: 1000
+  write-batch-interval: 1s
+  max-retries: 3
+  # Optional: cap one bulk request at this many encoded NDJSON bytes (default
+  # 5 MiB; 0 keeps the default). A single row larger than the limit fails the
+  # write instead of being sent, so raise it for multi-MiB rows.
+  # bulk-max-bytes: 5242880
+  # Optional: force one index for every routed table (multi-table compatible
+  # only when all tables share the same mapping).
+  # index-name: cdc_demo
+  # Optional: JSON file with "settings" / "mappings" for Create Index. Fields
+  # it defines win; missing fields are derived from the MySQL schema.
+  # mapping-file: ./configs/elasticsearch-mapping.json
+
+# Optional: send users to index "es.users" instead of "demo_db.users"
+# route:
+#   - source-table: demo_db\.users
+#     sink-table: es.users
+
+pipeline:
+  name: demo-elasticsearch
+
+checkpoint:
+  storage: file
+  interval: 10s
+  file-path: ./checkpoints

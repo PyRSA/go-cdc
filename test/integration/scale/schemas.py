@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -40,6 +41,36 @@ def checksum_sql(template: str, db: str, table: str) -> str:
         f"SELECT COUNT(*) AS cnt, COALESCE(SUM(`id`), 0) AS sum_id, "
         f"{name_crc} AS name_crc FROM `{db}`.`{table}`"
     )
+
+
+def checksum_column(template: str) -> str:
+    """String column used for the CRC32 half of the checksum triple."""
+    if template not in TEMPLATES:
+        raise ValueError(f"unknown template: {template!r}")
+    return _CHECKSUM_CRC_COLUMN[template]
+
+
+_COLUMN_LINE = re.compile(r"^\s*`(?P<name>[^`]+)`\s+(?P<type>[A-Za-z]+(?:\([^)]*\))?)")
+
+
+def table_columns(template: str) -> dict[str, str]:
+    """Ordered {column: MySQL COLUMN_TYPE} parsed from the template DDL.
+
+    The DDL above stays the single source of truth; the Elasticsearch suites
+    need the column types to derive expectations (mapping and canonical
+    values), so they are parsed instead of duplicated.
+    """
+    if template not in TEMPLATES:
+        raise ValueError(f"unknown template: {template!r}")
+    out: dict[str, str] = {}
+    for line in _DDL[template].splitlines():
+        match = _COLUMN_LINE.match(line)
+        if not match:
+            continue
+        out[match.group("name")] = re.sub(r"\s+", "", match.group("type")).lower()
+    if not out:
+        raise ValueError(f"template {template!r} declares no columns")
+    return out
 
 
 def insert_batch(

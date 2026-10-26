@@ -1,5 +1,5 @@
 // Command go-cdc runs one YAML pipeline.
-// sink.type selects stdout, mysql, kafka, or doris. Elasticsearch is rejected at startup.
+// sink.type selects stdout, mysql, kafka, doris, or elasticsearch.
 package main
 
 import (
@@ -17,6 +17,7 @@ import (
 	"github.com/PyRSA/go-cdc/composer/definition"
 	"github.com/PyRSA/go-cdc/connector/sink"
 	dorissink "github.com/PyRSA/go-cdc/connector/sink/doris"
+	esSink "github.com/PyRSA/go-cdc/connector/sink/elasticsearch"
 	kafkasink "github.com/PyRSA/go-cdc/connector/sink/kafka"
 	mysqlsink "github.com/PyRSA/go-cdc/connector/sink/mysql"
 	"github.com/PyRSA/go-cdc/connector/sink/stdout"
@@ -29,7 +30,7 @@ func main() {
 	os.Exit(run(os.Args[1:]))
 }
 
-func run(args []string) int {
+func run(args []string) (code int) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
@@ -37,7 +38,7 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: go-cdc <pipeline.yaml>")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Run one YAML pipeline (source → transform/route → sink).")
-		fmt.Fprintln(os.Stderr, "Supported sinks in this release: stdout, mysql, kafka, doris.")
+		fmt.Fprintln(os.Stderr, "Supported sinks in this release: stdout, mysql, kafka, doris, elasticsearch.")
 		return 0
 	}
 	if len(args) != 1 {
@@ -62,34 +63,66 @@ func run(args []string) int {
 		logger.Error("load checkpoint", "err", err)
 		return 1
 	}
-	sk, err := openSink(pipe)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	sk, err := openSink(ctx, pipe)
 	if err != nil {
 		logger.Error("open sink", "err", err)
 		return 1
 	}
-	defer sk.Close()
+	// A close failure is never swallowed: the process still exits non-zero when
+	// nothing else failed, so a broken sink is visible to the supervisor.
+	defer func() {
+		if err := sk.Close(); err != nil {
+			logger.Error("close sink", "err", err)
+			if code == 0 {
+				code = 1
+			}
+		}
+	}()
 
 	db, err := mysqlsrc.OpenDB(pipe.Source)
 	if err != nil {
 		logger.Error("open source", "err", err)
 		return 1
 	}
+	defer func() {
+		if err := db.Close(); err != nil {
+			logger.Error("close source", "err", err)
+		}
+	}()
 	db.SetWarn(func(msg string, args ...any) {
 		logger.Warn(msg, args...)
 	})
 	pipe.Source.ServerID = db.ServerID()
 	stream, err := mysqlsrc.OpenStream(pipe.Source, db)
 	if err != nil {
-		_ = db.Close()
 		logger.Error("open binlog stream", "err", err)
 		return 1
 	}
+	defer func() {
+		if err := stream.Close(); err != nil {
+			logger.Error("close binlog stream", "err", err)
+		}
+	}()
 	rules, err := transform.Compile(pipe.Transforms)
 	if err != nil {
-		_ = db.Close()
-		_ = stream.Close()
 		logger.Error("compile transform", "err", err)
 		return 1
+	}
+	// Only a CatalogSink needs its target tables before the first event, which
+	// covers restarts and binlog-only starts where the source emits no Schema.
+	// Other sinks keep their existing startup cost.
+	if _, ok := sk.(composer.CatalogSink); ok {
+		tables, err := db.ListTables(ctx)
+		if err != nil {
+			logger.Error("list source tables", "err", err)
+			return 1
+		}
+		if err := composer.PrepareCatalog(pipe, sk, tables, state); err != nil {
+			logger.Error("prepare sink catalog", "err", err)
+			return 1
+		}
 	}
 	spillDir := filepath.Join(filepath.Dir(pipe.Checkpoint.FilePath), "spill")
 	if err := os.MkdirAll(spillDir, 0o755); err != nil {
@@ -114,7 +147,8 @@ func run(args []string) int {
 		Stream:      stream,
 		Spill:       spill,
 		// Only Doris revalidates the target from a fresh source catalogue on
-		// resume. MySQL / Kafka / stdout must not see an extra Schema batch.
+		// resume. MySQL / Kafka / stdout / Elasticsearch must not see an extra
+		// Schema batch.
 		ReemitCapturedSchemas: strings.EqualFold(pipe.Sink.Type, "doris"),
 		Warn: func(msg string, args ...any) {
 			logger.Warn(msg, args...)
@@ -129,27 +163,29 @@ func run(args []string) int {
 			return columns, nil
 		},
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	msgs, err := capture.Messages(ctx)
 	if err != nil {
 		logger.Error("start capture", "err", err)
 		return 1
 	}
-	if err := composer.Run(ctx, pipe, msgs, sk, store, state, spill); err != nil && !errors.Is(err, context.Canceled) {
-		logger.Error("pipeline failed", "err", err)
+	runErr := composer.Run(ctx, pipe, msgs, sk, store, state, spill)
+	// Cancel before the deferred closes so the source goroutines stop touching the
+	// connection and the binlog stream first.
+	stop()
+	if runErr != nil && !errors.Is(runErr, context.Canceled) {
+		logger.Error("pipeline failed", "err", runErr)
 		return 1
 	}
 	logger.Info("pipeline stopped", "name", pipe.Runtime.Name)
 	return 0
 }
 
-func openSink(pipe *definition.Pipeline) (sink.Sink, error) {
+func openSink(ctx context.Context, pipe *definition.Pipeline) (sink.Sink, error) {
 	switch pipe.Sink.Type {
 	case "stdout":
 		sk := stdout.New(os.Stdout)
 		sk.SetSourceName(pipe.Runtime.Name)
-		if err := sk.Open(context.Background()); err != nil {
+		if err := sk.Open(ctx); err != nil {
 			return nil, err
 		}
 		return sk, nil
@@ -158,7 +194,7 @@ func openSink(pipe *definition.Pipeline) (sink.Sink, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := sk.Open(context.Background()); err != nil {
+		if err := sk.Open(ctx); err != nil {
 			return nil, err
 		}
 		return sk, nil
@@ -167,7 +203,7 @@ func openSink(pipe *definition.Pipeline) (sink.Sink, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := sk.Open(context.Background()); err != nil {
+		if err := sk.Open(ctx); err != nil {
 			return nil, err
 		}
 		return sk, nil
@@ -176,7 +212,22 @@ func openSink(pipe *definition.Pipeline) (sink.Sink, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := sk.Open(context.Background()); err != nil {
+		if err := sk.Open(ctx); err != nil {
+			return nil, err
+		}
+		return sk, nil
+	case "elasticsearch":
+		sk, err := esSink.New(pipe.Sink)
+		if err != nil {
+			return nil, err
+		}
+		// The source emits TIMESTAMP as the wall clock of source.server-time-zone;
+		// the sink needs that zone to store the same instant in UTC.
+		if err := sk.SetServerTimeZone(pipe.Source.TimeZone); err != nil {
+			return nil, err
+		}
+		if err := sk.Open(ctx); err != nil {
+			// Open already released the client it created on failure.
 			return nil, err
 		}
 		return sk, nil

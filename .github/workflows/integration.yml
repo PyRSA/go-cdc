@@ -118,6 +118,11 @@ jobs:
           python3 -m pip install -r harness/requirements.txt
           python3 -m pytest -q scale/
 
+      # Offline checks of the ES verification helpers (no Docker, no cluster).
+      - name: ES harness unit tests
+        working-directory: test/integration
+        run: python3 -m unittest harness.test_es_verify
+
       - name: Build go-cdc binary
         run: make build
 
@@ -273,6 +278,117 @@ jobs:
           MYSQL_TAG: ${{ matrix.tag }}
           COMPOSE_PROJECT_NAME: gocdc-it-${{ matrix.tag }}
         run: bash scripts/mysql-down.sh
+
+  # Elasticsearch 8 sink: all four layers on MySQL 8.0 + a throwaway single-node
+  # ES8 (security off, 512m heap). Scale runs `normal`; `heavy` is opt-in locally
+  # because it needs 10 source DBs, 50k rows/hotspot and a 45s 8-writer peak.
+  elasticsearch-e2e:
+    name: Elasticsearch 8 (integration + e2e + load + scale normal)
+    # No job-level if: cascade-skips when go-check is skipped.
+    needs: go-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: write
+    env:
+      COMPOSE_PROJECT_NAME: gocdc-es-80
+      MYSQL_IMAGE: mysql:8.0.36
+      MYSQL_TAG: "80"
+      ES_IMAGE: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+      ES_HEAP: 512m
+      ES_HOST_PORT: "19200"
+      LOAD_PROFILE: normal
+      LOAD_ROWS_PER_TABLE: "30000"
+      LOAD_PEAK_SECONDS: "60"
+      LOAD_PEAK_WORKERS: "4"
+
+    defaults:
+      run:
+        working-directory: test/integration
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install client tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y mysql-client
+          python3 -m pip install -r harness/requirements.txt
+
+      - name: Start MySQL 8.0 + Elasticsearch 8 (docker compose)
+        run: |
+          bash scripts/mysql-up.sh
+          bash scripts/es-up.sh
+
+      # Layer 1: Go sink/runner against the real cluster (build tag esintegration).
+      - name: Elasticsearch integration (real cluster)
+        run: bash scripts/run-es-integration.sh
+
+      # Layer 2: MySQL binlog -> runner -> ES8, including checkpoint restart.
+      - name: Elasticsearch e2e harness
+        run: bash scripts/run-es-e2e.sh
+
+      # Layer 3: sustained load + peak writers (LOAD_* above).
+      - name: Elasticsearch load harness
+        run: bash scripts/run-es-load.sh
+
+      # Layer 4: scale `normal` (CI-sized). `heavy` is a local/opt-in stress run.
+      - name: Elasticsearch scale harness (normal)
+        run: bash scripts/run-es-scale.sh normal
+
+      - name: Prune prior ES report artifact
+        if: >
+          always() &&
+          github.event_name != 'pull_request' &&
+          (github.ref == 'refs/heads/main' ||
+           github.ref == 'refs/heads/master' ||
+           startsWith(github.ref, 'refs/heads/release-'))
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_NAME: go-cdc-it-report-elasticsearch
+        run: |
+          set -euo pipefail
+          ids="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/artifacts" \
+            --jq '.artifacts[] | select(.name == env.ARTIFACT_NAME and .expired == false) | .id')"
+          for id in ${ids}; do
+            echo "Deleting prior artifact id=${id} name=${ARTIFACT_NAME}"
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}"
+          done
+
+      - name: Upload ES test reports
+        if: >
+          always() &&
+          github.event_name != 'pull_request' &&
+          (github.ref == 'refs/heads/main' ||
+           github.ref == 'refs/heads/master' ||
+           startsWith(github.ref, 'refs/heads/release-'))
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-cdc-it-report-elasticsearch
+          path: |
+            docs/test/reports/mysql-elasticsearch*.md
+            test/integration/workdir/ckpts-es*/**/*.ckpt
+            test/integration/workdir/*.log
+          if-no-files-found: warn
+
+      - name: Tear down
+        if: always()
+        run: |
+          bash scripts/es-down.sh
+          bash scripts/mysql-down.sh
 
   mysql-scale-e2e:
     name: MySQL ${{ matrix.mysql }} scale

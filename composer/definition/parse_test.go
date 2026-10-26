@@ -618,6 +618,32 @@ pipeline:
 	}
 }
 
+func TestParseMySQLSinkAcceptsAutoCreateTable(t *testing.T) {
+	// auto-create-table is a MySQL option the Doris sink reused, so the shared
+	// key must stay accepted for both types.
+	pipe, err := Parse([]byte(`
+source:
+  hostname: 127.0.0.1
+  username: root
+  password: secret
+  tables: db\..*
+sink:
+  type: mysql
+  hostname: 127.0.0.1
+  username: root
+  password: secret
+  auto-create-table: false
+pipeline:
+  name: demo
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pipe.Sink.AutoCreate {
+		t.Fatal("sink.auto-create-table: false was ignored for mysql")
+	}
+}
+
 func TestParseNonDorisRejectsDorisOnlyKeys(t *testing.T) {
 	// Doris-only options must fail for other sink types instead of being
 	// silently ignored (see AGENTS.md: accepted keys need a real meaning).

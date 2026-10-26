@@ -188,18 +188,19 @@ func applyCatalog(pipe *definition.Pipeline, rules *transform.Set, routes *route
 		}
 		return nil
 	}
+	// A CatalogSink prepares its own structures and must fail the job when it
+	// cannot: an unprepared sink would only fail later, after Checkpoint moved.
+	if catalog, ok := sk.(CatalogSink); ok {
+		targets := catalogTargets(rules, routes, table)
+		if err := checkCatalogTargets(targets); err != nil {
+			return fmt.Errorf("%s.%s: %w", table.Database, table.Table, err)
+		}
+		return catalog.PrepareCatalog(targets)
+	}
 	if pipe.Sink.Type != "mysql" || !pipe.Sink.AutoCreate {
 		return nil
 	}
-	projected := rules.ProjectTable(table)
-	routed := routes.Apply(event.Event{
-		Database: table.Database, Table: table.Table,
-		SourceDatabase: table.Database, SourceTable: table.Table,
-	})
-	for _, dst := range routed {
-		sinkTable := projected
-		sinkTable.Database = dst.Database
-		sinkTable.Table = dst.Table
+	for _, sinkTable := range catalogTargets(rules, routes, table) {
 		// Create is best-effort: failure must not exclude the table or stop the job.
 		// A later Write against a missing table fails the job.
 		_ = sk.CreateTable(sinkTable)
@@ -245,9 +246,11 @@ func applyDDL(pipe *definition.Pipeline, rules *transform.Set, routes *route.Set
 				state.AddCaptured(dst.SourceID())
 				continue
 			}
-			if len(dst.Columns) == 0 {
-				// Schema message path already AddCaptured above; empty CREATE without
-				// a prior catalog apply must not pretend the sink table exists.
+			// Only the MySQL sink can create a table from the event's column names.
+			// Every other sink prepares tables through the catalog path above, so a
+			// CREATE without catalog metadata must not invent a sink table; the
+			// following Write then fails instead of silently dropping rows.
+			if pipe.Sink.Type != "mysql" || len(dst.Columns) == 0 {
 				continue
 			}
 			table := schema.Table{Database: dst.Database, Table: dst.Table, Columns: columnsOf(dst), PrimaryKeys: dst.Keys}

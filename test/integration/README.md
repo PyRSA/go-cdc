@@ -133,6 +133,7 @@ Jobs:
 | `mysql-mysql-e2e` | MySQL **5.7** + **8.0** | functional + types + load; **8.0 also runs Kafka sink** TP-K01..K08 |
 | `mysql-scale-e2e` | MySQL **8.0 only** | scale `normal` or `heavy` (separate compose project / host port `13307`) |
 | `doris-e2e` | MySQL **8.0** + Doris **2.1.8** | MySQL→Doris pipeline TP-DR01..DR07 (functional + load) + sink Go suite + Doris scale ([`doris-integration.yml`](../../.github/workflows/doris-integration.yml)) |
+| `elasticsearch-e2e` | MySQL **8.0** + compose ES8 | ES sink: Go IT (`esintegration`), E2E, load, scale `normal` |
 
 **Load tier** (`LOAD_ROWS_PER_TABLE`):
 
@@ -240,3 +241,52 @@ The separate [`doris-integration.yml`](../../.github/workflows/doris-integration
 workflow starts MySQL + Doris `2.1.8` FE+BE, raises kernel limits, runs the suite
 (functional TP-DR01..DR04, then load TP-DR05..DR07, then the Doris scale profile),
 and uploads the Markdown reports plus `cdc-doris*.log` and compose logs.
+## Elasticsearch 8 sink suites
+
+The ES8 sink has the same four layers as the MySQL sink. They share the MySQL
+compose service, the source generators (`harness/load_it.py`,
+`scale/scale_it.py`) and the knob names; only the target side is new
+(`harness/es_client.py` for HTTP, `harness/es_verify.py` for the oracle).
+
+```bash
+bash test/integration/scripts/mysql-up.sh
+bash test/integration/scripts/es-up.sh          # compose service `elasticsearch` (8.15.3)
+
+bash test/integration/scripts/run-es-integration.sh   # Go sink/runner IT, tag `esintegration`
+bash test/integration/scripts/run-es-e2e.sh           # MySQL binlog -> runner -> ES8
+bash test/integration/scripts/run-es-load.sh          # 50k rows/table + peak writers
+bash test/integration/scripts/run-es-scale.sh normal  # 5 DBs / 20 tables
+bash test/integration/scripts/run-es-scale.sh heavy   # 10 DBs / 50 tables + hotspot burst/peak
+```
+
+Equivalent Make targets: `make integration-es-up`,
+`integration-es-integration`, `integration-es-e2e`, `integration-es-load`,
+`integration-es-scale-normal`, `integration-es-scale-heavy`
+(`test/integration/Makefile` has the shorter `make es-*` forms).
+
+| Layer | Harness | Report |
+| --- | --- | --- |
+| Integration | `go test -tags esintegration ./connector/sink/elasticsearch/` (real ES8) | `go test` output |
+| E2E | `harness/es_it.py` (TP-E01..) | `docs/test/reports/mysql-elasticsearch.md` |
+| Load | `harness/es_load_it.py` (TP-EL01..EL05) | `docs/test/reports/mysql-elasticsearch-load.md` |
+| Scale | `scale/es_scale_it.py` (normal / heavy) | `docs/test/reports/mysql-elasticsearch-scale-{profile}.md` |
+
+Isolation and knobs:
+
+- Every suite owns an index namespace, used both for naming and cleanup:
+  `ES_INDEX_PREFIX` (default `db_tp_es_snk`), `ES_LOAD_INDEX_PREFIX` (default
+  `db_tp_es_load_snk`), `ES_SCALE_INDEX_PREFIX` (default `db_tp_scale_snk_*`).
+  `action.destructive_requires_name` is on, and cleanup deletes index by index.
+- `ES_URL` (default `http://127.0.0.1:19200`), `ES_USERNAME` / `ES_PASSWORD`
+  (empty for the throwaway node), `ES_REQUEST_TIMEOUT` (seconds).
+- Load batch sweep: `ES_LOAD_BATCH_SIZE` / `ES_LOAD_BATCH_INTERVAL` (default
+  `1000` / `500ms`) for TP-EL02 and `ES_LOAD_SMALL_BATCH` /
+  `ES_LOAD_SMALL_INTERVAL` (default `100` / `100ms`) for the TP-EL03 restart.
+  `LOAD_*` knobs are shared with the MySQL load suite.
+- Scale reuses `SCALE_TOTAL_ROWS` / `SCALE_WORKERS` / `SCALE_TOTAL_TIMEOUT`
+  (default `1800`) and `ES_SCALE_RESTART_ROWS` (default `100`).
+- `tpl01_typed.c_bit` is dropped after seeding: sink v1 rejects `BIT` columns.
+- `write-batch-size` / `write-batch-interval` are runner-level knobs: one bulk
+  per `Sink.Write`, flushed on size, on interval, and on any split / position /
+  watermark / captured message (`composer/runner.go`). Snapshot chunks and binlog
+  events share that path, so both are exercised by the sweep.

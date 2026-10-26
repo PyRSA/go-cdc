@@ -3,6 +3,7 @@
 # Override image for version matrix, e.g.:
 #   MYSQL_IMAGE=mysql:5.7.42 MYSQL_TAG=57 bash scripts/mysql-up.sh
 # Kafka: bash scripts/kafka-up.sh (same COMPOSE_PROJECT_NAME as mysql-up).
+# Elasticsearch 8 (security off, single node): bash scripts/es-up.sh
 services:
   mysql:
     image: ${MYSQL_IMAGE:-mysql:8.0.36}
@@ -65,3 +66,34 @@ services:
       timeout: 10s
       retries: 30
       start_period: 20s
+
+  # Single-node ES8 for the Elasticsearch sink suites (host → 127.0.0.1:${ES_HOST_PORT}).
+  # Security is disabled on purpose: the harness talks plain HTTP to a throwaway node.
+  # Heap stays small so it fits next to MySQL in CI; the suites are correctness-first.
+  elasticsearch:
+    image: ${ES_IMAGE:-docker.elastic.co/elasticsearch/elasticsearch:8.15.3}
+    ports:
+      - "${ES_HOST_PORT:-19200}:9200"
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      xpack.security.http.ssl.enabled: "false"
+      xpack.security.transport.ssl.enabled: "false"
+      ES_JAVA_OPTS: "-Xms${ES_HEAP:-512m} -Xmx${ES_HEAP:-512m}"
+      # Bulk/scroll plus a small disk image: never trip the watermark checks.
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+      action.destructive_requires_name: "true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS 'http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+      start_period: 30s

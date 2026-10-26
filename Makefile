@@ -8,7 +8,10 @@ GOLANGCI_LINT_VERSION ?= v2.1.6
 	integration-kafka-up integration-kafka-test \
 	integration-doris-up integration-doris-test integration-doris-down \
 	integration-doris-scale-normal integration-doris-scale-heavy \
-	integration-scale-normal integration-scale-heavy
+	integration-scale-normal integration-scale-heavy \
+	integration-es-up integration-es-down integration-es-integration \
+	integration-es-e2e integration-es-load \
+	integration-es-scale-normal integration-es-scale-heavy
 
 build:
 	$(GO) build -o bin/go-cdc ./cmd/go-cdc
@@ -79,6 +82,31 @@ integration-scale-normal:
 
 integration-scale-heavy:
 	bash test/integration/scale/run-scale.sh heavy
+
+# Elasticsearch 8 sink suites. All of them need `integration-es-up` (compose ES8)
+# plus the MySQL service; reports land in docs/test/reports/.
+integration-es-up: integration-up
+	bash test/integration/scripts/es-up.sh
+
+integration-es-down:
+	bash test/integration/scripts/es-down.sh
+
+# Go-level sink/runner IT against a real cluster (build tag esintegration).
+integration-es-integration:
+	bash test/integration/scripts/run-es-integration.sh
+
+integration-es-e2e:
+	bash test/integration/scripts/run-es-e2e.sh
+
+integration-es-load:
+	bash test/integration/scripts/run-es-load.sh
+
+integration-es-scale-normal:
+	bash test/integration/scripts/run-es-scale.sh normal
+
+# Stress profile: 10 source DBs + 50k rows/hotspot + 45s peak. Explicit opt-in.
+integration-es-scale-heavy:
+	bash test/integration/scripts/run-es-scale.sh heavy
 
 clean:
 	$(GO) clean -i ./...
