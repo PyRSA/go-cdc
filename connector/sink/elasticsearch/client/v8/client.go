@@ -144,37 +144,18 @@ func (c *Client) GetMapping(ctx context.Context, index string) (map[string]any, 
 	return nil, fmt.Errorf("elasticsearch: indices.get_mapping: index %q has no mappings", index)
 }
 
-// Bulk sends one NDJSON request and parses every item result.
-func (c *Client) Bulk(ctx context.Context, ops []esclient.BulkOperation) (esclient.BulkResult, error) {
-	if len(ops) == 0 {
+// Bulk sends one pre-encoded NDJSON request and parses every item result.
+func (c *Client) Bulk(ctx context.Context, batch esclient.BulkBatch) (esclient.BulkResult, error) {
+	if len(batch.Ops) == 0 {
 		return esclient.BulkResult{}, nil
 	}
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	for _, op := range ops {
-		header := map[string]map[string]string{
-			string(op.Action): {"_index": op.Index, "_id": op.ID},
-		}
-		if err := enc.Encode(header); err != nil {
-			return esclient.BulkResult{}, fmt.Errorf("elasticsearch: bulk: encode header: %w", err)
-		}
-		switch op.Action {
-		case esclient.ActionIndex:
-			if len(op.Document) == 0 {
-				return esclient.BulkResult{}, fmt.Errorf("elasticsearch: bulk: index %q id %q has an empty document", op.Index, op.ID)
-			}
-			buf.Write(op.Document)
-			buf.WriteByte('\n')
-		case esclient.ActionDelete:
-		default:
-			return esclient.BulkResult{}, fmt.Errorf("elasticsearch: bulk: unsupported action %q", op.Action)
-		}
+	if len(batch.Body) == 0 {
+		return esclient.BulkResult{}, fmt.Errorf(
+			"elasticsearch: bulk: empty request body for %d operation(s)", len(batch.Ops))
 	}
-
 	ctx, cancel := c.requestContext(ctx)
 	defer cancel()
-	res, err := c.api.Bulk(&buf, c.api.Bulk.WithContext(ctx))
+	res, err := c.api.Bulk(bytes.NewReader(batch.Body), c.api.Bulk.WithContext(ctx))
 	if err != nil {
 		return esclient.BulkResult{}, &esclient.Error{Op: "bulk", Err: err}
 	}
@@ -187,7 +168,7 @@ func (c *Client) Bulk(ctx context.Context, ops []esclient.BulkOperation) (esclie
 	if err != nil {
 		return esclient.BulkResult{}, fmt.Errorf("elasticsearch: bulk: read body: %w", err)
 	}
-	return parseBulkResponse(ops, body)
+	return parseBulkResponse(batch.Ops, body)
 }
 
 func parseBulkResponse(ops []esclient.BulkOperation, body []byte) (esclient.BulkResult, error) {

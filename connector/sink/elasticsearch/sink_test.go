@@ -113,6 +113,9 @@ func TestNewValidatesConfig(t *testing.T) {
 		{name: "wrong type", cfg: definition.Sink{Type: "mysql", Hosts: []string{"http://h:9200"}}},
 		{name: "no hosts", cfg: definition.Sink{Type: "elasticsearch"}},
 		{name: "negative retries", cfg: definition.Sink{Type: "elasticsearch", Hosts: []string{"http://h:9200"}, MaxRetries: -1}},
+		{name: "negative bulk-max-bytes", cfg: definition.Sink{Type: "elasticsearch", Hosts: []string{"http://h:9200"}, BulkMaxBytes: -1}},
+		{name: "bulk-max-bytes below the parser minimum", cfg: definition.Sink{Type: "elasticsearch", Hosts: []string{"http://h:9200"}, BulkMaxBytes: definition.MinBulkMaxBytes - 1}},
+		{name: "bulk-max-bytes above the parser maximum", cfg: definition.Sink{Type: "elasticsearch", Hosts: []string{"http://h:9200"}, BulkMaxBytes: definition.MaxBulkMaxBytes + 1}},
 	}
 	for _, tc := range cases {
 		if _, err := New(tc.cfg); err == nil {
@@ -126,6 +129,45 @@ func TestNewValidatesConfig(t *testing.T) {
 	}
 	if s.timeout != DefaultRequestTimeout {
 		t.Fatalf("timeout = %v, want %v", s.timeout, DefaultRequestTimeout)
+	}
+	// Zero keeps meaning "not configured": the default budget applies, and the
+	// accepted range matches the one the YAML parser enforces.
+	if s.bulkMaxBytes != DefaultBulkMaxBytes {
+		t.Fatalf("bulk-max-bytes = %d, want the default %d", s.bulkMaxBytes, DefaultBulkMaxBytes)
+	}
+	if DefaultBulkMaxBytes != definition.DefaultBulkMaxBytes {
+		t.Fatalf("default bulk budget %d disagrees with the parser's %d",
+			DefaultBulkMaxBytes, definition.DefaultBulkMaxBytes)
+	}
+	bounded, err := New(definition.Sink{
+		Type: "elasticsearch", Hosts: []string{"http://h:9200"},
+		BulkMaxBytes: definition.MaxBulkMaxBytes,
+	})
+	if err != nil {
+		t.Fatalf("New at the upper bound: %v", err)
+	}
+	if bounded.bulkMaxBytes != definition.MaxBulkMaxBytes {
+		t.Fatalf("bulk-max-bytes = %d, want %d", bounded.bulkMaxBytes, definition.MaxBulkMaxBytes)
+	}
+}
+
+// The programmatic path accepts zero as "use the default" and rejects the same
+// out-of-range values as the YAML parser, with the same reason.
+func TestNewBulkMaxBytesMatchesParserRange(t *testing.T) {
+	_, err := New(definition.Sink{
+		Type: "elasticsearch", Hosts: []string{"http://h:9200"},
+		BulkMaxBytes: definition.MinBulkMaxBytes - 1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "sink.bulk-max-bytes") ||
+		!strings.Contains(err.Error(), "0 (use the default") {
+		t.Fatalf("error = %v, want the reason the parser reports", err)
+	}
+	for _, n := range []int{0, definition.MinBulkMaxBytes, definition.MaxBulkMaxBytes} {
+		if _, err := New(definition.Sink{
+			Type: "elasticsearch", Hosts: []string{"http://h:9200"}, BulkMaxBytes: n,
+		}); err != nil {
+			t.Fatalf("bulk-max-bytes %d: %v", n, err)
+		}
 	}
 }
 
@@ -405,10 +447,10 @@ func TestWriteSendsIndexOperations(t *testing.T) {
 	if err := s.Write([]event.Event{typesEvent(event.OpCreate, 1)}); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	if len(fake.BulkCalls) != 1 || len(fake.BulkCalls[0]) != 1 {
+	if len(fake.BulkCalls) != 1 || len(fake.BulkCalls[0].Ops) != 1 {
 		t.Fatalf("bulk calls = %d", len(fake.BulkCalls))
 	}
-	op := fake.BulkCalls[0][0]
+	op := fake.BulkCalls[0].Ops[0]
 	if op.Action != client.ActionIndex || op.Index != "shop.types" || op.ID == "" {
 		t.Fatalf("op = %+v", op)
 	}
@@ -422,8 +464,8 @@ func TestWriteDeleteUsesTheSameId(t *testing.T) {
 	if err := s.Write([]event.Event{typesEvent(event.OpDelete, 7)}); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	indexID := fake.BulkCalls[0][0].ID
-	deleteOp := fake.BulkCalls[1][0]
+	indexID := fake.BulkCalls[0].Ops[0].ID
+	deleteOp := fake.BulkCalls[1].Ops[0]
 	if deleteOp.Action != client.ActionDelete {
 		t.Fatalf("action = %q, want delete", deleteOp.Action)
 	}
@@ -445,7 +487,8 @@ func TestWriteRejectsUnregisteredTable(t *testing.T) {
 
 func TestWriteItemFailureReturnsError(t *testing.T) {
 	s, fake := registeredSink(t, typesTable())
-	fake.BulkHook = func(ops []client.BulkOperation) (client.BulkResult, error) {
+	fake.BulkHook = func(batch client.BulkBatch) (client.BulkResult, error) {
+		ops := batch.Ops
 		items := okItems(ops)
 		items[0].Status = 400
 		items[0].ErrType = "document_parsing_exception"
@@ -467,7 +510,8 @@ func TestWriteItemFailureReturnsError(t *testing.T) {
 func TestWriteRetriesOnlyTransientItems(t *testing.T) {
 	s, fake := registeredSink(t, typesTable())
 	attempts := 0
-	fake.BulkHook = func(ops []client.BulkOperation) (client.BulkResult, error) {
+	fake.BulkHook = func(batch client.BulkBatch) (client.BulkResult, error) {
+		ops := batch.Ops
 		attempts++
 		items := okItems(ops)
 		if attempts == 1 {
@@ -483,15 +527,16 @@ func TestWriteRetriesOnlyTransientItems(t *testing.T) {
 	if len(fake.BulkCalls) != 2 {
 		t.Fatalf("bulk calls = %d, want 2", len(fake.BulkCalls))
 	}
-	if len(fake.BulkCalls[0]) != 2 || len(fake.BulkCalls[1]) != 1 {
+	if len(fake.BulkCalls[0].Ops) != 2 || len(fake.BulkCalls[1].Ops) != 1 {
 		t.Fatalf("retry sent %d items after %d, want only the failed item",
-			len(fake.BulkCalls[1]), len(fake.BulkCalls[0]))
+			len(fake.BulkCalls[1].Ops), len(fake.BulkCalls[0].Ops))
 	}
 }
 
 func TestWriteExhaustsRetries(t *testing.T) {
 	s, fake := registeredSink(t, typesTable())
-	fake.BulkHook = func(ops []client.BulkOperation) (client.BulkResult, error) {
+	fake.BulkHook = func(batch client.BulkBatch) (client.BulkResult, error) {
+		ops := batch.Ops
 		items := okItems(ops)
 		for i := range items {
 			items[i].Status = 503
@@ -511,7 +556,8 @@ func TestWriteExhaustsRetries(t *testing.T) {
 func TestWriteRetriesTransportError(t *testing.T) {
 	s, fake := registeredSink(t, typesTable())
 	calls := 0
-	fake.BulkHook = func(ops []client.BulkOperation) (client.BulkResult, error) {
+	fake.BulkHook = func(batch client.BulkBatch) (client.BulkResult, error) {
+		ops := batch.Ops
 		calls++
 		if calls == 1 {
 			return client.BulkResult{}, &client.Error{Op: "bulk", Err: errors.New("dial tcp: connection refused")}
@@ -529,7 +575,7 @@ func TestWriteRetriesTransportError(t *testing.T) {
 func TestWriteDoesNotRetryAuthFailure(t *testing.T) {
 	s, fake := registeredSink(t, typesTable())
 	calls := 0
-	fake.BulkHook = func(ops []client.BulkOperation) (client.BulkResult, error) {
+	fake.BulkHook = func(client.BulkBatch) (client.BulkResult, error) {
 		calls++
 		return client.BulkResult{}, &client.Error{Op: "bulk", Status: 401, Reason: "Unauthorized"}
 	}
@@ -544,7 +590,8 @@ func TestWriteDoesNotRetryAuthFailure(t *testing.T) {
 
 func TestWriteTreatsDeleteNotFoundAsSuccess(t *testing.T) {
 	s, fake := registeredSink(t, typesTable())
-	fake.BulkHook = func(ops []client.BulkOperation) (client.BulkResult, error) {
+	fake.BulkHook = func(batch client.BulkBatch) (client.BulkResult, error) {
+		ops := batch.Ops
 		return client.BulkResult{Items: []client.BulkItem{{
 			Action: "delete", Index: ops[0].Index, ID: ops[0].ID, Status: 404,
 		}}}, nil
@@ -556,7 +603,7 @@ func TestWriteTreatsDeleteNotFoundAsSuccess(t *testing.T) {
 
 func TestWriteRejectsItemCountMismatch(t *testing.T) {
 	s, fake := registeredSink(t, typesTable())
-	fake.BulkHook = func([]client.BulkOperation) (client.BulkResult, error) {
+	fake.BulkHook = func(client.BulkBatch) (client.BulkResult, error) {
 		return client.BulkResult{}, nil
 	}
 	err := s.Write([]event.Event{typesEvent(event.OpCreate, 1)})

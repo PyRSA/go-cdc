@@ -96,6 +96,7 @@ type Sink struct {
 	// RequestTimeout is shared by Doris and Elasticsearch: request-timeout; the
 	// HTTP timeout for Stream Load and the Bulk API respectively.
 	RequestTimeout time.Duration
+	BulkMaxBytes   int // bulk-max-bytes; encoded NDJSON bytes per bulk request
 }
 
 // Route sends one source table pattern to a sink table.

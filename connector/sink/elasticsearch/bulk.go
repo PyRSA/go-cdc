@@ -61,16 +61,73 @@ func (e *bulkError) Error() string {
 	return b.String()
 }
 
-// bulk sends ops and returns an error unless every item was acknowledged.
-// Only 429, retryable 5xx, and transport failures are retried, and only the
-// failed items are resent; index and delete are idempotent because the _id is
-// derived from the primary key.
+// bulk sends ops in as many requests as the byte budget requires. Batches go out
+// in order and the first failure stops the call, so a rejected document leaves
+// the runner checkpoint untouched and the whole Write is replayed.
+//
+// Every request gets its own time budget (see bulkBudget); ctx only carries
+// cancellation, so splitting a Write never shortens the allowance of a request
+// and no request waits forever.
 func (s *Sink) bulk(ctx context.Context, ops []client.BulkOperation) error {
-	if len(ops) == 0 {
-		return nil
+	batches, err := s.planBulk(ops)
+	if err != nil {
+		return err
 	}
+	for i, batch := range batches {
+		batchCtx, cancel := context.WithTimeout(ctx, s.bulkBudget())
+		err := s.sendBatch(batchCtx, batch)
+		cancel()
+		if err != nil {
+			if len(batches) == 1 {
+				return err
+			}
+			return fmt.Errorf("elasticsearch: bulk: request %d/%d: %w", i+1, len(batches), err)
+		}
+	}
+	return nil
+}
+
+// planBulk encodes every operation once and groups the results so no request
+// body exceeds the byte budget. Splitting must be decided on the encoded bytes
+// (action line + document + newlines), because that is what the request carries.
+// The count cap stays the runner's write-batch-size: splitting never merges
+// requests, so it can only make a batch smaller. One operation over the budget
+// cannot be split and fails here, before anything is sent.
+func (s *Sink) planBulk(ops []client.BulkOperation) ([]client.BulkBatch, error) {
+	limit := s.bulkMaxBytes
+	batches := make([]client.BulkBatch, 0, 1)
+	var current client.BulkBatch
+	for _, op := range ops {
+		encoded, err := client.EncodeBulkOperation(op)
+		if err != nil {
+			return nil, err
+		}
+		if len(encoded) > limit {
+			return nil, fmt.Errorf(
+				"elasticsearch: bulk: %s %s/%s needs %d bytes, over the %d-byte sink.bulk-max-bytes limit; a document cannot be split",
+				op.Action, op.Index, op.ID, len(encoded), limit)
+		}
+		if len(current.Ops) > 0 && len(current.Body)+len(encoded) > limit {
+			batches = append(batches, current)
+			current = client.BulkBatch{}
+		}
+		current.Ops = append(current.Ops, op)
+		current.Body = append(current.Body, encoded...)
+	}
+	if len(current.Ops) > 0 {
+		batches = append(batches, current)
+	}
+	return batches, nil
+}
+
+// sendBatch sends one encoded batch and returns an error unless every item was
+// acknowledged. Only 429, retryable 5xx, and transport failures are retried, and
+// only the failed items are resent; index and delete are idempotent because the
+// _id is derived from the primary key. A permanent rejection such as HTTP 413 is
+// returned immediately: repeating the same oversized request cannot succeed.
+func (s *Sink) sendBatch(ctx context.Context, batch client.BulkBatch) error {
 	attempts := s.maxRetries + 1
-	pending := ops
+	pending := batch
 	var lastFailures []itemFailure
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -87,31 +144,39 @@ func (s *Sink) bulk(ctx context.Context, ops []client.BulkOperation) error {
 			if !retryableError(err) || attempt == attempts {
 				return fmt.Errorf(
 					"elasticsearch: bulk: %d item(s), attempt %d/%d: %w",
-					len(pending), attempt, attempts, err)
+					len(pending.Ops), attempt, attempts, err)
 			}
 			continue
 		}
-		if len(result.Items) != len(pending) {
+		if len(result.Items) != len(pending.Ops) {
 			return fmt.Errorf(
 				"elasticsearch: bulk: response has %d item(s) for %d operation(s)",
-				len(result.Items), len(pending))
+				len(result.Items), len(pending.Ops))
 		}
-		retryOps, retryFailures, permanent := classifyItems(pending, result.Items)
+		retryOps, retryFailures, permanent := classifyItems(pending.Ops, result.Items)
+		// Known gap, tracked as a separate data-correctness fix: when the same _id
+		// appears again later in this request and that later operation already
+		// succeeded, resending the failed operation makes the older value win.
+		// Requests are sent serially, so duplicates split across requests are safe.
 		if len(permanent) > 0 {
 			// A permanent rejection cannot be retried away, and the batch as a
 			// whole must fail so the runner keeps its checkpoint.
-			return &bulkError{total: len(ops), attempts: attempt, failures: permanent}
+			return &bulkError{total: len(batch.Ops), attempts: attempt, failures: permanent}
 		}
 		if len(retryOps) == 0 {
 			return nil
 		}
 		lastFailures = retryFailures
 		if attempt == attempts {
-			return &bulkError{total: len(ops), attempts: attempt, failures: retryFailures}
+			return &bulkError{total: len(batch.Ops), attempts: attempt, failures: retryFailures}
 		}
-		pending = retryOps
+		next, err := client.NewBulkBatch(retryOps)
+		if err != nil {
+			return err
+		}
+		pending = next
 	}
-	return &bulkError{total: len(ops), attempts: attempts, failures: lastFailures}
+	return &bulkError{total: len(batch.Ops), attempts: attempts, failures: lastFailures}
 }
 
 // classifyItems splits item results into retryable and permanent failures.
@@ -181,7 +246,7 @@ func retryDelay(attempt int) time.Duration {
 	return delay
 }
 
-// retryBudget is the total backoff a Write may spend across all retries.
+// retryBudget is the total backoff one request may spend across its retries.
 func retryBudget(attempts int) time.Duration {
 	var total time.Duration
 	for attempt := 1; attempt < attempts; attempt++ {

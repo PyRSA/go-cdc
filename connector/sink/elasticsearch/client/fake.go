@@ -22,8 +22,9 @@ type Fake struct {
 	Indices map[string]map[string]any
 	// Created lists every successful CreateIndex call in order.
 	Created []CreateIndexCall
-	// BulkCalls lists the operations of every Bulk call in order.
-	BulkCalls [][]BulkOperation
+	// BulkCalls lists every Bulk call in order, including the exact request body
+	// the sink built, so tests can assert the byte budget.
+	BulkCalls []BulkBatch
 
 	PingErr    error
 	CreateErr  error
@@ -34,7 +35,7 @@ type Fake struct {
 	// ExistsHook replaces the default existence lookup, for race or failure tests.
 	ExistsHook func(index string) (bool, error)
 	// BulkHook replaces the default all-success bulk behaviour.
-	BulkHook func(ops []BulkOperation) (BulkResult, error)
+	BulkHook func(batch BulkBatch) (BulkResult, error)
 	// PingCalls counts Ping invocations.
 	PingCalls int
 	Closed    bool
@@ -112,9 +113,9 @@ func (f *Fake) GetMapping(ctx context.Context, index string) (map[string]any, er
 }
 
 // Bulk implements Client. The default succeeds for every operation.
-func (f *Fake) Bulk(ctx context.Context, ops []BulkOperation) (BulkResult, error) {
+func (f *Fake) Bulk(ctx context.Context, batch BulkBatch) (BulkResult, error) {
 	f.Mu.Lock()
-	f.BulkCalls = append(f.BulkCalls, append([]BulkOperation(nil), ops...))
+	f.BulkCalls = append(f.BulkCalls, batch)
 	err := f.BulkErr
 	hook := f.BulkHook
 	f.Mu.Unlock()
@@ -122,10 +123,10 @@ func (f *Fake) Bulk(ctx context.Context, ops []BulkOperation) (BulkResult, error
 		return BulkResult{}, err
 	}
 	if hook != nil {
-		return hook(ops)
+		return hook(batch)
 	}
-	items := make([]BulkItem, 0, len(ops))
-	for _, op := range ops {
+	items := make([]BulkItem, 0, len(batch.Ops))
+	for _, op := range batch.Ops {
 		status := 201
 		if op.Action == ActionDelete {
 			status = 200

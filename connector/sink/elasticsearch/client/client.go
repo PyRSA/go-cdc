@@ -123,9 +123,9 @@ type Client interface {
 	CreateIndex(ctx context.Context, index string, body json.RawMessage) error
 	// GetMapping returns the mappings object of index.
 	GetMapping(ctx context.Context, index string) (map[string]any, error)
-	// Bulk sends operations in a single request and returns one item per
-	// operation. A nil error does not mean every item succeeded.
-	Bulk(ctx context.Context, ops []BulkOperation) (BulkResult, error)
+	// Bulk sends one pre-encoded batch and returns one item per operation. A
+	// nil error does not mean every item succeeded.
+	Bulk(ctx context.Context, batch BulkBatch) (BulkResult, error)
 	// Close releases the underlying transport.
 	Close() error
 }

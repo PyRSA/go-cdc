@@ -29,6 +29,10 @@ sink:
   write-batch-size: 1000
   write-batch-interval: 1s
   max-retries: 3
+  # Optional: cap one bulk request at this many encoded NDJSON bytes (default
+  # 5 MiB; 0 keeps the default). A single row larger than the limit fails the
+  # write instead of being sent, so raise it for multi-MiB rows.
+  # bulk-max-bytes: 5242880
   # Optional: force one index for every routed table (multi-table compatible
   # only when all tables share the same mapping).
   # index-name: cdc_demo

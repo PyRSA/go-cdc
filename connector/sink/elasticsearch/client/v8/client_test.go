@@ -191,9 +191,14 @@ func TestBulkParsesEveryItem(t *testing.T) {
 		{Action: esclient.ActionDelete, Index: "orders", ID: "2"},
 		{Action: esclient.ActionIndex, Index: "orders", ID: "3", Document: []byte(`{"id":3}`)},
 	}
-	result, err := client.Bulk(context.Background(), ops)
+	batch := mustBatch(t, ops)
+	result, err := client.Bulk(context.Background(), batch)
 	if err != nil {
 		t.Fatalf("bulk: %v", err)
+	}
+	// The body on the wire is exactly the bytes the sink measured.
+	if got != string(batch.Body) {
+		t.Fatalf("sent body differs from the encoded batch:\n%s", got)
 	}
 	if len(result.Items) != 3 {
 		t.Fatalf("items=%d", len(result.Items))
@@ -233,9 +238,9 @@ func TestBulkTopLevelFailure(t *testing.T) {
 		writeJSON(w, http.StatusTooManyRequests,
 			`{"error":{"type":"es_rejected_execution_exception","reason":"queue full"},"status":429}`)
 	})
-	_, err := client.Bulk(context.Background(), []esclient.BulkOperation{
+	_, err := client.Bulk(context.Background(), mustBatch(t, []esclient.BulkOperation{
 		{Action: esclient.ActionDelete, Index: "orders", ID: "1"},
-	})
+	}))
 	if esclient.StatusOf(err) != http.StatusTooManyRequests {
 		t.Fatalf("err=%v", err)
 	}
@@ -245,9 +250,9 @@ func TestBulkRejectsItemCountMismatch(t *testing.T) {
 	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, `{"took":1,"errors":false,"items":[]}`)
 	})
-	_, err := client.Bulk(context.Background(), []esclient.BulkOperation{
+	_, err := client.Bulk(context.Background(), mustBatch(t, []esclient.BulkOperation{
 		{Action: esclient.ActionDelete, Index: "orders", ID: "1"},
-	})
+	}))
 	if err == nil {
 		t.Fatal("want error for item count mismatch")
 	}
@@ -257,10 +262,22 @@ func TestBulkRejectsEmptyDocument(t *testing.T) {
 	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Error("no request expected")
 	})
-	_, err := client.Bulk(context.Background(), []esclient.BulkOperation{
+	_, err := esclient.NewBulkBatch([]esclient.BulkOperation{
 		{Action: esclient.ActionIndex, Index: "orders", ID: "1"},
 	})
-	if err == nil {
-		t.Fatal("want error for empty document")
+	if err == nil || !strings.Contains(err.Error(), "empty document") {
+		t.Fatalf("encode error = %v, want an empty-document failure", err)
 	}
+	if _, err := client.Bulk(context.Background(), esclient.BulkBatch{}); err != nil {
+		t.Fatalf("an empty batch must not reach the cluster: %v", err)
+	}
+}
+
+func mustBatch(t *testing.T, ops []esclient.BulkOperation) esclient.BulkBatch {
+	t.Helper()
+	batch, err := esclient.NewBulkBatch(ops)
+	if err != nil {
+		t.Fatalf("encode batch: %v", err)
+	}
+	return batch
 }

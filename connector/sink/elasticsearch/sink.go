@@ -27,11 +27,17 @@ import (
 // sink.request-timeout is not configured.
 const DefaultRequestTimeout = 30 * time.Second
 
+// DefaultBulkMaxBytes caps one bulk request body when sink.bulk-max-bytes is not
+// configured. Elasticsearch rejects bodies above its own http.max_content_length
+// (100mb by default) with HTTP 413, so the sink never builds one.
+const DefaultBulkMaxBytes = definition.DefaultBulkMaxBytes
+
 // Sink implements sink.Sink for Elasticsearch 8.
 type Sink struct {
-	cfg        definition.Sink
-	timeout    time.Duration
-	maxRetries int
+	cfg          definition.Sink
+	timeout      time.Duration
+	maxRetries   int
+	bulkMaxBytes int
 
 	mu     sync.Mutex
 	client client.Client
@@ -54,17 +60,32 @@ func New(cfg definition.Sink) (*Sink, error) {
 	if cfg.MaxRetries < 0 {
 		return nil, errors.New("elasticsearch: sink.max-retries must be >= 0")
 	}
+	// Zero means "not configured" and selects the default; any other value must
+	// stay inside the range the YAML parser accepts, and both paths report the
+	// same reason.
+	if err := definition.ValidateBulkMaxBytes(cfg.BulkMaxBytes); err != nil {
+		return nil, fmt.Errorf("elasticsearch: sink.bulk-max-bytes: %v", err)
+	}
 	timeout := cfg.RequestTimeout
 	if timeout <= 0 {
 		timeout = DefaultRequestTimeout
 	}
 	return &Sink{
-		cfg:        cfg,
-		timeout:    timeout,
-		maxRetries: cfg.MaxRetries,
-		tables:     make(map[string]*tableMeta),
-		sleep:      sleepContext,
+		cfg:          cfg,
+		timeout:      timeout,
+		maxRetries:   cfg.MaxRetries,
+		bulkMaxBytes: bulkMaxBytesOrDefault(cfg.BulkMaxBytes),
+		tables:       make(map[string]*tableMeta),
+		sleep:        sleepContext,
 	}, nil
+}
+
+// bulkMaxBytesOrDefault keeps a programmatic config without the field usable.
+func bulkMaxBytesOrDefault(configured int) int {
+	if configured <= 0 {
+		return DefaultBulkMaxBytes
+	}
+	return configured
 }
 
 // SetClient injects a client (tests) or replaces the client before Open.
@@ -169,8 +190,9 @@ func (s *Sink) ApplySchema(change schema.Change) error {
 		change.Database, change.Table, change.Action)
 }
 
-// Write sends every event in the batch as one bulk request and returns an error
-// unless every item was acknowledged. Nothing is buffered, so a nil error means
+// Write sends every event in the batch as one or more bulk requests and returns
+// an error unless every item was acknowledged. Requests are split so no body
+// exceeds the byte budget; nothing is buffered, so a nil error means
 // Elasticsearch already accepted the documents.
 func (s *Sink) Write(batch []event.Event) error {
 	if len(batch) == 0 {
@@ -194,9 +216,10 @@ func (s *Sink) Write(batch []event.Event) error {
 		}
 		ops = append(ops, op)
 	}
-	ctx, cancel := s.writeContext()
-	defer cancel()
-	return s.bulk(ctx, ops)
+	// bulk gives every request of this Write its own budget (see bulkBudget), so
+	// no Write-wide deadline is created here. There is no caller context to
+	// derive a cancellation from, so the parent only carries no deadline.
+	return s.bulk(context.Background(), ops)
 }
 
 // Flush has nothing to drain: Write blocks until the bulk response is checked.
@@ -289,11 +312,13 @@ func (s *Sink) requestContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), s.timeout)
 }
 
-// writeContext bounds one Write including every retry and backoff wait.
-func (s *Sink) writeContext() (context.Context, context.CancelFunc) {
+// bulkBudget bounds one bulk request: every attempt plus the backoff between
+// them. A Write is split into one or more requests, so the budget is per
+// request; a single Write-wide budget would starve the requests that come after
+// the first ones consumed it.
+func (s *Sink) bulkBudget() time.Duration {
 	attempts := s.maxRetries + 1
-	budget := time.Duration(attempts)*s.timeout + retryBudget(attempts)
-	return context.WithTimeout(context.Background(), budget)
+	return time.Duration(attempts)*s.timeout + retryBudget(attempts)
 }
 
 func sleepContext(ctx context.Context, d time.Duration) error {

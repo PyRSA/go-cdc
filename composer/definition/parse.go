@@ -39,13 +39,41 @@ const (
 	// new column appears or the budget runs out. Exported because the sink also
 	// defaults a directly constructed definition.Sink.
 	DefaultDorisSchemaChangeWait = 5 * time.Second
+	// DefaultBulkMaxBytes caps one Elasticsearch bulk request body. Elasticsearch
+	// rejects a body above its http.max_content_length (100mb by default) with 413.
+	DefaultBulkMaxBytes = 5 << 20 // 5 MiB of NDJSON
+	// A bulk body above Elasticsearch's default limit cannot be delivered, so a
+	// larger budget would only move the failure to the cluster. The sink validates
+	// programmatic configs against the same range.
+	MinBulkMaxBytes = 1024
+	MaxBulkMaxBytes = 100 << 20
 )
+
+// ValidateBulkMaxBytes checks a sink.bulk-max-bytes value. Zero means "not
+// configured" and selects DefaultBulkMaxBytes; every other value must stay in
+// the range Elasticsearch can accept. The parser and the sink share this check
+// so a YAML config and a programmatic config are rejected for the same reasons
+// with the same message.
+func ValidateBulkMaxBytes(n int) error {
+	if n == 0 {
+		return nil
+	}
+	if n < MinBulkMaxBytes || n > MaxBulkMaxBytes {
+		return fmt.Errorf("must be 0 (use the default %d) or an integer in %d..%d",
+			DefaultBulkMaxBytes, MinBulkMaxBytes, MaxBulkMaxBytes)
+	}
+	return nil
+}
 
 // Sink keys that only make sense for one sink type. Rejecting them keeps a
 // mistyped key from being silently ignored.
 var (
 	esOnlySinkKeys = map[string]struct{}{
 		"hosts": {}, "auto-create": {}, "index-name": {}, "mapping-file": {},
+		// bulk-max-bytes bounds the ES bulk body only.
+		"bulk-max-bytes": {},
+		// request-timeout is deliberately absent: it is shared with Doris and
+		// rejected per sink type through requestTimeoutSinkKeys.
 	}
 	kafkaOnlySinkKeys = map[string]struct{}{
 		"brokers": {}, "topic": {}, "source-name": {}, "client-id": {},
@@ -354,6 +382,7 @@ func parseSink(raw map[string]any) (Sink, error) {
 		AllowAutoCreateTopics: true, // kafka: keep prior Always-on AllowAutoTopicCreation
 		ProducerBatchMaxBytes: defaultProducerBatchMaxBytes,
 		FlushTimeout:          defaultFlushTimeout,
+		BulkMaxBytes:          DefaultBulkMaxBytes,
 	}
 	if strings.EqualFold(fmt.Sprint(raw["type"]), "doris") {
 		// Doris separates the FE HTTP port (Stream Load) from the SQL port.
@@ -411,6 +440,18 @@ func parseSink(raw map[string]any) (Sink, error) {
 				return Sink{}, configErr("sink.request-timeout", "must be a positive duration")
 			}
 			out.RequestTimeout = d
+		case "bulk-max-bytes":
+			n, err := asInt(value)
+			if err != nil {
+				return Sink{}, configErr("sink.bulk-max-bytes", "must be an integer")
+			}
+			if err := ValidateBulkMaxBytes(n); err != nil {
+				return Sink{}, configf("sink.bulk-max-bytes", "%v", err)
+			}
+			// Zero keeps the default injected above.
+			if n > 0 {
+				out.BulkMaxBytes = n
+			}
 		case "write-batch-size":
 			n, err := asInt(value)
 			if err != nil || n < 1 {
@@ -664,6 +705,9 @@ func validateElasticsearch(out *Sink, used map[string]struct{}) error {
 	}
 	if out.RequestTimeout <= 0 {
 		out.RequestTimeout = defaultRequestTimeout
+	}
+	if out.BulkMaxBytes <= 0 {
+		out.BulkMaxBytes = DefaultBulkMaxBytes
 	}
 	if out.IndexName != "" {
 		if err := validateElasticsearchIndexName(out.IndexName); err != nil {

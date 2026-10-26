@@ -20,16 +20,35 @@ request/response types stay inside `client/v8`.
 
 ## Delivery semantics
 
-`Write` sends the whole runner batch as **one bulk request** and returns an
-error unless **every item** was acknowledged. Nothing is buffered, so `Flush`
-is a no-op and a `nil` error means Elasticsearch already accepted the
+`Write` sends the whole runner batch as **one or more bulk requests** and
+returns an error unless **every item** was acknowledged. Nothing is buffered, so
+`Flush` is a no-op and a `nil` error means Elasticsearch already accepted the
 documents. The runner saves the checkpoint only after `Write`+`Flush` succeed,
 so a rejected document never advances the checkpoint.
 
-Each bulk attempt is bounded by `request-timeout`; the whole `Write` (attempts
-plus backoff) is bounded by `(max-retries+1) * request-timeout` plus the retry
-budget. Replays are idempotent because every operation carries a deterministic
-`_id` (see below).
+Each bulk attempt is bounded by `request-timeout`, and each **request** (its
+attempts plus backoff) gets its own budget of
+`(max-retries+1) * request-timeout` plus the retry budget. Because a large
+`Write` is split into several requests, its total time is bounded by that
+budget multiplied by the number of requests it needed, so a later request never
+inherits an exhausted deadline and no request waits without a bound. Replays
+are idempotent because every operation carries a deterministic `_id` (see
+below).
+
+A request body is capped by `sink.bulk-max-bytes` (default 5 MiB; `0` selects
+the default). The sink encodes each operation to its final NDJSON form once —
+action line, document line, and both newlines — and starts a new request when
+adding the next operation would exceed the budget, so the bytes that are
+measured are exactly the bytes that are sent. `write-batch-size` (and a
+snapshot chunk) still cap the number of operations handed to one `Write`;
+splitting only makes a request smaller, never larger, and never reorders
+operations.
+
+An operation that alone exceeds the budget cannot be split: the write fails
+before anything is sent, naming the operation, its encoded size, and the limit.
+Elasticsearch would reject such a body with `413` anyway, and no retry can make
+it fit. Raise `bulk-max-bytes` (at most `104857600`) in that case, or shrink the
+row.
 
 ## Example
 
@@ -45,6 +64,7 @@ sink:
   write-batch-size: 1000
   write-batch-interval: 1s
   max-retries: 3
+  # bulk-max-bytes: 5242880   # encoded bytes per bulk request (default 5 MiB)
 
 route:
   - source-table: demo_db\.users
@@ -65,14 +85,15 @@ Full job: [`configs/demo-elasticsearch.yaml`](../../configs/demo-elasticsearch.y
 | `index-name` | no | — | String | Explicit index for **every** routed table; overrides the derived name |
 | `mapping-file` | no | — | Path | JSON object used as the Create Index body (`settings` / `mappings` / `aliases`). Missing fields are derived from the schema |
 | `request-timeout` | no | `30s` | Duration | Timeout of one Elasticsearch request |
+| `bulk-max-bytes` | no | `5242880` (5 MiB) | Int | Maximum encoded NDJSON bytes of one bulk request: `0` (use the default) or `1024..104857600`. A single operation above it fails the write instead of being sent |
 | `write-batch-size` | no | `1000` | Int | Shared runner option: flush the DML batch when the size is reached |
 | `write-batch-interval` | no | `1s` | Duration | Shared runner option: flush the DML batch on this interval |
 | `max-retries` | no | `3` | Int | Retries for **transient** bulk failures (`>= 0`) |
 
 `sink.auto-create-table` belongs to the MySQL sink and is rejected for
 Elasticsearch: index creation is controlled by `sink.auto-create` only. ES-only
-keys (`hosts`, `index-name`, `mapping-file`, `request-timeout`, `auto-create`)
-are rejected for other sink types.
+keys (`hosts`, `index-name`, `mapping-file`, `request-timeout`,
+`bulk-max-bytes`, `auto-create`) are rejected for other sink types.
 
 ## Startup, catalog, and `auto-create`
 
@@ -244,24 +265,34 @@ DDL from the pipeline) and restart from a safe position.
 
 ## Bulk errors and retries
 
-One bulk request per `Write`; **every item** is inspected even when HTTP is
-200:
+One `Write` issues one or more bulk requests (split by `bulk-max-bytes`, sent in
+order); **every item** of every request is inspected even when HTTP is 200:
 
 - `2xx` → success.
 - `delete` + `404` without an error type → success (the document is already
   gone; replays stay idempotent).
 - `429`, `500`, `502`, `503`, `504`, and transport failures (no HTTP status)
   → transient: the item is retried up to `max-retries` times.
-- Anything else (`400`, `401`, `403`, `404` on index, mapping/parsing errors,
-  …) → permanent: the write fails immediately without retrying.
+- Anything else (`400`, `401`, `403`, `404` on index, `413` for a body the
+  cluster refuses, mapping/parsing errors, …) → permanent: the write fails
+  immediately without retrying. A `413` is never retried: the same body cannot
+  fit a second time.
 
-Retries resend **only the failed items**, with an exponential backoff starting
-at `100ms` and capped at `2s`, interrupted by context cancellation. When the
-budget is exhausted the write fails with
+Retries resend **only the failed items of the request that failed**, with an
+exponential backoff starting at `100ms` and capped at `2s`, interrupted by
+context cancellation. When the budget is exhausted the write fails with
 `elasticsearch: bulk: N of M item(s) failed after K attempt(s)` followed by up
 to 5 representative failures (action, index, id, status, error type, reason
 truncated to 200 characters) and `and X more`. No document content, password,
-or `Authorization` header is logged.
+or `Authorization` header is logged. When a `Write` was split, the error names
+the request: `elasticsearch: bulk: request i/n: ...`.
+
+Known limitation (fix tracked as a separate data-correctness task): if one
+request contains the same `_id` twice and only the earlier operation fails
+transiently, the retry resends that earlier value and can overwrite the value
+the later operation already stored. Operations separated by a request boundary
+are not affected, because requests are sent in order and a request is retried
+before the next one is built.
 
 ## Existing mapping compatibility
 
@@ -327,7 +358,7 @@ What each layer proves:
 
 | Layer | Needs | Checks |
 | --- | --- | --- |
-| unit | nothing | mapping derivation, `_id` hashing, bulk item classification, retries (fake client) |
+| unit | nothing | mapping derivation, `_id` hashing, bulk item classification, byte-budget splitting (exact NDJSON boundaries, 50×2 MiB), retries (fake client and `httptest`) |
 | Integration | ES8 | index create / `auto-create=false` failure, mapping compatibility, explicit mapping file, per-type storage read back over HTTP, insert/update/delete, idempotent re-index, composite keys, shared index, bulk partial failure |
 | E2E | MySQL + ES8 | snapshot then binlog, Transform/Route (final table + index + `_id`), checkpoint restart, binlog-only catalog, mapping conflict, ES-unavailable errors, document-level consistency |
 | Load | MySQL + ES8 | sustained insert/update/delete + mixed DML, `write-batch-size` sweep, peak writers, bounded catch-up, streaming checksums (`COUNT, SUM(id), SUM(CRC32)`) |
