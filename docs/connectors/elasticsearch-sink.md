@@ -1,9 +1,10 @@
 # Elasticsearch Sink Connector
 
-Writes each change as one document in **Elasticsearch 7 or 8** using the
+Writes each change as one document in **Elasticsearch 7, 8 or 9** using the
 official client
 [`github.com/elastic/go-elasticsearch/v7`](https://github.com/elastic/go-elasticsearch)
-or [`v8`](https://github.com/elastic/go-elasticsearch), selected by
+, [`v8`](https://github.com/elastic/go-elasticsearch) or
+[`v9`](https://github.com/elastic/go-elasticsearch), selected by
 `sink.version`.
 
 **YAML:** top-level `sink` with `type: elasticsearch`.
@@ -12,37 +13,39 @@ or [`v8`](https://github.com/elastic/go-elasticsearch), selected by
 
 | Item | Support |
 | --- | --- |
-| Elasticsearch | **7.17.x** (verified) and **8.x**. ES 9, and 7.0–7.16, are not verified |
-| Client | Official `go-elasticsearch/v7` (v7.17.x) or `go-elasticsearch/v8` (v8.19.x) |
-| Mapping / bulk format | Typeless mappings and the same NDJSON bulk body for both versions |
-| SDK retries | **Disabled** (`DisableRetry`); the sink owns its bounded retry loop |
-| v7 compatibility mode | **Off**; the configured version selects the client, never the server |
+| Elasticsearch | **7.17.x** and **8.x** (verified) and **9.5.x** (targeted by the ES9 CI job). 7.0–7.16 are not verified |
+| Client | Official `go-elasticsearch/v7` (v7.17.x), `go-elasticsearch/v8` (v8.19.x) or `go-elasticsearch/v9` (v9.5.x), selected by `version` |
+| Mapping / bulk format | Typeless mappings and the same NDJSON bulk body for all three versions |
+| SDK retries | **Disabled** (`elastictransport.WithDisableRetry()`); the sink owns its bounded retry loop |
+| Compatibility mode | **Off**; the configured version selects the client, never the server |
 | Packaging | Shipped inside the `go-cdc` binary; no CGo |
 
 The sink business layer only talks to a small `client.Client` interface
 (`Ping`, `IndexExists`, `CreateIndex`, `GetMapping`, `Bulk`, `Close`); SDK
-request/response types stay inside `client/v7` and `client/v8`. Index naming,
-mapping derivation, `_id` hashing, bulk planning, retry classification, and
-checkpoint behaviour are shared by both versions.
+request/response types stay inside `client/v7`, `client/v8` and `client/v9`.
+Index naming, mapping derivation, `_id` hashing, bulk planning, retry
+classification, and checkpoint behaviour are shared by all versions.
 
 ## Choosing the server version
 
 ```yaml
 sink:
   type: elasticsearch
-  version: 7          # 7 → go-elasticsearch/v7, 8 → go-elasticsearch/v8
+  version: 9          # 7 → v7 client, 8 → v8 client, 9 → v9 client
 ```
 
 - **Unset** (or `0` in a programmatic config) → `8`, so existing pipelines are
   unchanged.
 - `7` → the official v7 client, for an Elasticsearch 7.x cluster.
 - `8` → the official v8 client.
-- Anything else (`6`, `9`, `7.5`, `v7`, …) fails at parse time with
+- `9` → the official v9 client, for an Elasticsearch 9.x cluster.
+- Anything else (`6`, `10`, `7.5`, `v7`, …) fails at parse time with
   `sink.version`; the sink never falls back to another client.
 - The cluster version is **never probed**: a pipeline always uses the client it
   was configured with, even when it points at a different server version.
-- The v7 client requires the `X-Elastic-Product` response header, which 7.14+
-  sends. Targeting an older 7.x server is therefore not supported.
+- Every client requires the `X-Elastic-Product` response header, which 7.14+
+  and all 8.x/9.x releases send. Targeting an older 7.x server is therefore not
+  supported.
 
 ## Delivery semantics
 
@@ -81,7 +84,7 @@ row.
 ```yaml
 sink:
   type: elasticsearch
-  version: 8                 # 7 or 8; omit for 8
+  version: 9                 # 7, 8 or 9; omit for 8
   hosts:
     - http://127.0.0.1:9200
   # username: elastic     # Basic auth; username and password must be set together
@@ -105,7 +108,7 @@ Full job: [`configs/demo-elasticsearch.yaml`](../../configs/demo-elasticsearch.y
 | Option | Required | Default | Type | Description |
 | --- | --- | --- | --- | --- |
 | `type` | yes | — | String | Must be `elasticsearch` |
-| `version` | no | `8` | Int | Target major version: `7` or `8`. Any other value is rejected; the client is never probed from the server |
+| `version` | no | `8` | Int | Target major version: `7`, `8` or `9`. Any other value is rejected; the client is never probed from the server |
 | `hosts` | yes | — | String or list | `http(s)://host:port` entries. Credentials embedded in a URL are removed from error messages |
 | `username` | no | — | String | Basic auth user; must be paired with `password` |
 | `password` | no | — | String | Basic auth password; must be paired with `username` |
@@ -375,6 +378,11 @@ make integration-es7-up             # compose: Elasticsearch 7.17 on 127.0.0.1:1
 make integration-es7-integration    # only TestElasticsearch7* (v7 client, no MySQL)
 make integration-es7-down
 
+# 2c. Integration of the v9 adapter against a real ES9.5 (same build tag)
+make integration-es9-up             # compose: Elasticsearch 9.5 on 127.0.0.1:19202
+make integration-es9-integration    # only TestElasticsearch9* (v9 client, no MySQL)
+make integration-es9-down
+
 # 3. E2E: MySQL binlog -> runner -> ES8 (snapshot, DML, route/transform,
 #    checkpoint restart, mapping conflict, consistency)
 make integration-es-e2e
@@ -391,9 +399,9 @@ What each layer proves:
 
 | Layer | Needs | Checks |
 | --- | --- | --- |
-| unit | nothing | mapping derivation, `_id` hashing, bulk item classification, byte-budget splitting (exact NDJSON boundaries, 50×2 MiB), retries (fake client and `httptest`), version selection (default 8, `7`, `8`, invalid) |
-| Integration | ES8 / ES7.17 | index create / `auto-create=false` failure, mapping compatibility, explicit mapping file, per-type storage read back over HTTP, insert/update/delete, idempotent re-index, composite keys, shared index, bulk partial failure, schema re-check; the ES7 suite reuses the same harness through the v7 adapter |
-| E2E | MySQL + ES8 | snapshot then binlog, Transform/Route (final table + index + `_id`), checkpoint restart, binlog-only catalog, mapping conflict, ES-unavailable errors, document-level consistency |
+| unit | nothing | mapping derivation, `_id` hashing, bulk item classification, byte-budget splitting (exact NDJSON boundaries, 50×2 MiB), retries (fake client and `httptest`), version selection (default 8, `7`, `8`, `9`, invalid) |
+| Integration | ES8 / ES7.17 / ES9.5 | index create / `auto-create=false` failure, mapping compatibility, explicit mapping file, per-type storage read back over HTTP, insert/update/delete, idempotent re-index, composite keys, shared index, bulk partial failure, schema re-check; the ES7 and ES9 suites reuse the same harness through their own adapter |
+| E2E | MySQL + ES7.17 / ES8 / ES9.5 | snapshot then binlog, Transform/Route (final table + index + `_id`), checkpoint restart, binlog-only catalog, mapping conflict, ES-unavailable errors, document-level consistency |
 | Load | MySQL + ES8 | sustained insert/update/delete + mixed DML, `write-batch-size` sweep, peak writers, bounded catch-up, streaming checksums (`COUNT, SUM(id), SUM(CRC32)`) |
 | Scale | MySQL + ES8 | 5 DBs / 20 tables (normal) and 10 DBs / 50 tables + hotspot burst/peak (heavy), per-table checksums, marker and content samples |
 
@@ -419,7 +427,8 @@ docker run --rm -p 9200:9200 -e discovery.type=single-node \
 
 For Elasticsearch 7, run the same steps against
 `docker.elastic.co/elasticsearch/elasticsearch:7.17.24` and add `version: 7` to
-`sink`.
+`sink`. For Elasticsearch 9, use
+`docker.elastic.co/elasticsearch/elasticsearch:9.5.2` and `version: 9`.
 
 1. Point `configs/demo-elasticsearch.yaml` at `http://127.0.0.1:9200`, set
    `auto-create: true`, run `./bin/go-cdc configs/demo-elasticsearch.yaml`, and

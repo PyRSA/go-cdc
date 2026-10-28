@@ -1,5 +1,5 @@
-// Package elasticsearch writes routed CDC events to Elasticsearch 7 or 8
-// through the official go-elasticsearch v7/v8 client selected by sink.version.
+// Package elasticsearch writes routed CDC events to Elasticsearch 7, 8 or 9
+// through the official go-elasticsearch v7/v8/v9 client selected by sink.version.
 //
 // v1 is strict on purpose: a table must have a primary key, an existing index
 // mapping is never modified, and an event that cannot be encoded or confirmed
@@ -23,6 +23,7 @@ import (
 	"github.com/PyRSA/go-cdc/connector/sink/elasticsearch/client"
 	esv7 "github.com/PyRSA/go-cdc/connector/sink/elasticsearch/client/v7"
 	esv8 "github.com/PyRSA/go-cdc/connector/sink/elasticsearch/client/v8"
+	esv9 "github.com/PyRSA/go-cdc/connector/sink/elasticsearch/client/v9"
 )
 
 // DefaultRequestTimeout bounds one Elasticsearch request when
@@ -34,7 +35,7 @@ const DefaultRequestTimeout = 30 * time.Second
 // (100mb by default) with HTTP 413, so the sink never builds one.
 const DefaultBulkMaxBytes = definition.DefaultBulkMaxBytes
 
-// Sink implements sink.Sink for Elasticsearch 7 and 8.
+// Sink implements sink.Sink for Elasticsearch 7, 8 and 9.
 type Sink struct {
 	cfg          definition.Sink
 	timeout      time.Duration
@@ -66,7 +67,7 @@ func New(cfg definition.Sink) (*Sink, error) {
 		return nil, errors.New("elasticsearch: sink.max-retries must be >= 0")
 	}
 	// Both the parser and a programmatic caller go through the same resolver, so
-	// the configured version is either 7 or 8 and never silently falls back.
+	// the configured version is one of 7, 8 or 9 and never silently falls back.
 	version, err := definition.ResolveElasticsearchVersion(cfg.Version)
 	if err != nil {
 		return nil, fmt.Errorf("elasticsearch: sink.version %d: %v", cfg.Version, err)
@@ -188,7 +189,8 @@ func (s *Sink) Open(ctx context.Context) error {
 
 // buildAPIClient returns the official client adapter for the configured
 // version. Only the adapter differs: request construction, responses, and the
-// bulk NDJSON body are identical for both, so the sink business layer is shared.
+// bulk NDJSON body are identical for all of them, so the sink business layer is
+// shared.
 // The cluster version is never probed — a pipeline must keep using the client it
 // was configured with, even when it points at a different server version.
 func buildAPIClient(cfg definition.Sink, timeout time.Duration) (client.Client, error) {
@@ -203,6 +205,13 @@ func buildAPIClient(cfg definition.Sink, timeout time.Duration) (client.Client, 
 		})
 	case definition.ElasticsearchVersion8:
 		return esv8.New(esv8.Config{
+			Addresses:      addresses,
+			Username:       cfg.Username,
+			Password:       cfg.Password,
+			RequestTimeout: timeout,
+		})
+	case definition.ElasticsearchVersion9:
+		return esv9.New(esv9.Config{
 			Addresses:      addresses,
 			Username:       cfg.Username,
 			Password:       cfg.Password,

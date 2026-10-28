@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""MySQL -> go-cdc -> Elasticsearch 7/8 end-to-end suite (TP-E01..TP-E10).
+"""MySQL -> go-cdc -> Elasticsearch 7/8/9 end-to-end suite (TP-E01..TP-E10).
 
 Drives the real binary (no fake client) through the compose MySQL service and
 one Elasticsearch node - ES8 by default, ES7 when `ES_SINK_VERSION=7` /
-`ES_EXPECT_MAJOR=7` are set (see `scripts/run-es7-e2e.sh`) - and verifies
-Elasticsearch over plain HTTP:
+`ES_EXPECT_MAJOR=7` are set (see `scripts/run-es7-e2e.sh`), ES9 when both are
+`9` (see `scripts/run-es9-e2e.sh`) - and verifies Elasticsearch over plain HTTP:
 
   * `harness.es_client`   - scroll-based reads, index/mapping/detail checks
   * `harness.es_verify`   - independent re-implementation of the `_id` contract,
@@ -12,9 +12,10 @@ Elasticsearch over plain HTTP:
 
 The pipeline under test is `fixtures/pipeline.es.yaml.tpl` (snapshot + binlog),
 plus `fixtures/pipeline.es.binlog.yaml.tpl` for binlog-only startup and DDL.
-Run it with `scripts/run-es-e2e.sh` (ES8) or `scripts/run-es7-e2e.sh` (ES7);
-the report lands in `docs/test/reports/mysql-elasticsearch.md` for ES8 and
-`mysql-elasticsearch7.md` for ES7.
+Run it with `scripts/run-es-e2e.sh` (ES8), `scripts/run-es7-e2e.sh` (ES7) or
+`scripts/run-es9-e2e.sh` (ES9); the report lands in
+`docs/test/reports/mysql-elasticsearch.md` for ES8, `mysql-elasticsearch7.md`
+for ES7 and `mysql-elasticsearch9.md` for ES9.
 """
 from __future__ import annotations
 
@@ -392,7 +393,7 @@ def assert_target(version: str | None = None) -> None:
         if version.split(".")[0] != expected:
             raise RuntimeError(
                 f"expected Elasticsearch {expected}.x at {cfg.ES_URL}, got {version or 'unknown'}; "
-                "check ES_URL / ES7_URL / ES7_HOST_PORT"
+                "check ES_URL / ES7_URL / ES9_URL / ES7_HOST_PORT / ES9_HOST_PORT"
             )
         if cfg.ES_SINK_VERSION != expected:
             raise RuntimeError(
@@ -1010,7 +1011,7 @@ def main() -> int:
     if not ES.ping():
         raise RuntimeError(
             f"Elasticsearch is not reachable at {cfg.ES_URL}; "
-            "run scripts/es-up.sh (ES8) or scripts/es7-up.sh (ES7)"
+            "run scripts/es-up.sh (ES8), scripts/es7-up.sh (ES7) or scripts/es9-up.sh (ES9)"
         )
     log(f"==> Elasticsearch {ES.version()} at {cfg.ES_URL} (sink.version={cfg.ES_SINK_VERSION})")
     assert_target()

@@ -6,7 +6,7 @@ What you get today:
 
 - End-to-end YAML jobs (source → transform / route → sink)
 - MySQL source: snapshot + binlog
-- Sinks: stdout (JSON lines), MySQL, Kafka (at-least-once), Doris (UNIQUE KEY + Stream Load, at-least-once), and Elasticsearch 7/8
+- Sinks: stdout (JSON lines), MySQL, Kafka (at-least-once), Doris (UNIQUE KEY + Stream Load, at-least-once), and Elasticsearch 7/8/9
 - Column projection, row filter, table route, schema-change policy, file checkpoints
 
 ## Requirements
@@ -122,7 +122,7 @@ Stop with `Ctrl+C` (SIGINT) or SIGTERM; go-cdc flushes and saves the checkpoint 
 | Sync to another MySQL | [MySQL Sink](connectors/mysql-sink.md) and [`configs/demo-mysql.yaml`](../configs/demo-mysql.yaml) |
 | Publish to Kafka | [Kafka Sink](connectors/kafka-sink.md) and [`configs/demo-kafka.yaml`](../configs/demo-kafka.yaml) |
 | Write current state to Doris | [Doris Sink](connectors/doris-sink.md) and [`configs/demo-doris.yaml`](../configs/demo-doris.yaml) |
-| Index documents in Elasticsearch 7/8 | [Elasticsearch Sink](connectors/elasticsearch-sink.md) and [`configs/demo-elasticsearch.yaml`](../configs/demo-elasticsearch.yaml) |
+| Index documents in Elasticsearch 7/8/9 | [Elasticsearch Sink](connectors/elasticsearch-sink.md) and [`configs/demo-elasticsearch.yaml`](../configs/demo-elasticsearch.yaml) |
 | Source options (startup mode, chunks, …) | [MySQL Source](connectors/mysql-source.md) |
 | Projection / filter / route / schema evolution | [Pipeline](pipeline.md) |
 

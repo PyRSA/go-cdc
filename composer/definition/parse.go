@@ -43,10 +43,12 @@ const (
 	// rejects a body above its http.max_content_length (100mb by default) with 413.
 	DefaultBulkMaxBytes = 5 << 20 // 5 MiB of NDJSON
 	// Elasticsearch major versions the sink can write to. One value per official
-	// Go client: ElasticsearchVersion7 selects go-elasticsearch/v7 and
-	// ElasticsearchVersion8 selects go-elasticsearch/v8.
+	// Go client: ElasticsearchVersion7 selects go-elasticsearch/v7,
+	// ElasticsearchVersion8 selects go-elasticsearch/v8, and
+	// ElasticsearchVersion9 selects go-elasticsearch/v9.
 	ElasticsearchVersion7 = 7
 	ElasticsearchVersion8 = 8
+	ElasticsearchVersion9 = 9
 	// A bulk body above Elasticsearch's default limit cannot be delivered, so a
 	// larger budget would only move the failure to the cluster. The sink validates
 	// programmatic configs against the same range.
@@ -63,10 +65,11 @@ func ResolveElasticsearchVersion(configured int) (int, error) {
 	switch configured {
 	case 0:
 		return ElasticsearchVersion8, nil
-	case ElasticsearchVersion7, ElasticsearchVersion8:
+	case ElasticsearchVersion7, ElasticsearchVersion8, ElasticsearchVersion9:
 		return configured, nil
 	}
-	return 0, fmt.Errorf("must be %d or %d", ElasticsearchVersion7, ElasticsearchVersion8)
+	return 0, fmt.Errorf("must be %d, %d or %d",
+		ElasticsearchVersion7, ElasticsearchVersion8, ElasticsearchVersion9)
 }
 
 // ValidateBulkMaxBytes checks a sink.bulk-max-bytes value. Zero means "not
@@ -455,7 +458,7 @@ func parseSink(raw map[string]any) (Sink, error) {
 		case "version":
 			n, err := asVersion(value)
 			if err != nil {
-				return Sink{}, configErr("sink.version", "must be 7 or 8")
+				return Sink{}, configErr("sink.version", "must be 7, 8 or 9")
 			}
 			out.Version = n
 		case "index-name":

@@ -135,6 +135,7 @@ Jobs:
 | `doris-e2e` | MySQL **8.0** + Doris **2.1.8** | MySQL→Doris pipeline TP-DR01..DR07 (functional + load) + sink Go suite + Doris scale ([`doris-integration.yml`](../../.github/workflows/doris-integration.yml)) |
 | `elasticsearch-e2e` | MySQL **8.0** + compose ES8 | ES sink: Go IT (`esintegration`), E2E, load, scale `normal` |
 | `elasticsearch7-integration` | compose ES7.17 | v7 client adapter: Go IT (`esintegration`, `TestElasticsearch7*`) |
+| `elasticsearch9-integration` | compose ES9.5 | v9 client adapter: Go IT (`esintegration`, `TestElasticsearch9*`) + E2E with `sink.version=9` |
 
 **Load tier** (`LOAD_ROWS_PER_TABLE`):
 
@@ -332,3 +333,39 @@ the E2E harness fails fast when the cluster major version does not match
 `ES_EXPECT_MAJOR`, or when a fixture stops pinning `sink.version`. Verified
 server: Elasticsearch 7.17.x; 7.0–7.16 are not verified (the Go 7.17 client
 requires the `X-Elastic-Product` header, available from 7.14).
+
+## Elasticsearch 9 sink suites (v9 client adapter)
+
+Mirror of the ES7 suites for the v9 adapter. The Integration layer is the same
+test binary again, run against a third cluster with `sink.version: 9`; it reuses
+`es_integration_test.go` and adds ES9-specific coverage (`es9_integration_test.go`:
+adapter wiring, typeless mapping, schema re-check, close/error paths). It needs
+no MySQL. The E2E layer is `harness/es_it.py` (TP-E01..TP-E10) re-run with
+`sink.version=9` and `ES_EXPECT_MAJOR=9`, so it needs MySQL as well.
+
+```bash
+# Integration (ES9 only)
+bash test/integration/scripts/es9-up.sh              # service `elasticsearch9` (9.5.2, host port 19202)
+bash test/integration/scripts/run-es9-integration.sh  # -run 'TestElasticsearch9'
+bash test/integration/scripts/es9-down.sh
+
+# E2E (MySQL + ES9; the ES8/ES7 nodes and Kafka are not started)
+MYSQL_UP_SERVICES=mysql bash test/integration/scripts/mysql-up.sh
+bash test/integration/scripts/es9-up.sh
+bash test/integration/scripts/run-es9-e2e.sh          # report: mysql-elasticsearch9.md
+```
+
+Equivalent Make targets: `make integration-es9-up`, `integration-es9-integration`,
+`integration-es9-e2e-up`, `integration-es9-e2e`, `integration-es9-down`.
+
+| Layer | Harness | Report |
+| --- | --- | --- |
+| Integration | `go test -tags esintegration -run TestElasticsearch9 ...` (real ES9) | `go test` output |
+| E2E | `harness/es_it.py` with `sink.version=9` (TP-E01..) | `docs/test/reports/mysql-elasticsearch9.md` |
+
+Knobs: `ES9_URL` (default `http://127.0.0.1:19202`), `ES9_IMAGE`, `ES9_HEAP`,
+`ES9_HOST_PORT`, plus the shared E2E knobs (`ES_SRC_DB`, `ES_SNK_DB`, `ES_URL`)
+and `ES_SINK_VERSION` / `ES_EXPECT_MAJOR`. The ES9 node sits behind the `es9`
+compose profile, so the default service list and the ES7/ES8 jobs never start it.
+Targeted server: Elasticsearch 9.5.x (CI job `elasticsearch9-integration`);
+the adapter unit tests use `httptest` and need no cluster.

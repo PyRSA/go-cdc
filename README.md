@@ -4,12 +4,12 @@
 
 ## Introduction
 
-go-cdc is a YAML-driven Change Data Capture (CDC) tool. You describe one sync job in a single YAML file: capture full and incremental changes from MySQL, apply optional transform and route, then write to **stdout**, **MySQL**, **Kafka**, **Doris**, or **Elasticsearch 7/8** (Kafka / Doris at-least-once; Elasticsearch uses the Bulk API with idempotent writes). One process, one config, one binary: `go-cdc`.
+go-cdc is a YAML-driven Change Data Capture (CDC) tool. You describe one sync job in a single YAML file: capture full and incremental changes from MySQL, apply optional transform and route, then write to **stdout**, **MySQL**, **Kafka**, **Doris**, or **Elasticsearch 7/8/9** (Kafka / Doris at-least-once; Elasticsearch uses the Bulk API with idempotent writes). One process, one config, one binary: `go-cdc`.
 
 Features in this release:
 
 - MySQL source (snapshot + binlog)
-- Stdout sink (newline-delimited JSON), MySQL sink, Kafka sink (at-least-once), Doris sink (UNIQUE KEY + Stream Load, at-least-once), and Elasticsearch 7/8 sink (`sink.version`, default 8)
+- Stdout sink (newline-delimited JSON), MySQL sink, Kafka sink (at-least-once), Doris sink (UNIQUE KEY + Stream Load, at-least-once), and Elasticsearch 7/8/9 sink (`sink.version`, default 8)
 - Projection, filter, table route, schema-change policy, file checkpoints
 - **Note:** stdout JSON now uses the shared Debezium-inspired envelope (`source.db` / `source.table`); older top-level `database` / `table` fields are gone
 
