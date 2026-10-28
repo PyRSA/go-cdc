@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""MySQL -> go-cdc -> Elasticsearch 8 end-to-end suite (TP-E01..TP-E10).
+"""MySQL -> go-cdc -> Elasticsearch 7/8 end-to-end suite (TP-E01..TP-E10).
 
-Drives the real binary (no fake client) through the compose MySQL/Elasticsearch
-services and verifies Elasticsearch over plain HTTP:
+Drives the real binary (no fake client) through the compose MySQL service and
+one Elasticsearch node - ES8 by default, ES7 when `ES_SINK_VERSION=7` /
+`ES_EXPECT_MAJOR=7` are set (see `scripts/run-es7-e2e.sh`) - and verifies
+Elasticsearch over plain HTTP:
 
   * `harness.es_client`   - scroll-based reads, index/mapping/detail checks
   * `harness.es_verify`   - independent re-implementation of the `_id` contract,
@@ -10,8 +12,9 @@ services and verifies Elasticsearch over plain HTTP:
 
 The pipeline under test is `fixtures/pipeline.es.yaml.tpl` (snapshot + binlog),
 plus `fixtures/pipeline.es.binlog.yaml.tpl` for binlog-only startup and DDL.
-Run it with `scripts/run-es-e2e.sh`; the report lands in
-`docs/test/reports/mysql-elasticsearch.md`.
+Run it with `scripts/run-es-e2e.sh` (ES8) or `scripts/run-es7-e2e.sh` (ES7);
+the report lands in `docs/test/reports/mysql-elasticsearch.md` for ES8 and
+`mysql-elasticsearch7.md` for ES7.
 """
 from __future__ import annotations
 
@@ -370,6 +373,38 @@ def log_text(path: Path) -> str:
 
 
 # ----------------------------------------------------------- Elasticsearch
+def assert_target(version: str | None = None) -> None:
+    """Fail fast when the cluster and the fixtures disagree with the run's intent.
+
+    The suite is version-parameterised, so three silent mismatches are possible:
+    an ES7 launch pointed at an ES8 node, an ES7 run whose pipeline still renders
+    the default ``sink.version: 8``, and a fixture that lost its ``version:``
+    line altogether. Each one would keep passing while testing the wrong adapter,
+    so all three are errors here instead of a green report.
+
+    ``version`` is the cluster version to check; it is fetched when omitted so
+    the rules can also be exercised without a cluster (see test_es_target.py).
+    """
+    if version is None:
+        version = ES.version()
+    expected = cfg.ES_EXPECT_MAJOR.rstrip(".")
+    if expected:
+        if version.split(".")[0] != expected:
+            raise RuntimeError(
+                f"expected Elasticsearch {expected}.x at {cfg.ES_URL}, got {version or 'unknown'}; "
+                "check ES_URL / ES7_URL / ES7_HOST_PORT"
+            )
+        if cfg.ES_SINK_VERSION != expected:
+            raise RuntimeError(
+                f"ES_SINK_VERSION={cfg.ES_SINK_VERSION} but ES_EXPECT_MAJOR={expected}; "
+                f"the pipeline would not run the {expected}.x adapter"
+            )
+    for name in ("pipeline.es.yaml.tpl", "pipeline.es.binlog.yaml.tpl"):
+        text = (cfg.FIXTURES / name).read_text(encoding="utf-8")
+        if "version: ${ES_SINK_VERSION}" not in text:
+            raise RuntimeError(f"{name} does not pin sink.version; it would use the sink default")
+
+
 def index_for(table: str) -> str:
     return verify.index_name_for("", SNK_DB, table)
 
@@ -912,10 +947,12 @@ def tp_e10_mapping_conflict() -> None:
 def write_report() -> Path:
     REPORT.parent.mkdir(parents=True, exist_ok=True)
     failed = sum(1 for r in results if not r.passed)
+    version = ES.version()
     lines = [
-        "# MySQL → Elasticsearch integration report",
+        f"# MySQL → Elasticsearch {version.split('.')[0]} integration report",
         "",
-        f"- Elasticsearch: `{cfg.ES_URL}` (version {ES.version()})",
+        f"- Elasticsearch: `{cfg.ES_URL}` (version {version})",
+        f"- sink.version: `{cfg.ES_SINK_VERSION}` (client adapter under test)",
         f"- Source DB: `{SRC_DB}` · final-table namespace: `{SNK_DB}`",
         f"- Functional pipeline: `{cfg.PIPELINE_ES_NAME}`",
         f"- Binlog-only pipeline: `{cfg.PIPELINE_ES_RESTART_NAME}`",
@@ -971,8 +1008,12 @@ def _run_tp(tp_id: str, title: str, fn) -> None:
 def main() -> int:
     WORKDIR.mkdir(parents=True, exist_ok=True)
     if not ES.ping():
-        raise RuntimeError(f"Elasticsearch is not reachable at {cfg.ES_URL}; run scripts/es-up.sh")
-    log(f"==> Elasticsearch {ES.version()} at {cfg.ES_URL}")
+        raise RuntimeError(
+            f"Elasticsearch is not reachable at {cfg.ES_URL}; "
+            "run scripts/es-up.sh (ES8) or scripts/es7-up.sh (ES7)"
+        )
+    log(f"==> Elasticsearch {ES.version()} at {cfg.ES_URL} (sink.version={cfg.ES_SINK_VERSION})")
+    assert_target()
     log("==> schema + seed")
     ensure_schema()
     seed()

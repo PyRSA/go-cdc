@@ -18,6 +18,8 @@ source:
 sink:
   type: elasticsearch
   hosts: ["${ES_URL}"]
+  # Same knob as pipeline.es.yaml.tpl: 8 for the ES8 suite, 7 for the ES7 e2e run.
+  version: ${ES_SINK_VERSION}
   auto-create: true
   write-batch-size: 50
   write-batch-interval: 100ms

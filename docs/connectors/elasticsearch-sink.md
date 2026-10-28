@@ -1,7 +1,10 @@
 # Elasticsearch Sink Connector
 
-Writes each change as one document in **Elasticsearch 8** using the official
-client [`github.com/elastic/go-elasticsearch/v8`](https://github.com/elastic/go-elasticsearch).
+Writes each change as one document in **Elasticsearch 7 or 8** using the
+official client
+[`github.com/elastic/go-elasticsearch/v7`](https://github.com/elastic/go-elasticsearch)
+or [`v8`](https://github.com/elastic/go-elasticsearch), selected by
+`sink.version`.
 
 **YAML:** top-level `sink` with `type: elasticsearch`.
 
@@ -9,14 +12,37 @@ client [`github.com/elastic/go-elasticsearch/v8`](https://github.com/elastic/go-
 
 | Item | Support |
 | --- | --- |
-| Elasticsearch | **8.x only** (v1 ships the v8 adapter; v6/v7/v9 are not implemented) |
-| Client | Official `go-elasticsearch/v8` (v8.19.x) |
-| Packaging | Shipped inside the `go-cdc` binary; no CGo |
+| Elasticsearch | **7.17.x** (verified) and **8.x**. ES 9, and 7.0–7.16, are not verified |
+| Client | Official `go-elasticsearch/v7` (v7.17.x) or `go-elasticsearch/v8` (v8.19.x) |
+| Mapping / bulk format | Typeless mappings and the same NDJSON bulk body for both versions |
 | SDK retries | **Disabled** (`DisableRetry`); the sink owns its bounded retry loop |
+| v7 compatibility mode | **Off**; the configured version selects the client, never the server |
+| Packaging | Shipped inside the `go-cdc` binary; no CGo |
 
 The sink business layer only talks to a small `client.Client` interface
 (`Ping`, `IndexExists`, `CreateIndex`, `GetMapping`, `Bulk`, `Close`); SDK
-request/response types stay inside `client/v8`.
+request/response types stay inside `client/v7` and `client/v8`. Index naming,
+mapping derivation, `_id` hashing, bulk planning, retry classification, and
+checkpoint behaviour are shared by both versions.
+
+## Choosing the server version
+
+```yaml
+sink:
+  type: elasticsearch
+  version: 7          # 7 → go-elasticsearch/v7, 8 → go-elasticsearch/v8
+```
+
+- **Unset** (or `0` in a programmatic config) → `8`, so existing pipelines are
+  unchanged.
+- `7` → the official v7 client, for an Elasticsearch 7.x cluster.
+- `8` → the official v8 client.
+- Anything else (`6`, `9`, `7.5`, `v7`, …) fails at parse time with
+  `sink.version`; the sink never falls back to another client.
+- The cluster version is **never probed**: a pipeline always uses the client it
+  was configured with, even when it points at a different server version.
+- The v7 client requires the `X-Elastic-Product` response header, which 7.14+
+  sends. Targeting an older 7.x server is therefore not supported.
 
 ## Delivery semantics
 
@@ -55,6 +81,7 @@ row.
 ```yaml
 sink:
   type: elasticsearch
+  version: 8                 # 7 or 8; omit for 8
   hosts:
     - http://127.0.0.1:9200
   # username: elastic     # Basic auth; username and password must be set together
@@ -78,6 +105,7 @@ Full job: [`configs/demo-elasticsearch.yaml`](../../configs/demo-elasticsearch.y
 | Option | Required | Default | Type | Description |
 | --- | --- | --- | --- | --- |
 | `type` | yes | — | String | Must be `elasticsearch` |
+| `version` | no | `8` | Int | Target major version: `7` or `8`. Any other value is rejected; the client is never probed from the server |
 | `hosts` | yes | — | String or list | `http(s)://host:port` entries. Credentials embedded in a URL are removed from error messages |
 | `username` | no | — | String | Basic auth user; must be paired with `password` |
 | `password` | no | — | String | Basic auth password; must be paired with `username` |
@@ -92,7 +120,7 @@ Full job: [`configs/demo-elasticsearch.yaml`](../../configs/demo-elasticsearch.y
 
 `sink.auto-create-table` belongs to the MySQL sink and is rejected for
 Elasticsearch: index creation is controlled by `sink.auto-create` only. ES-only
-keys (`hosts`, `index-name`, `mapping-file`, `request-timeout`,
+keys (`hosts`, `version`, `index-name`, `mapping-file`, `request-timeout`,
 `bulk-max-bytes`, `auto-create`) are rejected for other sink types.
 
 ## Startup, catalog, and `auto-create`
@@ -342,6 +370,11 @@ go test ./...
 make integration-es-up              # compose: MySQL + Elasticsearch 8.15 (security off)
 make integration-es-integration     # go test -tags esintegration ./connector/sink/elasticsearch/
 
+# 2b. Integration of the v7 adapter against a real ES7.17 (same build tag)
+make integration-es7-up             # compose: Elasticsearch 7.17 on 127.0.0.1:19201
+make integration-es7-integration    # only TestElasticsearch7* (v7 client, no MySQL)
+make integration-es7-down
+
 # 3. E2E: MySQL binlog -> runner -> ES8 (snapshot, DML, route/transform,
 #    checkpoint restart, mapping conflict, consistency)
 make integration-es-e2e
@@ -358,8 +391,8 @@ What each layer proves:
 
 | Layer | Needs | Checks |
 | --- | --- | --- |
-| unit | nothing | mapping derivation, `_id` hashing, bulk item classification, byte-budget splitting (exact NDJSON boundaries, 50×2 MiB), retries (fake client and `httptest`) |
-| Integration | ES8 | index create / `auto-create=false` failure, mapping compatibility, explicit mapping file, per-type storage read back over HTTP, insert/update/delete, idempotent re-index, composite keys, shared index, bulk partial failure |
+| unit | nothing | mapping derivation, `_id` hashing, bulk item classification, byte-budget splitting (exact NDJSON boundaries, 50×2 MiB), retries (fake client and `httptest`), version selection (default 8, `7`, `8`, invalid) |
+| Integration | ES8 / ES7.17 | index create / `auto-create=false` failure, mapping compatibility, explicit mapping file, per-type storage read back over HTTP, insert/update/delete, idempotent re-index, composite keys, shared index, bulk partial failure, schema re-check; the ES7 suite reuses the same harness through the v7 adapter |
 | E2E | MySQL + ES8 | snapshot then binlog, Transform/Route (final table + index + `_id`), checkpoint restart, binlog-only catalog, mapping conflict, ES-unavailable errors, document-level consistency |
 | Load | MySQL + ES8 | sustained insert/update/delete + mixed DML, `write-batch-size` sweep, peak writers, bounded catch-up, streaming checksums (`COUNT, SUM(id), SUM(CRC32)`) |
 | Scale | MySQL + ES8 | 5 DBs / 20 tables (normal) and 10 DBs / 50 tables + hotspot burst/peak (heavy), per-table checksums, marker and content samples |
@@ -383,6 +416,10 @@ Notes:
 docker run --rm -p 9200:9200 -e discovery.type=single-node \
   -e xpack.security.enabled=false docker.elastic.co/elasticsearch/elasticsearch:8.15.0
 ```
+
+For Elasticsearch 7, run the same steps against
+`docker.elastic.co/elasticsearch/elasticsearch:7.17.24` and add `version: 7` to
+`sink`.
 
 1. Point `configs/demo-elasticsearch.yaml` at `http://127.0.0.1:9200`, set
    `auto-create: true`, run `./bin/go-cdc configs/demo-elasticsearch.yaml`, and

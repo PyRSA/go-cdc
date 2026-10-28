@@ -42,12 +42,32 @@ const (
 	// DefaultBulkMaxBytes caps one Elasticsearch bulk request body. Elasticsearch
 	// rejects a body above its http.max_content_length (100mb by default) with 413.
 	DefaultBulkMaxBytes = 5 << 20 // 5 MiB of NDJSON
+	// Elasticsearch major versions the sink can write to. One value per official
+	// Go client: ElasticsearchVersion7 selects go-elasticsearch/v7 and
+	// ElasticsearchVersion8 selects go-elasticsearch/v8.
+	ElasticsearchVersion7 = 7
+	ElasticsearchVersion8 = 8
 	// A bulk body above Elasticsearch's default limit cannot be delivered, so a
 	// larger budget would only move the failure to the cluster. The sink validates
 	// programmatic configs against the same range.
 	MinBulkMaxBytes = 1024
 	MaxBulkMaxBytes = 100 << 20
 )
+
+// ResolveElasticsearchVersion maps sink.version to the client major version.
+// Zero means "not configured" and keeps the historical v8 client, so existing
+// pipelines are unchanged. Any other unsupported value is an error: the sink
+// never falls back to a different client than the configured one, and it never
+// asks the cluster which version to use.
+func ResolveElasticsearchVersion(configured int) (int, error) {
+	switch configured {
+	case 0:
+		return ElasticsearchVersion8, nil
+	case ElasticsearchVersion7, ElasticsearchVersion8:
+		return configured, nil
+	}
+	return 0, fmt.Errorf("must be %d or %d", ElasticsearchVersion7, ElasticsearchVersion8)
+}
 
 // ValidateBulkMaxBytes checks a sink.bulk-max-bytes value. Zero means "not
 // configured" and selects DefaultBulkMaxBytes; every other value must stay in
@@ -70,6 +90,8 @@ func ValidateBulkMaxBytes(n int) error {
 var (
 	esOnlySinkKeys = map[string]struct{}{
 		"hosts": {}, "auto-create": {}, "index-name": {}, "mapping-file": {},
+		// version selects the Elasticsearch client major version.
+		"version": {},
 		// bulk-max-bytes bounds the ES bulk body only.
 		"bulk-max-bytes": {},
 		// request-timeout is deliberately absent: it is shared with Doris and
@@ -430,6 +452,12 @@ func parseSink(raw map[string]any) (Sink, error) {
 				return Sink{}, configf("sink.hosts", "%v", err)
 			}
 			out.Hosts = list
+		case "version":
+			n, err := asVersion(value)
+			if err != nil {
+				return Sink{}, configErr("sink.version", "must be 7 or 8")
+			}
+			out.Version = n
 		case "index-name":
 			out.IndexName = strings.TrimSpace(fmt.Sprint(value))
 		case "mapping-file":
@@ -692,6 +720,11 @@ func validateElasticsearch(out *Sink, used map[string]struct{}) error {
 	if _, ok := used["auto-create"]; !ok {
 		out.AutoCreate = false
 	}
+	version, err := ResolveElasticsearchVersion(out.Version)
+	if err != nil {
+		return configf("sink.version", "%v", err)
+	}
+	out.Version = version
 	if len(out.Hosts) == 0 {
 		return configErr("sink.hosts", "required")
 	}
@@ -974,6 +1007,15 @@ func asMap(value any) map[string]any {
 	default:
 		return nil
 	}
+}
+
+// asVersion parses sink.version strictly: asInt would read "7.5" as 7, but a
+// version is a whole major number or nothing.
+func asVersion(value any) (int, error) {
+	if raw, ok := value.(string); ok {
+		return strconv.Atoi(strings.TrimSpace(raw))
+	}
+	return asInt(value)
 }
 
 func asInt(value any) (int, error) {

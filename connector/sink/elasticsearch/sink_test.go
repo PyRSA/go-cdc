@@ -12,6 +12,8 @@ import (
 	"github.com/PyRSA/go-cdc/common/schema"
 	"github.com/PyRSA/go-cdc/composer/definition"
 	"github.com/PyRSA/go-cdc/connector/sink/elasticsearch/client"
+	esv7 "github.com/PyRSA/go-cdc/connector/sink/elasticsearch/client/v7"
+	esv8 "github.com/PyRSA/go-cdc/connector/sink/elasticsearch/client/v8"
 )
 
 func newTestSink(t *testing.T, mutate func(*definition.Sink)) (*Sink, *client.Fake) {
@@ -168,6 +170,76 @@ func TestNewBulkMaxBytesMatchesParserRange(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("bulk-max-bytes %d: %v", n, err)
 		}
+	}
+}
+
+func TestNewResolvesElasticsearchVersion(t *testing.T) {
+	// Zero means "not configured": existing pipelines keep the v8 client.
+	s, err := New(definition.Sink{Type: "elasticsearch", Hosts: []string{"http://h:9200"}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if s.cfg.Version != definition.ElasticsearchVersion8 {
+		t.Fatalf("version = %d, want %d by default", s.cfg.Version, definition.ElasticsearchVersion8)
+	}
+	for _, version := range []int{definition.ElasticsearchVersion7, definition.ElasticsearchVersion8} {
+		s, err := New(definition.Sink{
+			Type: "elasticsearch", Hosts: []string{"http://h:9200"}, Version: version,
+		})
+		if err != nil {
+			t.Fatalf("version %d: %v", version, err)
+		}
+		if s.cfg.Version != version {
+			t.Fatalf("version = %d, want %d", s.cfg.Version, version)
+		}
+	}
+}
+
+func TestNewRejectsUnsupportedVersion(t *testing.T) {
+	for _, version := range []int{-1, 6, 9} {
+		_, err := New(definition.Sink{
+			Type: "elasticsearch", Hosts: []string{"http://h:9200"}, Version: version,
+		})
+		if err == nil || !strings.Contains(err.Error(), "sink.version") {
+			t.Fatalf("version %d: error = %v, want a sink.version failure", version, err)
+		}
+	}
+}
+
+// The configured version decides the client: a v7 pipeline must not silently
+// keep the v8 adapter.
+func TestBuildAPIClientSelectsVersion(t *testing.T) {
+	cases := []struct {
+		version int
+		check   func(client.Client) bool
+	}{
+		{definition.ElasticsearchVersion7, func(cl client.Client) bool {
+			_, ok := cl.(*esv7.Client)
+			return ok
+		}},
+		{definition.ElasticsearchVersion8, func(cl client.Client) bool {
+			_, ok := cl.(*esv8.Client)
+			return ok
+		}},
+	}
+	for _, tc := range cases {
+		cl, err := buildAPIClient(definition.Sink{
+			Type: "elasticsearch", Hosts: []string{"http://127.0.0.1:9200"}, Version: tc.version,
+		}, time.Second)
+		if err != nil {
+			t.Fatalf("version %d: %v", tc.version, err)
+		}
+		if !tc.check(cl) {
+			t.Fatalf("version %d: client is %T", tc.version, cl)
+		}
+		if err := cl.Close(); err != nil {
+			t.Fatalf("version %d: close: %v", tc.version, err)
+		}
+	}
+	if _, err := buildAPIClient(definition.Sink{
+		Type: "elasticsearch", Hosts: []string{"http://127.0.0.1:9200"}, Version: 6,
+	}, time.Second); err == nil {
+		t.Fatal("buildAPIClient accepted an unsupported version")
 	}
 }
 

@@ -43,6 +43,16 @@ func integrationURL() string {
 	return defaultIntegrationURL
 }
 
+// defaultIntegrationURL7 is the ES 7 node the v7 adapter suite targets.
+const defaultIntegrationURL7 = "http://127.0.0.1:19201"
+
+func integrationURL7() string {
+	if raw := strings.TrimSpace(os.Getenv("ES7_URL")); raw != "" {
+		return raw
+	}
+	return defaultIntegrationURL7
+}
+
 // esCluster is the raw HTTP side of the test: independent of client/v8.
 type esCluster struct {
 	t    *testing.T
@@ -52,14 +62,21 @@ type esCluster struct {
 
 func newCluster(t *testing.T) *esCluster {
 	t.Helper()
-	c := &esCluster{t: t, base: integrationURL(), http: &http.Client{Timeout: 60 * time.Second}}
+	return newClusterAt(t, integrationURL(), "8.")
+}
+
+// newClusterAt verifies the cluster behind base speaks wantMajor, so the ES 7
+// suite reuses this harness without accepting an ES 8 node by mistake.
+func newClusterAt(t *testing.T, base, wantMajor string) *esCluster {
+	t.Helper()
+	c := &esCluster{t: t, base: base, http: &http.Client{Timeout: 60 * time.Second}}
 	status, body := c.do("GET", "/", nil)
 	if status != http.StatusOK {
 		t.Fatalf("Elasticsearch is not reachable at %s (status %d: %s); start it with "+
-			"`bash test/integration/scripts/es-up.sh`", c.base, status, body)
+			"`bash test/integration/scripts/es-up.sh` (ES 8) or `es7-up.sh` (ES 7)", c.base, status, body)
 	}
-	if !strings.HasPrefix(c.version(), "8.") {
-		t.Fatalf("integration cluster is %q, these tests target Elasticsearch 8", c.version())
+	if !strings.HasPrefix(c.version(), wantMajor) {
+		t.Fatalf("integration cluster is %q, these tests target Elasticsearch %s", c.version(), strings.TrimSuffix(wantMajor, "."))
 	}
 	return c
 }
@@ -261,8 +278,15 @@ func (c *esCluster) docExists(index, id string) bool {
 func newSink(t *testing.T, cfg definition.Sink) (*Sink, *esCluster) {
 	t.Helper()
 	cluster := newCluster(t)
+	return newSinkOn(t, cluster, cfg), cluster
+}
+
+// newSinkOn opens the production sink against an already-resolved cluster, so a
+// suite can target another server version without duplicating this wiring.
+func newSinkOn(t *testing.T, cluster *esCluster, cfg definition.Sink) *Sink {
+	t.Helper()
 	if len(cfg.Hosts) == 0 {
-		cfg.Hosts = []string{integrationURL()}
+		cfg.Hosts = []string{cluster.base}
 	}
 	if cfg.Type == "" {
 		cfg.Type = "elasticsearch"
@@ -285,7 +309,7 @@ func newSink(t *testing.T, cfg definition.Sink) (*Sink, *esCluster) {
 			t.Errorf("Close: %v", err)
 		}
 	})
-	return s, cluster
+	return s
 }
 
 // namespace returns a unique, valid index prefix for one test.

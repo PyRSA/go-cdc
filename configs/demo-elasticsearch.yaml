@@ -1,4 +1,4 @@
-# Quick start: MySQL → Elasticsearch 8
+# Quick start: MySQL → Elasticsearch 7/8
 # Edit hostname / hosts / tables, then:
 #   ./bin/go-cdc configs/demo-elasticsearch.yaml
 #
@@ -19,6 +19,8 @@ source:
 
 sink:
   type: elasticsearch
+  # Optional: target major version, 7 or 8 (default 8; any other value fails).
+  # version: 7
   hosts:
     - http://127.0.0.1:9200
   # Optional Basic auth. Username and password must be set together.

@@ -3,6 +3,7 @@ module github.com/PyRSA/go-cdc
 go 1.25.0
 
 require (
+	github.com/elastic/go-elasticsearch/v7 v7.17.10
 	github.com/elastic/go-elasticsearch/v8 v8.19.7
 	github.com/go-mysql-org/go-mysql v1.16.0
 	github.com/go-sql-driver/mysql v1.7.1

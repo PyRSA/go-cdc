@@ -1,5 +1,5 @@
-// Package elasticsearch writes routed CDC events to Elasticsearch 8 through
-// the official go-elasticsearch/v8 client.
+// Package elasticsearch writes routed CDC events to Elasticsearch 7 or 8
+// through the official go-elasticsearch v7/v8 client selected by sink.version.
 //
 // v1 is strict on purpose: a table must have a primary key, an existing index
 // mapping is never modified, and an event that cannot be encoded or confirmed
@@ -21,6 +21,7 @@ import (
 	"github.com/PyRSA/go-cdc/composer/definition"
 	"github.com/PyRSA/go-cdc/connector/sink"
 	"github.com/PyRSA/go-cdc/connector/sink/elasticsearch/client"
+	esv7 "github.com/PyRSA/go-cdc/connector/sink/elasticsearch/client/v7"
 	esv8 "github.com/PyRSA/go-cdc/connector/sink/elasticsearch/client/v8"
 )
 
@@ -33,7 +34,7 @@ const DefaultRequestTimeout = 30 * time.Second
 // (100mb by default) with HTTP 413, so the sink never builds one.
 const DefaultBulkMaxBytes = definition.DefaultBulkMaxBytes
 
-// Sink implements sink.Sink for Elasticsearch 8.
+// Sink implements sink.Sink for Elasticsearch 7 and 8.
 type Sink struct {
 	cfg          definition.Sink
 	timeout      time.Duration
@@ -64,6 +65,13 @@ func New(cfg definition.Sink) (*Sink, error) {
 	if cfg.MaxRetries < 0 {
 		return nil, errors.New("elasticsearch: sink.max-retries must be >= 0")
 	}
+	// Both the parser and a programmatic caller go through the same resolver, so
+	// the configured version is either 7 or 8 and never silently falls back.
+	version, err := definition.ResolveElasticsearchVersion(cfg.Version)
+	if err != nil {
+		return nil, fmt.Errorf("elasticsearch: sink.version %d: %v", cfg.Version, err)
+	}
+	cfg.Version = version
 	// Zero means "not configured" and selects the default; any other value must
 	// stay inside the range the YAML parser accepts, and both paths report the
 	// same reason.
@@ -146,18 +154,14 @@ func (s *Sink) SetClient(cl client.Client) {
 	s.owns = false
 }
 
-// Open builds the v8 client when none was injected and pings the cluster.
+// Open builds the client for the configured version when none was injected and
+// pings the cluster.
 func (s *Sink) Open(ctx context.Context) error {
 	s.mu.Lock()
 	cl := s.client
 	s.mu.Unlock()
 	if cl == nil {
-		created, err := esv8.New(esv8.Config{
-			Addresses:      append([]string(nil), s.cfg.Hosts...),
-			Username:       s.cfg.Username,
-			Password:       s.cfg.Password,
-			RequestTimeout: s.timeout,
-		})
+		created, err := buildAPIClient(s.cfg, s.timeout)
 		if err != nil {
 			return err
 		}
@@ -180,6 +184,33 @@ func (s *Sink) Open(ctx context.Context) error {
 		return fmt.Errorf("elasticsearch: ping %s: %w", safeAddresses(s.cfg.Hosts), err)
 	}
 	return nil
+}
+
+// buildAPIClient returns the official client adapter for the configured
+// version. Only the adapter differs: request construction, responses, and the
+// bulk NDJSON body are identical for both, so the sink business layer is shared.
+// The cluster version is never probed — a pipeline must keep using the client it
+// was configured with, even when it points at a different server version.
+func buildAPIClient(cfg definition.Sink, timeout time.Duration) (client.Client, error) {
+	addresses := append([]string(nil), cfg.Hosts...)
+	switch cfg.Version {
+	case definition.ElasticsearchVersion7:
+		return esv7.New(esv7.Config{
+			Addresses:      addresses,
+			Username:       cfg.Username,
+			Password:       cfg.Password,
+			RequestTimeout: timeout,
+		})
+	case definition.ElasticsearchVersion8:
+		return esv8.New(esv8.Config{
+			Addresses:      addresses,
+			Username:       cfg.Username,
+			Password:       cfg.Password,
+			RequestTimeout: timeout,
+		})
+	default:
+		return nil, fmt.Errorf("elasticsearch: sink.version %d is not supported", cfg.Version)
+	}
 }
 
 // CreateTable validates the primary key, resolves the index name, creates the
