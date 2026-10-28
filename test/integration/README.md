@@ -134,6 +134,7 @@ Jobs:
 | `mysql-scale-e2e` | MySQL **8.0 only** | scale `normal` or `heavy` (separate compose project / host port `13307`) |
 | `doris-e2e` | MySQL **8.0** + Doris **2.1.8** | MySQL→Doris pipeline TP-DR01..DR07 (functional + load) + sink Go suite + Doris scale ([`doris-integration.yml`](../../.github/workflows/doris-integration.yml)) |
 | `elasticsearch-e2e` | MySQL **8.0** + compose ES8 | ES sink: Go IT (`esintegration`), E2E, load, scale `normal` |
+| `elasticsearch7-integration` | compose ES7.17 | v7 client adapter: Go IT (`esintegration`, `TestElasticsearch7*`) |
 
 **Load tier** (`LOAD_ROWS_PER_TABLE`):
 
@@ -290,3 +291,22 @@ Isolation and knobs:
   per `Sink.Write`, flushed on size, on interval, and on any split / position /
   watermark / captured message (`composer/runner.go`). Snapshot chunks and binlog
   events share that path, so both are exercised by the sweep.
+
+## Elasticsearch 7 integration (v7 client adapter)
+
+The ES7 suite is the same test binary as the ES8 Integration layer, run against a
+second cluster with `sink.version: 7`. It reuses the ES8 harness
+(`es_integration_test.go`) and only adds ES7-specific coverage (adapter wiring,
+typeless mapping, schema re-check, close/error paths). It needs no MySQL.
+
+```bash
+bash test/integration/scripts/es7-up.sh            # compose service `elasticsearch7` (7.17.24, host port 19201)
+bash test/integration/scripts/run-es7-integration.sh  # -run 'TestElasticsearch7'
+bash test/integration/scripts/es7-down.sh
+```
+
+Knobs: `ES7_URL` (default `http://127.0.0.1:19201`), `ES7_IMAGE`, `ES7_HEAP`,
+`ES7_HOST_PORT`. The ES8 runner filters `-run 'TestES'`, so the ES7 tests never
+run against an ES8 node and vice versa. Verified server: Elasticsearch 7.17.x;
+7.0–7.16 are not verified (the Go 7.17 client requires the `X-Elastic-Product`
+header, available from 7.14).

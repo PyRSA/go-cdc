@@ -11,7 +11,8 @@ GOLANGCI_LINT_VERSION ?= v2.1.6
 	integration-scale-normal integration-scale-heavy \
 	integration-es-up integration-es-down integration-es-integration \
 	integration-es-e2e integration-es-load \
-	integration-es-scale-normal integration-es-scale-heavy
+	integration-es-scale-normal integration-es-scale-heavy \
+	integration-es7-up integration-es7-down integration-es7-integration
 
 build:
 	$(GO) build -o bin/go-cdc ./cmd/go-cdc
@@ -107,6 +108,16 @@ integration-es-scale-normal:
 # Stress profile: 10 source DBs + 50k rows/hotspot + 45s peak. Explicit opt-in.
 integration-es-scale-heavy:
 	bash test/integration/scripts/run-es-scale.sh heavy
+
+# Elasticsearch 7 (v7 client adapter): only the Go-level sink IT, no MySQL.
+integration-es7-up:
+	bash test/integration/scripts/es7-up.sh
+
+integration-es7-down:
+	bash test/integration/scripts/es7-down.sh
+
+integration-es7-integration:
+	bash test/integration/scripts/run-es7-integration.sh
 
 clean:
 	$(GO) clean -i ./...

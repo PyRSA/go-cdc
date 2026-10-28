@@ -4,6 +4,7 @@
 #   MYSQL_IMAGE=mysql:5.7.42 MYSQL_TAG=57 bash scripts/mysql-up.sh
 # Kafka: bash scripts/kafka-up.sh (same COMPOSE_PROJECT_NAME as mysql-up).
 # Elasticsearch 8 (security off, single node): bash scripts/es-up.sh
+# Elasticsearch 7.17 (security off, single node): bash scripts/es7-up.sh
 services:
   mysql:
     image: ${MYSQL_IMAGE:-mysql:8.0.36}
@@ -81,6 +82,36 @@ services:
       xpack.security.transport.ssl.enabled: "false"
       ES_JAVA_OPTS: "-Xms${ES_HEAP:-512m} -Xmx${ES_HEAP:-512m}"
       # Bulk/scroll plus a small disk image: never trip the watermark checks.
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+      action.destructive_requires_name: "true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS 'http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+      start_period: 30s
+
+  # Single-node ES7 for the v7 client adapter suite (host → 127.0.0.1:${ES7_HOST_PORT}).
+  # Kept separate from the ES8 node so both sinks can be verified on one machine.
+  elasticsearch7:
+    image: ${ES7_IMAGE:-docker.elastic.co/elasticsearch/elasticsearch:7.17.24}
+    # Gated behind the es7 profile: mysql-up.sh runs a full `docker compose up`,
+    # which must not start this node (port 19201, extra heap) for unrelated jobs.
+    profiles: ["es7"]
+    ports:
+      - "${ES7_HOST_PORT:-19201}:9200"
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms${ES7_HEAP:-512m} -Xmx${ES7_HEAP:-512m}"
       cluster.routing.allocation.disk.threshold_enabled: "false"
       action.destructive_requires_name: "true"
     ulimits:

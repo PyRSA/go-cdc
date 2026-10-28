@@ -62,6 +62,34 @@ func TestParseElasticsearchDefaults(t *testing.T) {
 	if sink.IndexName != "" || sink.MappingFile != "" || len(sink.Mapping) != 0 {
 		t.Fatalf("unexpected index/mapping: %+v", sink)
 	}
+	// An unconfigured version keeps the historical Elasticsearch 8 client.
+	if sink.Version != ElasticsearchVersion8 {
+		t.Fatalf("version=%d, want the default %d", sink.Version, ElasticsearchVersion8)
+	}
+}
+
+func TestParseElasticsearchVersion(t *testing.T) {
+	for _, version := range []int{ElasticsearchVersion7, ElasticsearchVersion8} {
+		pipe, err := parseES(t, fmt.Sprintf("  version: %d", version))
+		if err != nil {
+			t.Fatalf("version %d: %v", version, err)
+		}
+		if pipe.Sink.Version != version {
+			t.Fatalf("version=%d, want %d", pipe.Sink.Version, version)
+		}
+	}
+}
+
+func TestParseElasticsearchVersionRejects(t *testing.T) {
+	// Only the two client majors exist: anything else must fail instead of
+	// falling back to a different client than the one configured.
+	for _, bad := range []string{"6", "9", "7.5", "v7", ""} {
+		_, err := parseES(t, fmt.Sprintf("  version: %q", bad))
+		cfg, ok := err.(*ConfigError)
+		if !ok || cfg.Field != "sink.version" {
+			t.Fatalf("version %q: got %v, want a sink.version failure", bad, err)
+		}
+	}
 }
 
 func TestParseElasticsearchExplicitOptions(t *testing.T) {
@@ -198,6 +226,8 @@ func TestParseElasticsearchKeysAreSinkScoped(t *testing.T) {
 	}{
 		{"hosts on stdout", "  type: stdout\n  hosts: [http://127.0.0.1:9200]", "sink.hosts"},
 		{"auto-create on stdout", "  type: stdout\n  auto-create: true", "sink.auto-create"},
+		{"version on stdout", "  type: stdout\n  version: 7", "sink.version"},
+		{"version on kafka", "  type: kafka\n  brokers: 127.0.0.1:9092\n  topic: cdc\n  version: 7", "sink.version"},
 		{"bulk-max-bytes on stdout", "  type: stdout\n  bulk-max-bytes: 1048576", "sink.bulk-max-bytes"},
 		{"auto-create-table on kafka", "  type: kafka\n  brokers: 127.0.0.1:9092\n  topic: cdc\n  auto-create-table: true", "sink.auto-create-table"},
 		{"topic on elasticsearch", "  type: elasticsearch\n  hosts: [http://127.0.0.1:9200]\n  topic: cdc", "sink.topic"},

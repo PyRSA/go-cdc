@@ -390,6 +390,47 @@ jobs:
           bash scripts/es-down.sh
           bash scripts/mysql-down.sh
 
+  # ES7 (security off, 512m heap): only the Go-level v7 adapter suite. The
+  # ES8 job above keeps its own cluster, so neither run can mask the other.
+  elasticsearch7-integration:
+    name: Elasticsearch 7 (integration)
+    # No job-level if: cascade-skips when go-check is skipped.
+    needs: go-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      COMPOSE_PROJECT_NAME: gocdc-es7-80
+      MYSQL_TAG: "80"
+      ES7_IMAGE: docker.elastic.co/elasticsearch/elasticsearch:7.17.24
+      ES7_HEAP: 512m
+      ES7_HOST_PORT: "19201"
+
+    defaults:
+      run:
+        working-directory: test/integration
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Start Elasticsearch 7 (docker compose)
+        run: bash scripts/es7-up.sh
+
+      # Go sink against the real ES 7 node (build tag esintegration).
+      - name: Elasticsearch 7 integration (real cluster)
+        run: bash scripts/run-es7-integration.sh
+
+      - name: Tear down
+        if: always()
+        run: bash scripts/es7-down.sh
+
   mysql-scale-e2e:
     name: MySQL ${{ matrix.mysql }} scale
     # No job-level if: intentionally cascade-skips when go-check is skipped
