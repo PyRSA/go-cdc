@@ -17,6 +17,9 @@ source:
 sink:
   type: elasticsearch
   hosts: ["${ES_URL}"]
+  # Explicit major version: the ES8 suite renders the sink default (8) and the
+  # ES7 e2e run renders 7, so each run picks its adapter by configuration.
+  version: ${ES_SINK_VERSION}
   auto-create: true
   write-batch-size: 200
   write-batch-interval: 200ms

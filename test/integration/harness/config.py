@@ -11,6 +11,11 @@ import hashlib
 import os
 from pathlib import Path
 
+
+def env(name: str, default: str = "") -> str:
+    return os.environ.get(name, default)
+
+
 ROOT = Path(__file__).resolve().parents[3]  # go-cdc/
 IT_ROOT = Path(__file__).resolve().parents[1]  # test/integration/
 WORKDIR = IT_ROOT / "workdir"
@@ -21,13 +26,9 @@ REPORT_TYPES = REPORT_DIR / "mysql-mysql-types.md"
 REPORT_LOAD = REPORT_DIR / "mysql-mysql-load.md"
 REPORT_KAFKA = REPORT_DIR / "mysql-kafka.md"
 REPORT_DORIS = REPORT_DIR / "mysql-doris.md"
-REPORT_ES = REPORT_DIR / "mysql-elasticsearch.md"
+REPORT_ES = Path(env("REPORT_ES", str(REPORT_DIR / "mysql-elasticsearch.md")))
 REPORT_ES_LOAD = REPORT_DIR / "mysql-elasticsearch-load.md"
 REPORT_ES_SCALE_TMPL = "mysql-elasticsearch-scale-{profile}.md"
-
-
-def env(name: str, default: str = "") -> str:
-    return os.environ.get(name, default)
 
 
 MYSQL_HOST = env("MYSQL_HOST", "127.0.0.1")
@@ -95,6 +96,13 @@ ES_PASSWORD = env("ES_PASSWORD", "")
 ES_INDEX_PREFIX = env("ES_INDEX_PREFIX", ES_SNK_DB)
 ES_LOAD_INDEX_PREFIX = env("ES_LOAD_INDEX_PREFIX", ES_LOAD_SNK_DB)
 ES_REQUEST_TIMEOUT = float(env("ES_REQUEST_TIMEOUT", "30"))
+# sink.version rendered into the functional E2E fixtures. The ES8 suite renders
+# 8 (the sink default, so its behaviour is unchanged); the ES7 E2E run renders
+# 7, so the v7 adapter is exercised on purpose instead of relying on a probe.
+ES_SINK_VERSION = env("ES_SINK_VERSION", "8")
+# Guard for the E2E harness: refuse to seed a cluster of another major version
+# (empty disables the check). ES7 runs use "7"; ES8 runs leave it unset.
+ES_EXPECT_MAJOR = env("ES_EXPECT_MAJOR", "")
 # Scale suite: every final table lives under ``db_tp_scale_snk_<nn>``, which is
 # both the index-name namespace and the cleanup prefix.
 ES_SCALE_INDEX_PREFIX = env("ES_SCALE_INDEX_PREFIX", "db_tp_scale_snk_*")
@@ -288,6 +296,7 @@ def render_template(tpl_name: str, out_path: Path, extra: dict | None = None) ->
         "CDC_SERVER_ID_ES_RESTART": CDC_SERVER_ID_ES_RESTART,
         "CDC_SERVER_ID_ES_LOAD": CDC_SERVER_ID_ES_LOAD,
         "ES_URL": ES_URL,
+        "ES_SINK_VERSION": ES_SINK_VERSION,
         "ES_SRC_DB": ES_SRC_DB,
         "ES_SNK_DB": ES_SNK_DB,
         "ES_LOAD_SNK_DB": ES_LOAD_SNK_DB,

@@ -390,18 +390,20 @@ jobs:
           bash scripts/es-down.sh
           bash scripts/mysql-down.sh
 
-  # ES7 (security off, 512m heap): only the Go-level v7 adapter suite. The
-  # ES8 job above keeps its own cluster, so neither run can mask the other.
+  # ES7 (security off, 512m heap): the Go-level v7 adapter suite plus the CDC e2e
+  # harness with sink.version=7. The ES8 job above keeps its own cluster and its
+  # load/scale layers, so neither run can mask the other. No ES7 load/scale.
   elasticsearch7-integration:
-    name: Elasticsearch 7 (integration)
+    name: Elasticsearch 7 (integration + e2e)
     # No job-level if: cascade-skips when go-check is skipped.
     needs: go-check
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: read
     env:
       COMPOSE_PROJECT_NAME: gocdc-es7-80
+      MYSQL_IMAGE: mysql:8.0.36
       MYSQL_TAG: "80"
       ES7_IMAGE: docker.elastic.co/elasticsearch/elasticsearch:7.17.24
       ES7_HEAP: 512m
@@ -420,16 +422,45 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Start Elasticsearch 7 (docker compose)
-        run: bash scripts/es7-up.sh
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # mysql-up.sh waits through wait-for-mysql.sh, which needs mysqladmin (its
+      # pymysql fallback is only installed by run-es7-e2e.sh much later), so the
+      # client tools must exist before the containers start.
+      - name: Install client tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y mysql-client
+          python3 -m pip install -r harness/requirements.txt
+
+      # Offline check of the e2e target guard (no containers, no cluster).
+      - name: ES7 e2e guard unit tests
+        run: python3 -m unittest harness.test_es_target
+
+      # MySQL only: the ES7 job needs no Kafka and no ES8 node.
+      - name: Start MySQL 8.0 + Elasticsearch 7 (docker compose)
+        env:
+          MYSQL_UP_SERVICES: mysql
+        run: |
+          bash scripts/mysql-up.sh
+          bash scripts/es7-up.sh
 
       # Go sink against the real ES 7 node (build tag esintegration).
       - name: Elasticsearch 7 integration (real cluster)
         run: bash scripts/run-es7-integration.sh
 
+      # MySQL binlog -> runner -> ES7, sink.version=7 (same harness as ES8).
+      - name: Elasticsearch 7 e2e harness
+        run: bash scripts/run-es7-e2e.sh
+
       - name: Tear down
         if: always()
-        run: bash scripts/es7-down.sh
+        run: |
+          bash scripts/es7-down.sh
+          bash scripts/mysql-down.sh
 
   mysql-scale-e2e:
     name: MySQL ${{ matrix.mysql }} scale

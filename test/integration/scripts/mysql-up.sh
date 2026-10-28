@@ -32,7 +32,10 @@ log "==> MySQL image ${MYSQL_IMAGE} (tag=${MYSQL_TAG}, project=${COMPOSE_PROJECT
 # Recreate volume so init scripts re-run when switching versions.
 docker compose down -v --remove-orphans >/dev/null 2>&1 || true
 docker compose pull mysql 2>/dev/null || true
-docker compose up -d --wait 2>/dev/null || docker compose up -d
+# MYSQL_UP_SERVICES narrows the startup set for suites that need MySQL only
+# (e.g. `MYSQL_UP_SERVICES=mysql`); unset keeps the historical full project up.
+# shellcheck disable=SC2086  # the service list is meant to be word-split
+docker compose up -d --wait ${MYSQL_UP_SERVICES:-} 2>/dev/null || docker compose up -d ${MYSQL_UP_SERVICES:-}
 
 export WAIT_MYSQL_USER="${WAIT_MYSQL_USER:-root}"
 export WAIT_MYSQL_PASSWORD="${WAIT_MYSQL_PASSWORD:-rootpass}"

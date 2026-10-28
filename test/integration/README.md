@@ -292,21 +292,43 @@ Isolation and knobs:
   watermark / captured message (`composer/runner.go`). Snapshot chunks and binlog
   events share that path, so both are exercised by the sweep.
 
-## Elasticsearch 7 integration (v7 client adapter)
+## Elasticsearch 7 sink suites (v7 client adapter)
 
-The ES7 suite is the same test binary as the ES8 Integration layer, run against a
-second cluster with `sink.version: 7`. It reuses the ES8 harness
+The ES7 Integration layer is the same test binary as the ES8 Integration layer,
+run against a second cluster with `sink.version: 7`. It reuses the ES8 harness
 (`es_integration_test.go`) and only adds ES7-specific coverage (adapter wiring,
 typeless mapping, schema re-check, close/error paths). It needs no MySQL.
 
+The ES7 E2E layer is the ES8 E2E harness (`harness/es_it.py`, TP-E01..TP-E10)
+re-run with `sink.version=7` and `ES_EXPECT_MAJOR=7`: real MySQL source,
+snapshot + binlog, the real `go-cdc` binary, and a real 7.17 node. It needs
+MySQL, so `es7-up.sh` alone is not enough for that layer.
+
 ```bash
-bash test/integration/scripts/es7-up.sh            # compose service `elasticsearch7` (7.17.24, host port 19201)
+# Integration (ES7 only)
+bash test/integration/scripts/es7-up.sh              # service `elasticsearch7` (7.17.24, host port 19201)
 bash test/integration/scripts/run-es7-integration.sh  # -run 'TestElasticsearch7'
 bash test/integration/scripts/es7-down.sh
+
+# E2E (MySQL + ES7; the ES8 node and Kafka are not started)
+MYSQL_UP_SERVICES=mysql bash test/integration/scripts/mysql-up.sh
+bash test/integration/scripts/es7-up.sh
+bash test/integration/scripts/run-es7-e2e.sh          # report: mysql-elasticsearch7.md
 ```
 
+Equivalent Make targets: `make integration-es7-up`, `integration-es7-integration`,
+`integration-es7-e2e-up`, `integration-es7-e2e`, `integration-es7-down`.
+
+| Layer | Harness | Report |
+| --- | --- | --- |
+| Integration | `go test -tags esintegration -run TestElasticsearch7 ...` (real ES7) | `go test` output |
+| E2E | `harness/es_it.py` with `sink.version=7` (TP-E01..) | `docs/test/reports/mysql-elasticsearch7.md` |
+
 Knobs: `ES7_URL` (default `http://127.0.0.1:19201`), `ES7_IMAGE`, `ES7_HEAP`,
-`ES7_HOST_PORT`. The ES8 runner filters `-run 'TestES'`, so the ES7 tests never
-run against an ES8 node and vice versa. Verified server: Elasticsearch 7.17.x;
-7.0–7.16 are not verified (the Go 7.17 client requires the `X-Elastic-Product`
-header, available from 7.14).
+`ES7_HOST_PORT`, plus the ES8 E2E knobs (`ES_SRC_DB`, `ES_SNK_DB`, `ES_URL`) and
+`ES_SINK_VERSION` / `ES_EXPECT_MAJOR` for the harness. The ES8 runner filters
+`-run 'TestES'`, so the ES7 tests never run against an ES8 node and vice versa;
+the E2E harness fails fast when the cluster major version does not match
+`ES_EXPECT_MAJOR`, or when a fixture stops pinning `sink.version`. Verified
+server: Elasticsearch 7.17.x; 7.0–7.16 are not verified (the Go 7.17 client
+requires the `X-Elastic-Product` header, available from 7.14).
