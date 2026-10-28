@@ -723,10 +723,56 @@ func TestParsePostgresSinkDefaults(t *testing.T) {
 	if sink.AutoCreate {
 		t.Fatal("postgresql must not default to auto-create")
 	}
+	if sink.SchemaChange {
+		t.Fatal("postgresql must not default to schema changes")
+	}
+	if sink.DropTruncate {
+		t.Fatal("postgresql must not default to drop/truncate")
+	}
+	if sink.SchemaChangeInclude != nil {
+		t.Fatalf("include %v", sink.SchemaChangeInclude)
+	}
 	if sink.WriteBatchSize != 1000 || sink.MaxRetries != 3 || sink.WriteBatchEvery != time.Second {
 		t.Fatalf("shared defaults lost: %#v", sink)
 	}
 }
+
+// TestParsePostgresSinkSchemaChangeOptions pins the options the PostgreSQL sink
+// owns. They stay rejected for every other sink type, so the shared key lists
+// must keep their meaning.
+func TestParsePostgresSinkSchemaChangeOptions(t *testing.T) {
+	body := postgresPipeline(`  type: postgresql
+  hostname: pg.internal
+  username: cdc
+  password: secret
+  database: target
+  auto-create-table: true
+  schema.change.enabled: true
+  schema.change.include: add.column,drop.column,rename.column,modify.column,drop.table,truncate
+  schema.change.drop-truncate.enabled: true
+`)
+	pipe, err := Parse([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := pipe.Sink
+	if !sink.AutoCreate || !sink.SchemaChange || !sink.DropTruncate {
+		t.Fatalf("schema change options did not reach the sink: %#v", sink)
+	}
+	want := []string{"add.column", "drop.column", "rename.column", "modify.column", "drop.table", "truncate"}
+	if len(sink.SchemaChangeInclude) != len(want) {
+		t.Fatalf("include %v", sink.SchemaChangeInclude)
+	}
+	for i, kind := range want {
+		if sink.SchemaChangeInclude[i] != kind {
+			t.Fatalf("include %v, want %v", sink.SchemaChangeInclude, want)
+		}
+	}
+}
+
+// TestParsePostgresChangeKindsMatchSink is in the connector package: the sink
+// owns the vocabulary and imports this package, so the equality can only be
+// asserted from that side without an import cycle.
 
 func TestParsePostgresSinkKeepsExplicitValues(t *testing.T) {
 	body := postgresPipeline(`  type: postgresql
@@ -837,19 +883,14 @@ func TestParsePostgresSinkRejects(t *testing.T) {
 			field: "sink.database",
 		},
 		{
-			name:  "auto create true",
-			body:  valid + "  auto-create-table: true\n",
-			field: "sink.auto-create-table",
+			name:  "doris wait timeout",
+			body:  valid + "  schema.change.wait-timeout: 5s\n",
+			field: "sink.schema.change.wait-timeout",
 		},
 		{
-			name:  "mysql drop truncate",
-			body:  valid + "  schema.change.drop-truncate.enabled: true\n",
-			field: "sink.schema.change.drop-truncate.enabled",
-		},
-		{
-			name:  "doris schema change",
-			body:  valid + "  schema.change.enabled: true\n",
-			field: "sink.schema.change.enabled",
+			name:  "include outside the sink vocabulary",
+			body:  valid + "  schema.change.include: create.table\n",
+			field: "sink.schema.change.include",
 		},
 		{
 			name:  "doris sql port",

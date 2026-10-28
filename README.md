@@ -9,7 +9,7 @@ go-cdc is a YAML-driven Change Data Capture (CDC) tool. You describe one sync jo
 Features in this release:
 
 - MySQL source (snapshot + binlog)
-- Stdout sink (newline-delimited JSON), MySQL sink, Kafka sink (at-least-once), Doris sink (UNIQUE KEY + Stream Load, at-least-once), Elasticsearch 7/8/9 sink (`sink.version`, default 8), and PostgreSQL sink (current-state DML; tables must pre-exist)
+- Stdout sink (newline-delimited JSON), MySQL sink, Kafka sink (at-least-once), Doris sink (UNIQUE KEY + Stream Load, at-least-once), Elasticsearch 7/8/9 sink (`sink.version`, default 8), and PostgreSQL sink (current-state DML, with opt-in table creation and schema evolution)
 - Projection, filter, table route, schema-change policy, file checkpoints
 - **Note:** stdout JSON now uses the shared Debezium-inspired envelope (`source.db` / `source.table`); older top-level `database` / `table` fields are gone
 

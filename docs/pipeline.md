@@ -163,7 +163,18 @@ DDL comes from the source when `source.schema-change.enabled` is `true` (default
 | CREATE TABLE | Applied through `auto-create-table` / the inferred schema, then validated |
 | Other / unprojected columns | Ignored when no Doris action is required |
 
-**PostgreSQL sink** does not handle DDL in this release: any schema change stops the job with an explicit error and the checkpoint does not advance, so the target table never drifts silently behind the source. Set `source.schema-change.enabled: false` only if you accept that the target table is maintained outside `go-cdc`.
+**PostgreSQL** applies column changes from the source definition, in its own dialect, and only when the switches say so. Rows still held by the runner are flushed before any DDL runs, and every applied change is re-read from `pg_catalog` before the checkpoint moves past it:
+
+| DDL kind | PostgreSQL sink |
+| --- | --- |
+| Add / drop / rename / change / modify column | Applied when `schema.change.enabled: true` and `schema.change.include` names the kind (an empty list names all of them); otherwise the job fails with an error naming the switch |
+| DROP TABLE / TRUNCATE | Applied only when the kind is included **and** `schema.change.drop-truncate.enabled: true`; refused either way without the switch |
+| CREATE TABLE | Not applied as raw SQL; built from the source definition and validated, and only when `auto-create-table: true` |
+| Index | A plain non-unique secondary index is skipped with a warning — PostgreSQL plans its own access path; a statement that touches a primary key, a unique key, or a constraint, and anything that cannot be classified, fails the job |
+| RENAME TABLE / other | Fails the job; apply it by hand |
+| Columns outside the projection | Ignored, exactly as in the other sinks: no target action is required |
+
+Details: [PostgreSQL Sink](connectors/postgresql-sink.md#schema-evolution).
 
 Details: [MySQL Source](connectors/mysql-source.md), [MySQL Sink](connectors/mysql-sink.md), [Stdout Sink](connectors/stdout-sink.md), [Kafka Sink](connectors/kafka-sink.md), [Doris Sink](connectors/doris-sink.md), [Elasticsearch Sink](connectors/elasticsearch-sink.md), [PostgreSQL Sink](connectors/postgresql-sink.md).
 
