@@ -1,6 +1,6 @@
 // Package client defines the Elasticsearch operations the sink needs behind a
-// version-independent interface. v1 ships the official v8 adapter only; the
-// sink business layer never imports an Elasticsearch SDK.
+// version-independent interface. The sink ships the official v7, v8 and v9
+// adapters; the sink business layer never imports an Elasticsearch SDK.
 package client
 
 import (

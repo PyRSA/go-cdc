@@ -69,7 +69,9 @@ func TestParseElasticsearchDefaults(t *testing.T) {
 }
 
 func TestParseElasticsearchVersion(t *testing.T) {
-	for _, version := range []int{ElasticsearchVersion7, ElasticsearchVersion8} {
+	for _, version := range []int{
+		ElasticsearchVersion7, ElasticsearchVersion8, ElasticsearchVersion9,
+	} {
 		pipe, err := parseES(t, fmt.Sprintf("  version: %d", version))
 		if err != nil {
 			t.Fatalf("version %d: %v", version, err)
@@ -81,9 +83,9 @@ func TestParseElasticsearchVersion(t *testing.T) {
 }
 
 func TestParseElasticsearchVersionRejects(t *testing.T) {
-	// Only the two client majors exist: anything else must fail instead of
+	// Only the three client majors exist: anything else must fail instead of
 	// falling back to a different client than the one configured.
-	for _, bad := range []string{"6", "9", "7.5", "v7", ""} {
+	for _, bad := range []string{"6", "10", "7.5", "v7", ""} {
 		_, err := parseES(t, fmt.Sprintf("  version: %q", bad))
 		cfg, ok := err.(*ConfigError)
 		if !ok || cfg.Field != "sink.version" {

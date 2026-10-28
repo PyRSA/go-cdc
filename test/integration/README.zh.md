@@ -113,6 +113,8 @@ bash test/integration/scripts/run-doris-scale.sh normal
 | `mysql-scale-e2e` | 仅 MySQL **8.0** | scale `normal` / `heavy`（独立 compose 项目，宿主机端口 `13307`） |
 | `doris-e2e` | MySQL **8.0** + Doris **2.1.8** | MySQL→Doris 流水线 TP-DR01..DR07（功能 + 负载）+ sink Go 套件 + Doris 规模（[`doris-integration.yml`](../../.github/workflows/doris-integration.yml)） |
 | `elasticsearch-e2e` | MySQL **8.0** + compose ES8 | ES sink：Go IT（`esintegration`）+ E2E + 负载 + scale `normal` |
+| `elasticsearch7-integration` | compose ES7.17 | v7 适配器：Go IT（`esintegration`，`TestElasticsearch7*`） |
+| `elasticsearch9-integration` | compose ES9.5 | v9 适配器：Go IT（`esintegration`，`TestElasticsearch9*`）+ E2E（`sink.version=9`） |
 
 **负载分档**（`LOAD_ROWS_PER_TABLE`）：PR / `main` / `master` / `release-*` → **100000**（`LOAD_PROFILE=full`）；其他分支 push → **30000**（`normal`）。峰值：5.7 / 8.0 均为 **60s×4**。Doris `doris-e2e` 使用同一分档（5 张批量表）；`workflow_dispatch` 可显式选 `normal` / `full`。
 
@@ -206,3 +208,30 @@ bash test/integration/scripts/run-es-scale.sh heavy   # 10 库 / 50 表 + 热点
 - `write-batch-size` / `write-batch-interval` 是 runner 级 knob：一次 `Sink.Write` 对应一个 bulk，按大小、按间隔、以及任何 split / position / watermark / captured 消息触发 flush（`composer/runner.go`），快照分块与 binlog 事件走同一条路径。
 
 校验原则：不把 bulk HTTP 200 当数据正确性证据；`_count` 只做进度门槛，内容一致性用分页（scroll，1000 条/页）流式算出 `(COUNT, SUM(id), SUM(CRC32))` 与 MySQL 比对，并额外做整文档字段比对（NULL / DECIMAL / JSON / 二进制 / 日期时间）。
+
+## Elasticsearch 7 / 9 变体套件（v7 / v9 客户端适配器）
+
+ES7 与 ES9 复用同一份 Integration 测试二进制（`es_integration_test.go`），只是集群与 `sink.version` 不同：ES7 用 `es7_integration_test.go`，ES9 用 `es9_integration_test.go`（同样覆盖适配器接线、typeless mapping、Schema 重校验、Close/错误路径）。Integration 层不需要 MySQL。
+
+E2E 层是同一个 `harness/es_it.py`（TP-E01..TP-E10）换 `sink.version` / `ES_EXPECT_MAJOR` 重跑，因此需要 MySQL。
+
+```bash
+# Integration（只起 ES9）
+bash test/integration/scripts/es9-up.sh              # compose 服务 elasticsearch9（9.5.2，宿主端口 19202）
+bash test/integration/scripts/run-es9-integration.sh  # -run 'TestElasticsearch9'
+bash test/integration/scripts/es9-down.sh
+
+# E2E（MySQL + ES9；不启动 ES8/ES7 与 Kafka）
+MYSQL_UP_SERVICES=mysql bash test/integration/scripts/mysql-up.sh
+bash test/integration/scripts/es9-up.sh
+bash test/integration/scripts/run-es9-e2e.sh          # 报告：mysql-elasticsearch9.md
+```
+
+ES7 把上面命令中的 `es9` 换成 `es7`（宿主端口 19201，报告 `mysql-elasticsearch7.md`）。对应 Make 目标：`make integration-es7-up` / `integration-es7-integration` / `integration-es7-e2e` / `integration-es7-down`，以及 `integration-es9-*` 同名系列。
+
+| 层级 | 入口 | 报告 |
+| --- | --- | --- |
+| Integration | `go test -tags esintegration -run TestElasticsearch7` 或 `TestElasticsearch9`（真实集群） | `go test` 输出 |
+| E2E | `harness/es_it.py`，`ES_SINK_VERSION` / `ES_EXPECT_MAJOR` 为 `7` 或 `9` | `docs/test/reports/mysql-elasticsearch{7,9}.md` |
+
+knob：`ES7_URL`（默认 `http://127.0.0.1:19201`）、`ES9_URL`（默认 `http://127.0.0.1:19202`）、`ES7_IMAGE` / `ES9_IMAGE`、`ES7_HEAP` / `ES9_HEAP`、`ES7_HOST_PORT` / `ES9_HOST_PORT`，以及共享的 `ES_SRC_DB`、`ES_SNK_DB`、`ES_URL`。两个节点都在 compose profile（`es7` / `es9`）之后，默认服务列表与其他 Job 不会启动它们。目标服务端：ES 7.17.x、ES 9.5.x（CI Job `elasticsearch7-integration` / `elasticsearch9-integration`）。

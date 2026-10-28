@@ -89,8 +89,8 @@ type Sink struct {
 
 	// Elasticsearch. AutoCreate defaults to false for this sink; mapping-file is
 	// read and validated at parse time and kept as the Create Index body.
-	// Version is the target major version (7 or 8); Parse and New both resolve
-	// the zero value to ElasticsearchVersion8.
+	// Version is the target major version (7, 8 or 9); Parse and New both
+	// resolve the zero value to ElasticsearchVersion8.
 	Version     int
 	Hosts       []string
 	IndexName   string

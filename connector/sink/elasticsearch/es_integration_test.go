@@ -53,6 +53,16 @@ func integrationURL7() string {
 	return defaultIntegrationURL7
 }
 
+// defaultIntegrationURL9 is the ES 9 node the v9 adapter suite targets.
+const defaultIntegrationURL9 = "http://127.0.0.1:19202"
+
+func integrationURL9() string {
+	if raw := strings.TrimSpace(os.Getenv("ES9_URL")); raw != "" {
+		return raw
+	}
+	return defaultIntegrationURL9
+}
+
 // esCluster is the raw HTTP side of the test: independent of client/v8.
 type esCluster struct {
 	t    *testing.T
@@ -73,7 +83,8 @@ func newClusterAt(t *testing.T, base, wantMajor string) *esCluster {
 	status, body := c.do("GET", "/", nil)
 	if status != http.StatusOK {
 		t.Fatalf("Elasticsearch is not reachable at %s (status %d: %s); start it with "+
-			"`bash test/integration/scripts/es-up.sh` (ES 8) or `es7-up.sh` (ES 7)", c.base, status, body)
+			"`bash test/integration/scripts/es-up.sh` (ES 8), `es7-up.sh` (ES 7) or `es9-up.sh` (ES 9)",
+			c.base, status, body)
 	}
 	if !strings.HasPrefix(c.version(), wantMajor) {
 		t.Fatalf("integration cluster is %q, these tests target Elasticsearch %s", c.version(), strings.TrimSuffix(wantMajor, "."))

@@ -462,6 +462,78 @@ jobs:
           bash scripts/es7-down.sh
           bash scripts/mysql-down.sh
 
+  # ES9 (security off, 512m heap): the Go-level v9 adapter suite plus the CDC e2e
+  # harness with sink.version=9. Its own compose project and host port keep it
+  # independent of the ES7 and ES8 jobs. No ES9 load/scale.
+  elasticsearch9-integration:
+    name: Elasticsearch 9 (integration + e2e)
+    # No job-level if: cascade-skips when go-check is skipped.
+    needs: go-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      COMPOSE_PROJECT_NAME: gocdc-es9-80
+      MYSQL_IMAGE: mysql:8.0.36
+      MYSQL_TAG: "80"
+      ES9_IMAGE: docker.elastic.co/elasticsearch/elasticsearch:9.5.2
+      ES9_HEAP: 512m
+      ES9_HOST_PORT: "19202"
+
+    defaults:
+      run:
+        working-directory: test/integration
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # mysql-up.sh waits through wait-for-mysql.sh, which needs mysqladmin (its
+      # pymysql fallback is only installed by run-es9-e2e.sh much later), so the
+      # client tools must exist before the containers start.
+      - name: Install client tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y mysql-client
+          python3 -m pip install -r harness/requirements.txt
+
+      # Offline check of the e2e target guard (no containers, no cluster).
+      - name: ES9 e2e guard unit tests
+        run: python3 -m unittest harness.test_es_target
+
+      # MySQL only: the ES9 job needs no Kafka and no ES8 node.
+      - name: Start MySQL 8.0 + Elasticsearch 9 (docker compose)
+        env:
+          MYSQL_UP_SERVICES: mysql
+        run: |
+          bash scripts/mysql-up.sh
+          bash scripts/es9-up.sh
+
+      # Go sink against the real ES 9 node (build tag esintegration).
+      - name: Elasticsearch 9 integration (real cluster)
+        run: bash scripts/run-es9-integration.sh
+
+      # MySQL binlog -> runner -> ES9, sink.version=9 (same harness as ES7/ES8).
+      - name: Elasticsearch 9 e2e harness
+        run: bash scripts/run-es9-e2e.sh
+
+      - name: Tear down
+        if: always()
+        run: |
+          bash scripts/es9-down.sh
+          bash scripts/mysql-down.sh
+
   mysql-scale-e2e:
     name: MySQL ${{ matrix.mysql }} scale
     # No job-level if: intentionally cascade-skips when go-check is skipped

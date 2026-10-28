@@ -13,7 +13,9 @@ GOLANGCI_LINT_VERSION ?= v2.1.6
 	integration-es-e2e integration-es-load \
 	integration-es-scale-normal integration-es-scale-heavy \
 	integration-es7-up integration-es7-down integration-es7-integration \
-	integration-es7-e2e-up integration-es7-e2e
+	integration-es7-e2e-up integration-es7-e2e \
+	integration-es9-up integration-es9-down integration-es9-integration \
+	integration-es9-e2e-up integration-es9-e2e
 
 build:
 	$(GO) build -o bin/go-cdc ./cmd/go-cdc
@@ -128,6 +130,25 @@ integration-es7-e2e-up:
 
 integration-es7-e2e:
 	bash test/integration/scripts/run-es7-e2e.sh
+
+# Elasticsearch 9 (v9 client adapter): the Go-level sink IT needs only ES9.
+integration-es9-up:
+	bash test/integration/scripts/es9-up.sh
+
+integration-es9-down:
+	bash test/integration/scripts/es9-down.sh
+
+integration-es9-integration:
+	bash test/integration/scripts/run-es9-integration.sh
+
+# ES9 CDC e2e: the same harness with sink.version=9, so it needs MySQL as well.
+# MYSQL_UP_SERVICES keeps the ES8 node and Kafka out of this run.
+integration-es9-e2e-up:
+	MYSQL_UP_SERVICES=mysql bash test/integration/scripts/mysql-up.sh
+	bash test/integration/scripts/es9-up.sh
+
+integration-es9-e2e:
+	bash test/integration/scripts/run-es9-e2e.sh
 
 clean:
 	$(GO) clean -i ./...

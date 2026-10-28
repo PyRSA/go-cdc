@@ -5,6 +5,7 @@
 # Kafka: bash scripts/kafka-up.sh (same COMPOSE_PROJECT_NAME as mysql-up).
 # Elasticsearch 8 (security off, single node): bash scripts/es-up.sh
 # Elasticsearch 7.17 (security off, single node): bash scripts/es7-up.sh
+# Elasticsearch 9 (security off, single node): bash scripts/es9-up.sh
 services:
   mysql:
     image: ${MYSQL_IMAGE:-mysql:8.0.36}
@@ -82,6 +83,37 @@ services:
       xpack.security.transport.ssl.enabled: "false"
       ES_JAVA_OPTS: "-Xms${ES_HEAP:-512m} -Xmx${ES_HEAP:-512m}"
       # Bulk/scroll plus a small disk image: never trip the watermark checks.
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+      action.destructive_requires_name: "true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS 'http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+      start_period: 30s
+
+  # Single-node ES9 for the v9 client adapter suite (host → 127.0.0.1:${ES9_HOST_PORT}).
+  # Gated behind the es9 profile for the same reason as ES7: a plain compose up
+  # used by unrelated jobs must not start this node (port 19202, extra heap).
+  elasticsearch9:
+    image: ${ES9_IMAGE:-docker.elastic.co/elasticsearch/elasticsearch:9.5.2}
+    profiles: ["es9"]
+    ports:
+      - "${ES9_HOST_PORT:-19202}:9200"
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      xpack.security.http.ssl.enabled: "false"
+      xpack.security.transport.ssl.enabled: "false"
+      ES_JAVA_OPTS: "-Xms${ES9_HEAP:-512m} -Xmx${ES9_HEAP:-512m}"
       cluster.routing.allocation.disk.threshold_enabled: "false"
       action.destructive_requires_name: "true"
     ulimits:

@@ -48,6 +48,23 @@ class AssertTargetTest(unittest.TestCase):
         self._target(expect="", sink="8")
         es_it.assert_target("8.15.3")
 
+    def test_es9_run_accepts_a_9_cluster(self) -> None:
+        self._target(expect="9", sink="9")
+        es_it.assert_target("9.5.2")
+
+    def test_es9_run_rejects_an_8_cluster(self) -> None:
+        self._target(expect="9", sink="9")
+        with self.assertRaises(RuntimeError) as ctx:
+            es_it.assert_target("8.15.3")
+        self.assertIn("expected Elasticsearch 9.x", str(ctx.exception))
+
+    def test_es9_run_rejects_the_default_es8_sink_version(self) -> None:
+        self._target(expect="9", sink="8")
+        with self.assertRaises(RuntimeError) as ctx:
+            es_it.assert_target("9.5.2")
+        self.assertIn("ES_SINK_VERSION=8", str(ctx.exception))
+        self.assertIn("ES_EXPECT_MAJOR=9", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

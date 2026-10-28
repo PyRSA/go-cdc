@@ -14,6 +14,7 @@ import (
 	"github.com/PyRSA/go-cdc/connector/sink/elasticsearch/client"
 	esv7 "github.com/PyRSA/go-cdc/connector/sink/elasticsearch/client/v7"
 	esv8 "github.com/PyRSA/go-cdc/connector/sink/elasticsearch/client/v8"
+	esv9 "github.com/PyRSA/go-cdc/connector/sink/elasticsearch/client/v9"
 )
 
 func newTestSink(t *testing.T, mutate func(*definition.Sink)) (*Sink, *client.Fake) {
@@ -182,7 +183,11 @@ func TestNewResolvesElasticsearchVersion(t *testing.T) {
 	if s.cfg.Version != definition.ElasticsearchVersion8 {
 		t.Fatalf("version = %d, want %d by default", s.cfg.Version, definition.ElasticsearchVersion8)
 	}
-	for _, version := range []int{definition.ElasticsearchVersion7, definition.ElasticsearchVersion8} {
+	for _, version := range []int{
+		definition.ElasticsearchVersion7,
+		definition.ElasticsearchVersion8,
+		definition.ElasticsearchVersion9,
+	} {
 		s, err := New(definition.Sink{
 			Type: "elasticsearch", Hosts: []string{"http://h:9200"}, Version: version,
 		})
@@ -196,7 +201,7 @@ func TestNewResolvesElasticsearchVersion(t *testing.T) {
 }
 
 func TestNewRejectsUnsupportedVersion(t *testing.T) {
-	for _, version := range []int{-1, 6, 9} {
+	for _, version := range []int{-1, 6, 10} {
 		_, err := New(definition.Sink{
 			Type: "elasticsearch", Hosts: []string{"http://h:9200"}, Version: version,
 		})
@@ -219,6 +224,10 @@ func TestBuildAPIClientSelectsVersion(t *testing.T) {
 		}},
 		{definition.ElasticsearchVersion8, func(cl client.Client) bool {
 			_, ok := cl.(*esv8.Client)
+			return ok
+		}},
+		{definition.ElasticsearchVersion9, func(cl client.Client) bool {
+			_, ok := cl.(*esv9.Client)
 			return ok
 		}},
 	}
