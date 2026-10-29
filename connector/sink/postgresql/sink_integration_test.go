@@ -764,11 +764,14 @@ func TestPostgresSinkDropColumnLeavesAViewToTheServer(t *testing.T) {
 }
 
 // countWhere reads one count from the catalogue, so an assertion about a skipped
-// index comes from the server.
+// index comes from the server. The predicate spells the schema as $1, so the
+// schema is bound here: a placeholder without a matching argument makes pgx fail
+// with "expected 1 arguments, got 0" before the statement ever reaches the server.
 func (e *itEnv) countWhere(t *testing.T, relation, predicate string) int {
 	t.Helper()
 	var rows int
-	if err := e.conn.QueryRow(e.ctx, "SELECT count(*) FROM "+relation+" WHERE "+predicate).Scan(&rows); err != nil {
+	query := "SELECT count(*) FROM " + relation + " WHERE " + predicate
+	if err := e.conn.QueryRow(e.ctx, query, e.schema).Scan(&rows); err != nil {
 		t.Fatalf("count %s: %v", relation, err)
 	}
 	return rows
