@@ -153,9 +153,61 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/postgres-sink-it.log"
-          # pipefail keeps the go test exit code even though the log is teed.
+          # The exit code is captured instead of letting set -e abort the step, so
+          # the failing cases can be reprinted before the step ends. The captured
+          # status is what the step exits with, so a red run stays red; tee still
+          # writes the untouched log to the console, so the full output survives.
+          set +e
+          # pipefail makes the pipeline report the go test status, not tee's.
           go test -tags postgres_integration ./connector/sink/postgresql/ \
             -count=1 -v -timeout 10m 2>&1 | tee "${log}"
+          status=${PIPESTATUS[0]}
+          set -e
+          if (( status != 0 )); then
+            # Go prints a case as a block that opens with "=== RUN" and holds the
+            # assertion lines, the indented "--- FAIL" line and, on a crash, the
+            # panic dump. The block is buffered and replayed once any failure
+            # marker was seen inside it, so the assertion line that precedes
+            # "--- FAIL" is kept instead of dropped. No count of lines is assumed,
+            # so a multi-line PostgreSQL error or a panic stack stays whole.
+            failures="$(awk '
+              function flush() { if (flag) printf "%s", buf; buf = ""; flag = 0 }
+              /^(=== RUN|=== PAUSE|=== CONT)/ { flush(); buf = $0 "\n"; next }
+              { buf = buf $0 "\n" }
+              /^[[:space:]]*--- (FAIL|SKIP):/ { flag = 1 }
+              /^(panic:|fatal error:)/ { flag = 1 }
+              END { flush() }
+            ' "${log}")"
+            if [[ -z "${failures}" ]]; then
+              # A build failure or a crash before the first case prints no block at
+              # all, so the whole log is the only evidence: it is reprinted whole
+              # rather than truncated, because truncation is what hid the message.
+              failures="$(cat "${log}")"
+            fi
+            fail_count="$(awk '/^[[:space:]]*--- FAIL:/{n++} END{print n+0}' "${log}")"
+            # Go indents an assertion as "file.go:line: message". The token may not
+            # carry a slash, so a stack frame such as /usr/local/go/src/.../x.go is
+            # not mistaken for an assertion site.
+            sites="$(awk '
+              match($0, /[[:space:]][^[:space:]\/]+\.go:[0-9]+:/) {
+                site = substr($0, RSTART + 1, RLENGTH - 1)
+                if (!(site in seen)) { seen[site] = 1; printf "%s%s", sep, site; sep = ", " }
+              }
+            ' "${log}")"
+            if (( fail_count > 0 )); then
+              summary="${fail_count} failing case(s); assertion sites: ${sites:-none}."
+            else
+              # A build error, a crash or a timeout reports no --- FAIL line.
+              summary="the run failed before any case printed '--- FAIL'; see the log reprinted below."
+            fi
+            echo "::group::failing PostgreSQL integration tests"
+            printf '%s\n' "${failures}"
+            echo "::endgroup::"
+            # One annotation for the whole run. GitHub caps a step at ten of them,
+            # so a per-line loop would drop the tail exactly when many cases fail.
+            echo "::error::${summary} Failing blocks are in the group above and the raw log was printed by tee."
+            exit "${status}"
+          fi
           # A skip means no server was contacted, so a green run that skipped
           # must not be read as a passing DML path.
           if grep -q '^--- SKIP' "${log}"; then

@@ -323,8 +323,13 @@ func (m *metadata) keys(ctx context.Context, target Target) (primary []string, u
 // half of the union skips indexes that back a constraint, because the constraint
 // row already names them and reporting both would only duplicate the same
 // dependency.
+//
+// contype is the internal one-byte "char" type while the index branch spells the
+// kind as text, so the constraint branch casts it: PostgreSQL refuses a union
+// whose branches cannot be matched instead of widening one side on its own, and
+// reports 'UNION types "char" and text cannot be matched' (SQLSTATE 42804).
 func (m *metadata) dependents(ctx context.Context, target Target, column string) ([]dependent, error) {
-	const dependentsSQL = `SELECT con.conname, con.contype
+	const dependentsSQL = `SELECT con.conname, con.contype::text
   FROM pg_catalog.pg_constraint con
   JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
   JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace

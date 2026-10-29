@@ -179,6 +179,29 @@ func TestMetadataSchemaExists(t *testing.T) {
 	}
 }
 
+// TestDependentsQueryCastsConstraintTypeToText pins the column types of the
+// dependency read. The statement is a union: the constraint branch returns
+// contype, the internal one-byte "char" type, and the index branch returns text
+// for the kind it synthesises. PostgreSQL does not widen the two on its own, so
+// the constraint branch has to cast; a missing cast only shows up against a real
+// server, as SQLSTATE 42804 on every DROP COLUMN.
+func TestDependentsQueryCastsConstraintTypeToText(t *testing.T) {
+	querier := &fakeQuerier{}
+	if _, err := newFakeMetadata(querier).dependents(context.Background(), Target{Schema: "ods", Table: "users"}, "note"); err != nil {
+		t.Fatal(err)
+	}
+	if len(querier.statements) != 1 {
+		t.Fatalf("statements %#v", querier.statements)
+	}
+	statement := querier.statements[0]
+	if !strings.Contains(statement, "UNION") {
+		t.Fatalf("the dependency read is expected to union the two branches: %s", statement)
+	}
+	if !strings.Contains(statement, "con.contype::text") {
+		t.Fatalf("the dependency read must hand contype to the union as text: %s", statement)
+	}
+}
+
 func TestMetadataQueryErrorNamesTarget(t *testing.T) {
 	querier := &fakeQuerier{queryErr: errors.New("connection reset")}
 	_, _, err := newFakeMetadata(querier).table(context.Background(), Target{Schema: "ods", Table: "users"})
