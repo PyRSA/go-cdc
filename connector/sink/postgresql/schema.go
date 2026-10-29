@@ -200,7 +200,7 @@ func (s *Sink) addColumn(ctx context.Context, target Target, change schema.Chang
 	// A column that already existed with another definition makes IF NOT EXISTS
 	// a no-op, so the read-back is what decides whether the change took effect.
 	for _, column := range columns {
-		if _, err := s.verifyColumn(ctx, target, column); err != nil {
+		if _, err := s.verifyAddedColumn(ctx, target, column); err != nil {
 			return err
 		}
 	}
@@ -479,6 +479,60 @@ func (s *Sink) verifyColumn(ctx context.Context, target Target, column schema.Co
 	}
 	if !live.NotNull && !column.Nullable {
 		return tableState{}, fmt.Errorf("sink.postgresql: column %q of %s is nullable after the schema change while the source column is NOT NULL",
+			column.Name, target)
+	}
+	return state, nil
+}
+
+// verifyAddedColumn re-reads the target and proves one added column can hold
+// every value the source sends. It is the read-back of addColumn, and it
+// relaxes exactly one rule verifyColumn keeps: the column may already exist
+// with a wider type.
+//
+// ADD COLUMN IF NOT EXISTS is a no-op for a column that is already there, and a
+// replayed ADD arrives after the target moved forward:
+//
+//	ADD COLUMN c VARCHAR(32) → MODIFY c VARCHAR(64) → crash before the checkpoint
+//
+// Replay starts at the ADD, but the target already holds VARCHAR(64), which
+// stores every value VARCHAR(32) does. Refusing it would stop a job whose
+// target is ahead of the statement it is replaying, so the read-back accepts a
+// target type that the same verified widening ALTER COLUMN TYPE accepts, read
+// in the other direction (safeAlterType(want, live)). A column this sink just
+// created always matches exactly and never reaches that branch.
+//
+// The relaxation is one-directional and stays proved: a target that is narrower
+// than the source mapping, of another family, or neither is still refused, and
+// so is a target that is stricter about NULL than the source. A target that is
+// more permissive about NULL (nullable where the source is NOT NULL) accepts
+// every row the source sends and is what a replayed MODIFY leaves behind, so it
+// is accepted; a replayed MODIFY that must precede it tightens the column again.
+func (s *Sink) verifyAddedColumn(ctx context.Context, target Target, column schema.Column) (tableState, error) {
+	wantType, err := mapColumnType(column.Type)
+	if err != nil {
+		return tableState{}, fmt.Errorf("sink.postgresql: table %s column %s: %w", target, column.Name, err)
+	}
+	state, exists, err := s.meta.refresh(ctx, target)
+	if err != nil {
+		return tableState{}, err
+	}
+	if !exists {
+		return tableState{}, fmt.Errorf("sink.postgresql: table %s does not exist after the schema change", target)
+	}
+	live, ok := state.columnFold(column.Name)
+	if !ok {
+		return tableState{}, fmt.Errorf("sink.postgresql: column %q is missing from %s after the schema change", column.Name, target)
+	}
+	if !samePGType(wantType, live.Type) {
+		if err := safeAlterType(wantType, live.Type); err != nil {
+			return tableState{}, fmt.Errorf("sink.postgresql: column %q of %s is %s after the schema change, the source %s maps to %s; a target column may be wider than the source mapping but never narrower or of another family, and this replayed ADD COLUMN cannot make it hold the source values",
+				column.Name, target, live.Type, column.Type, wantType)
+		}
+		s.logger().Warn("postgresql: added column already exists with a wider type; the replayed change left it unchanged",
+			"table", target.String(), "column", column.Name, "target", live.Type, "source", wantType)
+	}
+	if live.NotNull && column.Nullable {
+		return tableState{}, fmt.Errorf("sink.postgresql: column %q of %s is NOT NULL after the schema change while the source column is nullable",
 			column.Name, target)
 	}
 	return state, nil

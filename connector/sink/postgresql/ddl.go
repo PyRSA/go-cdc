@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -172,7 +173,7 @@ func columnClause(target Target, column schema.Column) (string, error) {
 	if !column.Nullable {
 		parts = append(parts, "NOT NULL")
 	}
-	if value, ok := columnDefault(column); ok {
+	if value, ok := columnDefault(column, pgType); ok {
 		parts = append(parts, "DEFAULT", value)
 	}
 	return strings.Join(parts, " "), nil
@@ -182,7 +183,13 @@ func columnClause(target Target, column schema.Column) (string, error) {
 // default this sink cannot prove portable is left out instead of being guessed:
 // the sink writes an explicit value for every projected column, so a missing
 // default never changes what a captured row stores.
-func columnDefault(column schema.Column) (string, bool) {
+//
+// pgType decides how a value is spelled, because the source default is text for
+// every column type. '0' is the number 0 in an integer column and the
+// one-character string "0" in a char column, and PostgreSQL refuses the wrong
+// spelling outright (42804 on a numeric literal written to a character column),
+// so the target type, not the shape of the text, decides.
+func columnDefault(column schema.Column, pgType string) (string, bool) {
 	if !column.HasDefault {
 		return "", false
 	}
@@ -211,10 +218,22 @@ func columnDefault(column schema.Column) (string, bool) {
 		// would fail the CREATE; the value itself already fails every write.
 		return "", false
 	}
-	if isNumericLiteral(value) {
+	if acceptsNumericLiteral(pgType) && isNumericLiteral(value) {
 		return value, true
 	}
 	return "'" + strings.ReplaceAll(value, "'", "''") + "'", true
+}
+
+// acceptsNumericLiteral reports whether an unquoted numeric literal is a valid
+// default for the column type. Only the numeric and floating point families
+// are: a character, temporal, binary, or json column takes the same text as a
+// string literal, where the quotes are part of the value's meaning.
+func acceptsNumericLiteral(pgType string) bool {
+	switch parseIntType(pgType).name {
+	case "smallint", "integer", "bigint", "numeric", "real", "double precision":
+		return true
+	}
+	return false
 }
 
 // isZeroDate reports the MySQL zero date and zero datetime sentinels.
@@ -232,8 +251,13 @@ func isNumericLiteral(value string) bool {
 	if value == "" {
 		return false
 	}
-	_, err := strconv.ParseFloat(value, 64)
-	return err == nil
+	number, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return false
+	}
+	// NaN and the infinities have no unquoted spelling in SQL. Quoted, they are
+	// the values numeric and double precision accept.
+	return !math.IsNaN(number) && !math.IsInf(number, 0)
 }
 
 // execDDL runs one statement in its own transaction.
@@ -274,11 +298,14 @@ func (s *Sink) execDDLAll(ctx context.Context, statements []string) error {
 		execErr = fmt.Errorf("sink.postgresql: close schema change batch: %w", closeErr)
 	}
 	if execErr != nil {
-		_ = beginTx.Rollback(context.WithoutCancel(opCtx))
+		// The same bounded rollback the DML path uses: the operation deadline may
+		// already have fired, and an unbounded rollback would wait forever on a
+		// connection that stopped answering.
+		rollback(beginTx, opCtx)
 		return execErr
 	}
 	if err := beginTx.Commit(opCtx); err != nil {
-		_ = beginTx.Rollback(context.WithoutCancel(opCtx))
+		rollback(beginTx, opCtx)
 		return fmt.Errorf("sink.postgresql: commit schema change: %w", err)
 	}
 	return nil

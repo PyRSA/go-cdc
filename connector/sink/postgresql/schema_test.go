@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/PyRSA/go-cdc/common/event"
 	"github.com/PyRSA/go-cdc/common/schema"
@@ -195,6 +196,133 @@ func TestCreateTableDropsZeroDateDefault(t *testing.T) {
 	// The value path is untouched: nothing turns the zero date into NULL.
 	if got := ConvertValue("0000-00-00"); got != "0000-00-00" {
 		t.Fatalf("zero date value was rewritten to %#v", got)
+	}
+}
+
+// TestColumnClauseSpellsDefaultsByTargetType pins how a default becomes SQL. The
+// source default is text for every column type, so only the mapped PostgreSQL
+// type says whether a value is a number or a string: `DEFAULT 0` on a char
+// column is not a default PostgreSQL coerces, it is a CREATE that fails with
+// 42804. Numeric columns keep their literal, everything else is quoted.
+func TestColumnClauseSpellsDefaultsByTargetType(t *testing.T) {
+	target := Target{Schema: "public", Table: "users"}
+	cases := []struct {
+		name   string
+		column schema.Column
+		want   string
+	}{
+		{"numeric shaped char",
+			schema.Column{Name: "status", Type: "char(1)", Nullable: true, Default: "0", HasDefault: true},
+			`"status" CHAR(1) DEFAULT '0'`},
+		{"exponent varchar",
+			schema.Column{Name: "code", Type: "varchar(20)", Nullable: true, Default: "1e5", HasDefault: true},
+			`"code" VARCHAR(20) DEFAULT '1e5'`},
+		{"negative varchar",
+			schema.Column{Name: "code", Type: "varchar(20)", Nullable: true, Default: "-1", HasDefault: true},
+			`"code" VARCHAR(20) DEFAULT '-1'`},
+		{"numeric shaped text",
+			schema.Column{Name: "note", Type: "text", Nullable: true, Default: "1e5", HasDefault: true},
+			`"note" TEXT DEFAULT '1e5'`},
+		{"decimal",
+			schema.Column{Name: "amount", Type: "decimal(10,2)", Nullable: true, Default: "0.00", HasDefault: true},
+			`"amount" NUMERIC(10,2) DEFAULT 0.00`},
+		{"integer",
+			schema.Column{Name: "total", Type: "int", Nullable: true, Default: "42", HasDefault: true},
+			`"total" INTEGER DEFAULT 42`},
+		{"tinyint",
+			schema.Column{Name: "flag", Type: "tinyint(1)", Nullable: true, Default: "0", HasDefault: true},
+			`"flag" SMALLINT DEFAULT 0`},
+		{"unsigned bigint",
+			schema.Column{Name: "big", Type: "bigint unsigned", Nullable: true, Default: "18446744073709551615", HasDefault: true},
+			`"big" NUMERIC(20,0) DEFAULT 18446744073709551615`},
+		{"quoted string",
+			schema.Column{Name: "label", Type: "varchar(20)", Nullable: true, Default: "it's", HasDefault: true},
+			`"label" VARCHAR(20) DEFAULT 'it''s'`},
+		{"not a literal",
+			schema.Column{Name: "ratio", Type: "double", Nullable: true, Default: "NaN", HasDefault: true},
+			`"ratio" DOUBLE PRECISION DEFAULT 'NaN'`},
+		{"empty string",
+			schema.Column{Name: "tag", Type: "varchar(4)", Nullable: true, Default: "", HasDefault: true},
+			`"tag" VARCHAR(4) DEFAULT ''`},
+		{"null",
+			schema.Column{Name: "tag", Type: "varchar(4)", Nullable: true, Default: "NULL", HasDefault: true},
+			`"tag" VARCHAR(4) DEFAULT NULL`},
+		{"time expression",
+			schema.Column{Name: "created", Type: "datetime", Nullable: true, Default: "CURRENT_TIMESTAMP", HasDefault: true, DefaultExpr: true},
+			`"created" TIMESTAMP DEFAULT CURRENT_TIMESTAMP`},
+		{"zero date",
+			schema.Column{Name: "created", Type: "date", Nullable: true, Default: "0000-00-00", HasDefault: true},
+			`"created" DATE`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := columnClause(target, tc.column)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("clause\n got %s\nwant %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAddColumnSpellsDefaultsByTargetType is the ADD COLUMN half of the same
+// rule: the statement a live or a replayed change renders spells a default
+// exactly as CREATE TABLE does, so a column added by a change is never given a
+// default the CREATE path would have refused.
+func TestAddColumnSpellsDefaultsByTargetType(t *testing.T) {
+	cases := []struct {
+		name     string
+		column   schema.Column
+		liveType string
+		liveDef  string
+		want     string
+	}{
+		{"numeric shaped char",
+			schema.Column{Name: "status", Type: "char(1)", Nullable: true, Default: "0", HasDefault: true},
+			"character(1)", "'0'::bpchar",
+			`ADD COLUMN IF NOT EXISTS "status" CHAR(1) DEFAULT '0'`},
+		{"exponent varchar",
+			schema.Column{Name: "code", Type: "varchar(20)", Nullable: true, Default: "1e5", HasDefault: true},
+			"character varying(20)", "",
+			`ADD COLUMN IF NOT EXISTS "code" VARCHAR(20) DEFAULT '1e5'`},
+		{"negative varchar",
+			schema.Column{Name: "code", Type: "varchar(20)", Nullable: true, Default: "-1", HasDefault: true},
+			"character varying(20)", "",
+			`ADD COLUMN IF NOT EXISTS "code" VARCHAR(20) DEFAULT '-1'`},
+		{"decimal",
+			schema.Column{Name: "total", Type: "decimal(10,2)", Nullable: true, Default: "0.00", HasDefault: true},
+			"numeric(10,2)", "0.00",
+			`ADD COLUMN IF NOT EXISTS "total" NUMERIC(10,2) DEFAULT 0.00`},
+		{"quoted string",
+			schema.Column{Name: "label", Type: "varchar(20)", Nullable: true, Default: "it's", HasDefault: true},
+			"character varying(20)", "",
+			`ADD COLUMN IF NOT EXISTS "label" VARCHAR(20) DEFAULT 'it''s'`},
+		{"time expression",
+			schema.Column{Name: "created_at", Type: "datetime", Nullable: true, Default: "CURRENT_TIMESTAMP", HasDefault: true, DefaultExpr: true},
+			"timestamp without time zone", "CURRENT_TIMESTAMP",
+			`ADD COLUMN IF NOT EXISTS "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &fakePool{}
+			columns := append(usersState(), columnRow(tc.column.Name, tc.liveType, false, tc.liveDef, tc.liveDef != ""))
+			sink := ddlSink(p, &fakeQuerier{columns: columns, keys: [][]any{{"users_pkey", "p", "id"}}})
+			definition := tc.column
+			change := schema.Change{
+				Action: schema.ActionAddColumn, Database: "public", Table: "users",
+				Column: definition.Name, AddColumns: []string{definition.Name},
+				ColumnDef: &definition,
+				DDL:       "ALTER TABLE users ADD COLUMN " + definition.Name,
+			}
+			if err := sink.ApplySchema(change); err != nil {
+				t.Fatal(err)
+			}
+			if got := p.txs[0].sqls[0]; !strings.Contains(got, tc.want) {
+				t.Fatalf("sql\n got %s\nwant %s", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -691,12 +819,13 @@ func TestColumnChangeWithoutSourceTableIsRefused(t *testing.T) {
 	}
 }
 
-// TestAddColumnThatWasAlreadyThereWithAnotherType proves the read-back is what
+// TestAddColumnThatWasAlreadyThereWithANarrowerType proves the read-back is what
 // decides: IF NOT EXISTS makes the statement a no-op, so only the catalogue can
-// say whether the target now holds the definition the source asked for.
-func TestAddColumnThatWasAlreadyThereWithAnotherType(t *testing.T) {
+// say whether the target now holds a definition that stores every source value.
+// A target column narrower than the source mapping cannot, and the change stops.
+func TestAddColumnThatWasAlreadyThereWithANarrowerType(t *testing.T) {
 	p := &fakePool{}
-	columns := append(usersState(), columnRow("note", "text", false, "", false))
+	columns := append(usersState(), columnRow("note", "character varying(8)", false, "", false))
 	sink := ddlSink(p, &fakeQuerier{columns: columns, keys: [][]any{{"users_pkey", "p", "id"}}})
 	change := schema.Change{
 		Action: schema.ActionAddColumn, Database: "public", Table: "users",
@@ -704,8 +833,140 @@ func TestAddColumnThatWasAlreadyThereWithAnotherType(t *testing.T) {
 		ColumnDef: &schema.Column{Name: "note", Type: "varchar(32)", Nullable: true},
 	}
 	err := sink.ApplySchema(change)
-	if err == nil || !strings.Contains(err.Error(), `is text after the schema change`) {
+	if err == nil || !strings.Contains(err.Error(), "never narrower") {
 		t.Fatalf("err %v", err)
+	}
+}
+
+// TestAddColumnReplayAcceptsAWiderTarget covers the shape a restart produces:
+// the ADD reached the target before the checkpoint did, a later change widened
+// the column, and the replay can only see the widened result. The target still
+// stores every value the source sends, so the replay converges instead of
+// stopping a job whose target is ahead of the statement.
+func TestAddColumnReplayAcceptsAWiderTarget(t *testing.T) {
+	p := &fakePool{}
+	columns := append(usersState(), columnRow("note", "text", false, "", false))
+	sink := ddlSink(p, &fakeQuerier{columns: columns, keys: [][]any{{"users_pkey", "p", "id"}}})
+	capture := &logCapture{}
+	sink.log = slog.New(capture)
+	change := schema.Change{
+		Action: schema.ActionAddColumn, Database: "public", Table: "users",
+		Column: "note", AddColumns: []string{"note"},
+		ColumnDef: &schema.Column{Name: "note", Type: "varchar(32)", Nullable: true},
+	}
+	if err := sink.ApplySchema(change); err != nil {
+		t.Fatal(err)
+	}
+	want := `ALTER TABLE "public"."users" ADD COLUMN IF NOT EXISTS "note" VARCHAR(32)`
+	if got := p.txs[0].sqls[0]; got != want {
+		t.Fatalf("sql %s", got)
+	}
+	if !capture.contains("wider type") {
+		t.Fatalf("the widening was not reported: %#v", capture.messages())
+	}
+}
+
+// TestAddColumnReplayAfterAWideningModify is the whole restart sequence:
+// ADD COLUMN note varchar(32), MODIFY note varchar(64), crash before the
+// checkpoint, replay from the ADD. The target holds varchar(64) when the ADD is
+// replayed, and the replay has to converge on it.
+func TestAddColumnReplayAfterAWideningModify(t *testing.T) {
+	p := &fakePool{}
+	querier := &fakeQuerier{
+		columns:     withNote(usersState()...),
+		columnPhase: 2,
+		laterColumns: append(usersState(),
+			columnRow("note", "character varying(64)", false, "", false)),
+		keys: [][]any{{"users_pkey", "p", "id"}},
+	}
+	sink := ddlSink(p, querier)
+	sink.SetTableDescriber(&fakeDescriber{table: schema.Table{
+		Database: "app", Table: "users",
+		Columns:     []schema.Column{{Name: "note", Type: "varchar(64)", Nullable: true}},
+		PrimaryKeys: []string{"id"},
+	}})
+	add := schema.Change{
+		Action: schema.ActionAddColumn, Database: "public", Table: "users",
+		Column: "note", AddColumns: []string{"note"},
+		ColumnDef: &schema.Column{Name: "note", Type: "varchar(32)", Nullable: true},
+		DDL:       "ALTER TABLE users ADD COLUMN note varchar(32)",
+	}
+	if err := sink.ApplySchema(add); err != nil {
+		t.Fatalf("first ADD COLUMN: %v", err)
+	}
+	modify := schema.Change{
+		Action: schema.ActionModifyColumn, Database: "public", Table: "users",
+		Column: "note", SourceDatabase: "app", SourceTable: "users",
+		DDL: "ALTER TABLE users MODIFY note varchar(64)",
+	}
+	if err := sink.ApplySchema(modify); err != nil {
+		t.Fatalf("MODIFY: %v", err)
+	}
+	widened := `ALTER TABLE "public"."users" ALTER COLUMN "note" TYPE VARCHAR(64)`
+	if got := p.txs[1].sqls[0]; got != widened {
+		t.Fatalf("the modify did not widen the column: %s", got)
+	}
+	// The checkpoint never covered the MODIFY, so the restart replays the ADD.
+	if err := sink.ApplySchema(add); err != nil {
+		t.Fatalf("replayed ADD COLUMN: %v", err)
+	}
+}
+
+// TestAddColumnRefusesATargetThatIsStricterAboutNull keeps the direction of the
+// nullability rule: a target may be more permissive than the source, never
+// stricter, because a stricter column refuses a NULL the source sends.
+func TestAddColumnRefusesATargetThatIsStricterAboutNull(t *testing.T) {
+	p := &fakePool{}
+	columns := append(usersState(), columnRow("note", "character varying(32)", true, "", false))
+	sink := ddlSink(p, &fakeQuerier{columns: columns, keys: [][]any{{"users_pkey", "p", "id"}}})
+	change := schema.Change{
+		Action: schema.ActionAddColumn, Database: "public", Table: "users",
+		Column: "note", AddColumns: []string{"note"},
+		ColumnDef: &schema.Column{Name: "note", Type: "varchar(32)", Nullable: true},
+	}
+	err := sink.ApplySchema(change)
+	if err == nil || !strings.Contains(err.Error(), "NOT NULL after the schema change") {
+		t.Fatalf("err %v", err)
+	}
+}
+
+// TestAddColumnReplayAcceptsARelaxedNull is the other nullability direction: a
+// later change dropped NOT NULL, and the replayed ADD finds a column that
+// accepts every row the source sends.
+func TestAddColumnReplayAcceptsARelaxedNull(t *testing.T) {
+	p := &fakePool{}
+	sink := ddlSink(p, &fakeQuerier{columns: withNote(usersState()...), keys: [][]any{{"users_pkey", "p", "id"}}})
+	change := schema.Change{
+		Action: schema.ActionAddColumn, Database: "public", Table: "users",
+		Column: "note", AddColumns: []string{"note"},
+		ColumnDef: &schema.Column{Name: "note", Type: "varchar(32)", Nullable: false, Default: "x", HasDefault: true},
+	}
+	if err := sink.ApplySchema(change); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestAddColumnCreatesAColumnTheTargetLacks is the first-run half of the same
+// read-back: the column is absent, the statement creates it, and the catalogue
+// then holds exactly the definition the source asked for.
+func TestAddColumnCreatesAColumnTheTargetLacks(t *testing.T) {
+	p := &fakePool{}
+	querier := &fakeQuerier{
+		columnPhase:  0,
+		laterColumns: withNote(usersState()...),
+		keys:         [][]any{{"users_pkey", "p", "id"}},
+	}
+	sink := ddlSink(p, querier)
+	change := schema.Change{
+		Action: schema.ActionAddColumn, Database: "public", Table: "users",
+		Column: "note", AddColumns: []string{"note"},
+		ColumnDef: &schema.Column{Name: "note", Type: "varchar(32)", Nullable: true},
+	}
+	if err := sink.ApplySchema(change); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.txs[0].sqls[0]; got != `ALTER TABLE "public"."users" ADD COLUMN IF NOT EXISTS "note" VARCHAR(32)` {
+		t.Fatalf("sql %s", got)
 	}
 }
 
@@ -1148,6 +1409,110 @@ func TestSchemaChangeWithAnUnprovenCommitKeepsEveryCache(t *testing.T) {
 	}
 	if _, present := state.columnFold("name"); !present {
 		t.Fatal("the cached structure lost the column the drop may not have applied")
+	}
+}
+
+// TestSchemaChangeRollbackIsBoundedAndIgnoresCancellation pins the DDL path to
+// the rollback contract the DML path already has: a cancelled or expired
+// operation context must not reach the rollback, and the rollback must still
+// carry a finite deadline so a server that stopped answering cannot hold the
+// change, and the job, open forever.
+func TestSchemaChangeRollbackIsBoundedAndIgnoresCancellation(t *testing.T) {
+	p := &fakePool{}
+	sink := ddlSink(p, &fakeQuerier{
+		columns: withNote(usersState()...), keys: [][]any{{"users_pkey", "p", "id"}},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sink.baseCtx = ctx
+	p.resultsFor = func(int) *fakeResults {
+		// The signal arrives while the statement is on the wire, so the
+		// operation context is already cancelled when the rollback runs.
+		cancel()
+		return &fakeResults{execErrs: []error{pgError("42710")}}
+	}
+	change := schema.Change{
+		Action: schema.ActionAddColumn, Database: "public", Table: "users",
+		Column: "note", AddColumns: []string{"note"},
+		ColumnDef: &schema.Column{Name: "note", Type: "varchar(32)", Nullable: true},
+	}
+	if err := sink.ApplySchema(change); err == nil {
+		t.Fatal("expected error")
+	}
+	handle := p.txs[0]
+	if !handle.rolledBack {
+		t.Fatal("transaction not rolled back")
+	}
+	if handle.rollbackCtxErr != nil {
+		t.Fatalf("rollback context was already done: %v", handle.rollbackCtxErr)
+	}
+	if !handle.rollbackHasDeadline {
+		t.Fatal("rollback context carries no deadline")
+	}
+	if remaining := time.Until(handle.rollbackDeadline); remaining <= 0 || remaining > rollbackTimeout {
+		t.Fatalf("rollback deadline in %s, want (0, %s]", remaining, rollbackTimeout)
+	}
+}
+
+// TestSchemaChangeRollbackFailureKeepsTheDDLError proves a failing rollback does
+// not replace the statement error the runner reports, and therefore cannot
+// change what stops the job or what the checkpoint keeps.
+func TestSchemaChangeRollbackFailureKeepsTheDDLError(t *testing.T) {
+	p := &fakePool{
+		rollbackErr: context.DeadlineExceeded,
+		resultsFor: func(int) *fakeResults {
+			return &fakeResults{execErrs: []error{pgError("42710")}}
+		},
+	}
+	sink := ddlSink(p, &fakeQuerier{
+		columns: withNote(usersState()...), keys: [][]any{{"users_pkey", "p", "id"}},
+	})
+	change := schema.Change{
+		Action: schema.ActionAddColumn, Database: "public", Table: "users",
+		Column: "note", AddColumns: []string{"note"},
+		ColumnDef: &schema.Column{Name: "note", Type: "varchar(32)", Nullable: true},
+	}
+	err := sink.ApplySchema(change)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "42710") {
+		t.Fatalf("error %q lost the statement failure", err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error %q reports the rollback failure", err)
+	}
+	if !p.txs[0].rolledBack {
+		t.Fatal("transaction not rolled back")
+	}
+}
+
+// TestSchemaChangeCommitFailureRollsBackBounded covers the second rollback site:
+// a COMMIT whose result was lost still abandons the transaction, and it does so
+// under the same bounded deadline.
+func TestSchemaChangeCommitFailureRollsBackBounded(t *testing.T) {
+	p := &fakePool{commitErr: pgError("40001")}
+	sink := ddlSink(p, &fakeQuerier{
+		columns: withNote(usersState()...), keys: [][]any{{"users_pkey", "p", "id"}},
+	})
+	change := schema.Change{
+		Action: schema.ActionAddColumn, Database: "public", Table: "users",
+		Column: "note", AddColumns: []string{"note"},
+		ColumnDef: &schema.Column{Name: "note", Type: "varchar(32)", Nullable: true},
+	}
+	err := sink.ApplySchema(change)
+	if err == nil || !strings.Contains(err.Error(), "commit schema change") {
+		t.Fatalf("err %v", err)
+	}
+	handle := p.txs[0]
+	if handle.committed || !handle.rolledBack {
+		t.Fatalf("committed=%v rolledBack=%v", handle.committed, handle.rolledBack)
+	}
+	if !handle.rollbackHasDeadline {
+		t.Fatal("rollback context carries no deadline")
+	}
+	if remaining := time.Until(handle.rollbackDeadline); remaining <= 0 || remaining > rollbackTimeout {
+		t.Fatalf("rollback deadline in %s, want (0, %s]", remaining, rollbackTimeout)
 	}
 }
 
