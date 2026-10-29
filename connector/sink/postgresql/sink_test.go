@@ -41,12 +41,18 @@ func (r *fakeResults) Close() error {
 }
 
 type fakeTx struct {
-	results    *fakeResults
-	commitErr  error
-	queued     int
-	paramCount int
-	committed  bool
-	rolledBack bool
+	results     *fakeResults
+	commitErr   error
+	rollbackErr error
+	queued      int
+	paramCount  int
+	committed   bool
+	rolledBack  bool
+	// The rollback context is snapshotted at call time: the sink cancels it on
+	// return, so reading its state afterwards would always report a cancellation.
+	rollbackCtxErr      error
+	rollbackDeadline    time.Time
+	rollbackHasDeadline bool
 }
 
 func (f *fakeTx) SendBatch(ctx context.Context, batch *pgx.Batch) pgx.BatchResults {
@@ -65,14 +71,17 @@ func (f *fakeTx) Commit(context.Context) error {
 	return nil
 }
 
-func (f *fakeTx) Rollback(context.Context) error {
+func (f *fakeTx) Rollback(ctx context.Context) error {
 	f.rolledBack = true
-	return nil
+	f.rollbackCtxErr = ctx.Err()
+	f.rollbackDeadline, f.rollbackHasDeadline = ctx.Deadline()
+	return f.rollbackErr
 }
 
 type fakePool struct {
-	pingErr  error
-	beginErr error
+	pingErr     error
+	beginErr    error
+	rollbackErr error
 	// onBegin runs before the context check, so a test can cancel the lifecycle
 	// context while a transaction is being opened.
 	onBegin func()
@@ -100,7 +109,7 @@ func (f *fakePool) Begin(ctx context.Context) (tx, error) {
 	if f.resultsFor != nil {
 		results = f.resultsFor(f.begins)
 	}
-	handle := &fakeTx{results: results}
+	handle := &fakeTx{results: results, rollbackErr: f.rollbackErr}
 	f.txs = append(f.txs, handle)
 	return handle, nil
 }
@@ -196,6 +205,101 @@ func TestWriteRollsBackWhenBatchCloseFails(t *testing.T) {
 	}
 	if !p.txs[0].rolledBack {
 		t.Fatal("transaction not rolled back")
+	}
+}
+
+// TestRollbackContextIsBoundedAndIgnoresCancellation pins the two properties the
+// rollback context must have: a cancelled operation context (shutdown, or an
+// expired operation deadline) must not reach the rollback, and the rollback must
+// still carry a finite deadline so a connection that stopped answering cannot
+// block the process exit forever.
+func TestRollbackContextIsBoundedAndIgnoresCancellation(t *testing.T) {
+	p := &fakePool{}
+	sink := newTestSink(p, 3)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sink.baseCtx = ctx
+	p.resultsFor = func(int) *fakeResults {
+		// The signal arrives while the batch is on the wire, so the operation
+		// context is already cancelled when the transaction is rolled back.
+		cancel()
+		return &fakeResults{execErrs: []error{context.Canceled}}
+	}
+	if err := sink.Write([]event.Event{createEvent()}); err == nil {
+		t.Fatal("expected error")
+	}
+	handle := p.txs[0]
+	if !handle.rolledBack {
+		t.Fatal("transaction not rolled back")
+	}
+	if handle.rollbackCtxErr != nil {
+		t.Fatalf("rollback context was already done: %v", handle.rollbackCtxErr)
+	}
+	if !handle.rollbackHasDeadline {
+		t.Fatal("rollback context carries no deadline")
+	}
+	if remaining := time.Until(handle.rollbackDeadline); remaining <= 0 || remaining > rollbackTimeout {
+		t.Fatalf("rollback deadline in %s, want (0, %s]", remaining, rollbackTimeout)
+	}
+}
+
+// TestRollbackFailureKeepsTheOriginalDMLError proves a failing or expiring rollback
+// does not replace the statement error the caller sees. The retry policy is a
+// separate contract, covered by TestRetryPolicySurvivesRollbackFailure with a
+// SQLSTATE that is actually retryable.
+func TestRollbackFailureKeepsTheOriginalDMLError(t *testing.T) {
+	p := &fakePool{
+		rollbackErr: context.DeadlineExceeded,
+		resultsFor: func(int) *fakeResults {
+			return &fakeResults{execErrs: []error{pgError("23502")}}
+		},
+	}
+	sink := newTestSink(p, 3)
+	err := sink.Write([]event.Event{createEvent()})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "23502") {
+		t.Fatalf("error %q lost the statement failure", err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error %q reports the rollback failure", err)
+	}
+	if !p.txs[0].rolledBack {
+		t.Fatal("transaction not rolled back")
+	}
+}
+
+// TestRetryPolicySurvivesRollbackFailure pins the retry contract: the decision to
+// retry comes from the statement error alone, so a batch that fails with a
+// transient SQLSTATE is still retried to max-retries+1 attempts even when every
+// rollback fails, and the rollback failure never reaches the caller.
+func TestRetryPolicySurvivesRollbackFailure(t *testing.T) {
+	rollbackFailure := errors.New("rollback aborted")
+	p := &fakePool{
+		rollbackErr: rollbackFailure,
+		resultsFor: func(int) *fakeResults {
+			return &fakeResults{execErrs: []error{pgError("40001")}}
+		},
+	}
+	sink := newTestSink(p, 1)
+	err := sink.Write([]event.Event{createEvent()})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if p.begins != 2 {
+		t.Fatalf("attempts %d, want max-retries+1", p.begins)
+	}
+	for i, handle := range p.txs {
+		if !handle.rolledBack {
+			t.Fatalf("transaction %d not rolled back", i)
+		}
+	}
+	if !strings.Contains(err.Error(), "40001") {
+		t.Fatalf("error %q lost the statement failure", err)
+	}
+	if strings.Contains(err.Error(), rollbackFailure.Error()) {
+		t.Fatalf("error %q reports the rollback failure", err)
 	}
 }
 

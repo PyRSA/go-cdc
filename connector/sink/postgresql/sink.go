@@ -33,6 +33,12 @@ const (
 	defaultConnectTimeout = 30 * time.Second
 	backoffInitial        = 100 * time.Millisecond
 	backoffMax            = 2 * time.Second
+	// rollbackTimeout bounds the single "rollback" round trip. A rollback is one
+	// control statement rather than a batch, so it gets a fraction of the 30s
+	// transaction budget and cannot hold up process exit for as long as a whole
+	// transaction may take. When it expires pgx hard-closes the connection, which
+	// makes the server abort the open transaction on disconnect.
+	rollbackTimeout = 5 * time.Second
 )
 
 // tx is the part of pgx.Tx the sink uses.
@@ -292,14 +298,26 @@ func (s *Sink) writeOnce(ctx context.Context, p pool, statements []Statement) er
 	}
 	if execErr != nil {
 		// The rollback must run even when the operation deadline already fired.
-		_ = beginTx.Rollback(context.WithoutCancel(opCtx))
+		rollback(beginTx, opCtx)
 		return execErr
 	}
 	if err := beginTx.Commit(opCtx); err != nil {
-		_ = beginTx.Rollback(context.WithoutCancel(opCtx))
+		rollback(beginTx, opCtx)
 		return &commitError{err: fmt.Errorf("sink.postgresql: commit transaction: %w", err)}
 	}
 	return nil
+}
+
+// rollback abandons t with a bounded context. opCtx cannot be reused as is: it may
+// already be cancelled (shutdown) or past its deadline (a slow batch).
+// context.WithoutCancel alone is not enough either, because it drops the deadline
+// along with the cancellation and pgx bounds a round trip only through the context
+// it watches; an unbounded rollback would wait forever on a connection that stopped
+// answering.
+func rollback(t tx, opCtx context.Context) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(opCtx), rollbackTimeout)
+	defer cancel()
+	_ = t.Rollback(ctx)
 }
 
 // commitError marks a failed COMMIT. The transaction may or may not be durable,

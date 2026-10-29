@@ -916,6 +916,11 @@ func TestParsePostgresSinkRejects(t *testing.T) {
 			body:  valid + "  connect-timeout: 1ms\n",
 			field: "sink.connect-timeout",
 		},
+		{
+			name:  "request timeout",
+			body:  valid + "  request-timeout: 10s\n",
+			field: "sink.request-timeout",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -929,6 +934,43 @@ func TestParsePostgresSinkRejects(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestParseSinkKeyErrorMessages pins the two scope messages the PostgreSQL sink
+// influences: the request-timeout rejection names the sink type, and the
+// auto-create-table message names every type that accepts the key.
+func TestParseSinkKeyErrorMessages(t *testing.T) {
+	t.Run("postgres request-timeout names the sink type", func(t *testing.T) {
+		body := postgresPipeline(`  type: postgresql
+  hostname: pg.internal
+  username: cdc
+  password: secret
+  database: target
+  request-timeout: 10s
+`)
+		_, err := Parse([]byte(body))
+		cfg, ok := err.(*ConfigError)
+		if !ok || cfg.Field != "sink.request-timeout" {
+			t.Fatalf("got %v, want field sink.request-timeout", err)
+		}
+		if !strings.Contains(err.Error(), "postgresql") {
+			t.Fatalf("message %q does not name sink.type postgresql", err)
+		}
+	})
+	t.Run("auto-create-table names every allowed sink type", func(t *testing.T) {
+		// stdout has no table to create, so the key is rejected there; the message
+		// must list every sink type that accepts it.
+		_, err := Parse([]byte(postgresPipeline("  type: stdout\n  auto-create-table: false\n")))
+		cfg, ok := err.(*ConfigError)
+		if !ok || cfg.Field != "sink.auto-create-table" {
+			t.Fatalf("got %v, want field sink.auto-create-table", err)
+		}
+		for _, sinkType := range []string{"mysql", "doris", "postgresql"} {
+			if !strings.Contains(err.Error(), sinkType) {
+				t.Fatalf("message %q does not name sink.type %s", err, sinkType)
+			}
+		}
+	})
 }
 
 // TestParsePostgresFieldsRejectedForOtherSinks covers the PostgreSQL-only options

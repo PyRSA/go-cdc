@@ -144,9 +144,9 @@ var kafkaOnlySinkFields = []string{
 	"flush-timeout",
 }
 
-// postgresNamespaceFields are rejected for stdout, mysql, kafka, and doris:
-// none of those sinks has a schema, TLS mode, or connect timeout, so accepting
-// them would silently drop the setting.
+// postgresNamespaceFields are rejected for stdout, mysql, kafka, doris, and
+// elasticsearch: none of those sinks has a schema, TLS mode, or connect timeout,
+// so accepting them would silently drop the setting.
 // database is deliberately absent. Only doris and postgresql read it, but mysql,
 // kafka, and stdout parsed it as a no-op long before postgresql existed, so
 // rejecting it there would break working configurations.
@@ -189,7 +189,8 @@ var dorisOnlySinkKeys = []string{
 }
 
 // requestTimeoutSinkKeys is the only Doris option Elasticsearch shares. It is
-// rejected for the sinks that have no request to bound.
+// rejected for the sinks that have no request to bound: stdout, mysql, kafka,
+// and postgresql.
 var requestTimeoutSinkKeys = []string{"request-timeout"}
 
 func rejectKeysForSinkType(sinkType string, seen map[string]struct{}, keyLists ...[]string) error {
@@ -753,6 +754,10 @@ func parseSink(raw map[string]any) (Sink, error) {
 		if err := rejectKeysForSinkType(out.Type, used, dorisOnlySinkKeys); err != nil {
 			return Sink{}, err
 		}
+		// schema / sslmode / connect-timeout belong to the PostgreSQL sink only.
+		if err := rejectSinkFields(raw, out.Type, postgresNamespaceFields...); err != nil {
+			return Sink{}, err
+		}
 		if err := validateElasticsearch(&out, used); err != nil {
 			return Sink{}, err
 		}
@@ -784,7 +789,7 @@ func validateSinkKeys(sinkType string, used map[string]struct{}) error {
 			// auto-create-table is shared by the MySQL, Doris and PostgreSQL
 			// sinks; the Elasticsearch sink opts into index creation with
 			// auto-create.
-			return configf("sink."+key, "only valid for sink.type mysql or doris")
+			return configf("sink."+key, "only valid for sink.type mysql, doris or postgresql")
 		}
 	}
 	return nil
@@ -909,6 +914,12 @@ func parsePostgresSink(out *Sink, raw map[string]any) error {
 	// Doris-only keys stay rejected here too: this sink has no DDL or Stream Load
 	// equivalent, so accepting them would silently drop the setting.
 	if err := rejectSinkFields(raw, out.Type, dorisOnlySinkKeys...); err != nil {
+		return err
+	}
+	// request-timeout bounds a Doris Stream Load or an Elasticsearch bulk request.
+	// This sink issues neither, so the value would never take effect and must not
+	// be accepted as a no-op.
+	if err := rejectSinkFields(raw, out.Type, requestTimeoutSinkKeys...); err != nil {
 		return err
 	}
 	if _, ok := raw["auto-create-table"]; ok && out.AutoCreate {
