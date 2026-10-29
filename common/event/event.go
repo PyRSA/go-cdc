@@ -34,6 +34,11 @@ type Event struct {
 	Keys           []string
 	SourceDatabase string
 	SourceTable    string
+	// Routed reports that a route rule matched this event and rewrote
+	// Database/Table. Sinks that map the routed database onto a namespace
+	// read it instead of comparing Database with SourceDatabase, because an
+	// identity route or a table-only rename keeps the source database name.
+	Routed bool
 	// SourceTSMs is the binlog event time in Unix milliseconds when known.
 	// Zero means unavailable; sinks must not invent a wall-clock substitute.
 	SourceTSMs int64
@@ -53,7 +58,8 @@ func (e Event) SinkID() string {
 	return e.Database + "." + e.Table
 }
 
-// Clone copies the event so route fan-out cannot share row maps.
+// Clone copies the event so route fan-out cannot share row maps. Routed is a
+// value field, so it is copied along with the rest of the event.
 func (e Event) Clone() Event {
 	e.Before = cloneMap(e.Before)
 	e.After = cloneMap(e.After)

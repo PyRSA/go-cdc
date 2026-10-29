@@ -209,6 +209,11 @@ func applyCatalog(pipe *definition.Pipeline, rules *transform.Set, routes *route
 }
 
 func applyDDL(pipe *definition.Pipeline, rules *transform.Set, routes *route.Set, sk sink.Sink, state *checkpoint.State, item event.Event, catalogApplied bool) error {
+	// The PostgreSQL sink does not map types or create tables in this release, so
+	// a schema change stops the job instead of letting the target table drift.
+	if pipe.Sink.Type == "postgresql" {
+		return fmt.Errorf("sink.postgresql: schema change is not supported in this release (table %s.%s, ddl %q)", item.Database, item.Table, item.DDL)
+	}
 	routed := routes.Apply(item)
 	for _, dst := range routed {
 		projection := rules.ProjectedColumns(dst.SourceDatabase, dst.SourceTable)

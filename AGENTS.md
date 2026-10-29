@@ -16,6 +16,7 @@ YAML-driven MySQL CDC. Binary: `go-cdc`.
 - `docs/connectors/kafka-sink.md` — Kafka (franz-go, at-least-once)
 - `docs/connectors/doris-sink.md` — Doris 2.1.x (UNIQUE KEY, Stream Load, at-least-once)
 - `docs/connectors/elasticsearch-sink.md` — Elasticsearch 8 (go-elasticsearch/v8)
+- `docs/connectors/postgresql-sink.md` — PostgreSQL (pgx, DML only; no table creation)
 - `docs/performance/mysql-to-mysql-e2e.md` — MySQL→MySQL CI performance detail (README summary only)
 
 Document only options accepted by `composer/definition/parse.go`.

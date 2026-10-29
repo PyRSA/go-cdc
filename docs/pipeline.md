@@ -36,6 +36,7 @@ Writes results. Supported types:
 | `kafka` | [connectors/kafka-sink.md](connectors/kafka-sink.md) |
 | `doris` | [connectors/doris-sink.md](connectors/doris-sink.md) |
 | `elasticsearch` | [connectors/elasticsearch-sink.md](connectors/elasticsearch-sink.md) |
+| `postgresql` | [connectors/postgresql-sink.md](connectors/postgresql-sink.md) |
 
 Doris v1 targets **2.1.x** with `UNIQUE KEY` tables and Stream Load JSON Lines;
 DELETE, partial-column updates, and DROP/TRUNCATE are rejected.
@@ -129,9 +130,9 @@ DDL comes from the source when `source.schema-change.enabled` is `true` (default
 | Location | Option | Default | Description |
 | --- | --- | --- | --- |
 | `source` | `schema-change.enabled` | `true` | Capture DDL when `true` |
-| `sink` | `schema.change.drop-truncate.enabled` | `false` | Allow DROP TABLE / TRUNCATE on MySQL sink when `true`; rejected for Doris |
-| `sink` | `schema.change.enabled` | `false` | **Doris only** (rejected for mysql / kafka / stdout): apply whitelisted `ADD COLUMN` when `true` |
-| `sink` | `schema.change.include` | `["add.column"]` | **Doris only** (rejected for mysql / kafka / stdout): v1 accepts only `add.column` |
+| `sink` | `schema.change.drop-truncate.enabled` | `false` | Allow DROP TABLE / TRUNCATE on MySQL sink when `true`; rejected for Doris and PostgreSQL |
+| `sink` | `schema.change.enabled` | `false` | **Doris only** (rejected for mysql / kafka / stdout / postgresql): apply whitelisted `ADD COLUMN` when `true` |
+| `sink` | `schema.change.include` | `["add.column"]` | **Doris only** (rejected for mysql / kafka / stdout / postgresql): v1 accepts only `add.column` |
 
 ### Behavior summary
 
@@ -162,7 +163,9 @@ DDL comes from the source when `source.schema-change.enabled` is `true` (default
 | CREATE TABLE | Applied through `auto-create-table` / the inferred schema, then validated |
 | Other / unprojected columns | Ignored when no Doris action is required |
 
-Details: [MySQL Source](connectors/mysql-source.md), [MySQL Sink](connectors/mysql-sink.md), [Stdout Sink](connectors/stdout-sink.md), [Kafka Sink](connectors/kafka-sink.md), [Doris Sink](connectors/doris-sink.md), [Elasticsearch Sink](connectors/elasticsearch-sink.md).
+**PostgreSQL sink** does not handle DDL in this release: any schema change stops the job with an explicit error and the checkpoint does not advance, so the target table never drifts silently behind the source. Set `source.schema-change.enabled: false` only if you accept that the target table is maintained outside `go-cdc`.
+
+Details: [MySQL Source](connectors/mysql-source.md), [MySQL Sink](connectors/mysql-sink.md), [Stdout Sink](connectors/stdout-sink.md), [Kafka Sink](connectors/kafka-sink.md), [Doris Sink](connectors/doris-sink.md), [Elasticsearch Sink](connectors/elasticsearch-sink.md), [PostgreSQL Sink](connectors/postgresql-sink.md).
 
 ---
 
@@ -192,7 +195,7 @@ source:
   type: mysql
   # … see mysql-source.md
 sink:
-  type: mysql   # or stdout / kafka / doris / elasticsearch — see sink docs
+  type: mysql   # or stdout / kafka / doris / elasticsearch / postgresql — see sink docs
   # …
 transform:
   - source-table: demo_db\.orders
@@ -223,3 +226,4 @@ checkpoint:
   - [Kafka Sink](connectors/kafka-sink.md)
   - [Doris Sink](connectors/doris-sink.md)
   - [Elasticsearch Sink](connectors/elasticsearch-sink.md)
+  - [PostgreSQL Sink](connectors/postgresql-sink.md)

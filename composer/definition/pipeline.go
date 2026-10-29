@@ -55,7 +55,7 @@ type Source struct {
 	JDBCProperties        map[string]string
 }
 
-// Sink is stdout, MySQL, Kafka, Doris, or Elasticsearch for this release.
+// Sink is stdout, MySQL, Kafka, Doris, Elasticsearch, or PostgreSQL for this release.
 type Sink struct {
 	Type            string
 	Hostname        string
@@ -76,9 +76,11 @@ type Sink struct {
 	AllowAutoCreateTopics bool          // allow.auto.create.topics; default true via parseSink
 	ProducerBatchMaxBytes int           // producer-batch-max-bytes; bytes; default via parseSink
 	FlushTimeout          time.Duration // flush-timeout; default 30s via parseSink
-	// Doris
+	// Doris (Database is shared with PostgreSQL; mysql, kafka, and stdout still
+	// accept it as a no-op for compatibility with configurations written before
+	// the PostgreSQL sink existed)
 	SQLPort             int           // sql-port; FE MySQL protocol; default 9030 via parseSink
-	Database            string        // database; optional default target database
+	Database            string        // database; required for postgresql, optional default target database for doris
 	SchemaChange        bool          // schema.change.enabled; default false
 	SchemaChangeInclude []string      // schema.change.include; v1 allows only add.column
 	SchemaChangeWait    time.Duration // schema.change.wait-timeout; ADD COLUMN visibility budget
@@ -100,6 +102,11 @@ type Sink struct {
 	// HTTP timeout for Stream Load and the Bulk API respectively.
 	RequestTimeout time.Duration
 	BulkMaxBytes   int // bulk-max-bytes; encoded NDJSON bytes per bulk request
+
+	// PostgreSQL
+	Schema         string        // schema; default public via parseSink
+	SSLMode        string        // sslmode; default prefer via parseSink
+	ConnectTimeout time.Duration // connect-timeout; default 30s via parseSink
 }
 
 // Route sends one source table pattern to a sink table.

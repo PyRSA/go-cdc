@@ -1,0 +1,189 @@
+# PostgreSQL sink DML integration tests (TP-PG scope): one real PostgreSQL 16,
+# no MySQL source and no pipeline harness. The MySQL E2E lives in integration.yml.
+name: CI / PostgreSQL Sink Integration
+
+on:
+  # The sink under test is reached through common/event, runtime/route and
+  # composer, so any Go change can break it; docs-only changes are excluded,
+  # except this workflow itself.
+  push:
+    paths:
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/postgresql-integration.yml"
+      - "!**/*.md"
+  pull_request:
+    paths:
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/postgresql-integration.yml"
+      - "!**/*.md"
+  workflow_dispatch:
+
+# Per-workflow group: a newer commit on the same branch/PR cancels older runs
+# of THIS workflow only. Same commit's repo-checks / integration runs are untouched.
+concurrency:
+  group: postgresql-sink-integration-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Same-repo PR + push would double-run; skip push work when an open PR
+  # already covers this head (pull_request / workflow_dispatch always run).
+  decide:
+    name: Decide run
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    permissions:
+      pull-requests: read
+    steps:
+      - id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" != "push" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "event=${EVENT_NAME}: run"
+            exit 0
+          fi
+          # Fail open on API errors so a transient gh blip still runs push CI.
+          count="$(gh api \
+            "repos/${REPO}/pulls?state=open&head=${OWNER}:${REF_NAME}" \
+            --jq 'length' 2>/dev/null || true)"
+          if [[ "${count}" =~ ^[0-9]+$ && "${count}" -gt 0 ]]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "push skipped: ${count} open PR(s) for ${OWNER}:${REF_NAME}"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            if [[ -z "${count}" || ! "${count}" =~ ^[0-9]+$ ]]; then
+              echo "push runs: PR lookup failed or empty; fail-open"
+            else
+              echo "push runs: no open PR for ${OWNER}:${REF_NAME}"
+            fi
+          fi
+
+  postgres-sink-dml:
+    name: PostgreSQL 16 sink DML
+    needs: decide
+    if: needs.decide.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    # The patch tag is pinned like the MySQL images in integration.yml, so a
+    # server upgrade is a deliberate change rather than a silent one.
+    services:
+      postgres:
+        image: postgres:16.4
+        env:
+          POSTGRES_USER: cdc
+          POSTGRES_PASSWORD: cdc_it_password
+          POSTGRES_DB: cdc_it
+        ports:
+          - 5432:5432
+        # The runner blocks on this health check, so no step starts against a
+        # booting server; pg_isready proves the listener accepts connections.
+        options: >-
+          --health-cmd "pg_isready -U cdc -d cdc_it"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: cdc
+      PGDATABASE: cdc_it
+      PGPASSWORD: cdc_it_password
+      # Read by connector/sink/postgresql/sink_integration_test.go only.
+      PG_DSN: postgres://cdc:cdc_it_password@127.0.0.1:5432/cdc_it?sslmode=disable
+      # Turns a missing DSN into a failure instead of a suite-wide skip.
+      PG_IT_REQUIRED: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Verify PostgreSQL accepts connections
+        run: |
+          set -euo pipefail
+          if [[ -z "${PG_DSN:-}" ]]; then
+            echo "::error::PG_DSN is empty; the integration environment is broken."
+            exit 1
+          fi
+          # Print the target without the password so a connection failure is
+          # diagnosable from the log alone.
+          echo "target: postgres://${PGUSER}@${PGHOST}:${PGPORT}/${PGDATABASE} (password hidden)"
+          if ! command -v psql >/dev/null; then
+            sudo apt-get update -y
+            sudo apt-get install -y --no-install-recommends postgresql-client
+          fi
+          # pg_isready gates container start-up; it does not prove the
+          # authentication path works, so probe with the real credentials. Only
+          # this probe retries: a failing Go test is never retried, otherwise a
+          # real defect could be hidden behind a green job.
+          attempts=5
+          for attempt in $(seq 1 "${attempts}"); do
+            if psql --no-password --set=ON_ERROR_STOP=1 \
+              --command 'SELECT version()' \
+              --command 'SELECT current_user, current_database()'; then
+              echo "auth probe passed on attempt ${attempt}/${attempts}"
+              exit 0
+            fi
+            if [[ "${attempt}" -eq "${attempts}" ]]; then
+              echo "::error::psql auth probe failed ${attempts} times; the server never accepted the credentials."
+              exit 1
+            fi
+            echo "auth probe attempt ${attempt}/${attempts} failed; retrying in 2s"
+            sleep 2
+          done
+
+      - name: Run PostgreSQL integration tests
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/postgres-sink-it.log"
+          # pipefail keeps the go test exit code even though the log is teed.
+          go test -tags postgres_integration ./connector/sink/postgresql/ \
+            -count=1 -v -timeout 10m 2>&1 | tee "${log}"
+          # A skip means no server was contacted, so a green run that skipped
+          # must not be read as a passing DML path.
+          if grep -q '^--- SKIP' "${log}"; then
+            echo "::error::the integration suite skipped at least one test; it must hit a real PostgreSQL."
+            grep '^--- SKIP' "${log}"
+            exit 1
+          fi
+          # Every test in the integration file must report PASS, so a case that
+          # stops running cannot quietly turn the job green.
+          missing=0
+          while read -r name; do
+            if ! grep -q "^--- PASS: ${name} " "${log}"; then
+              echo "::error::integration test ${name} did not report PASS."
+              missing=$((missing + 1))
+            fi
+          done < <(sed -n 's/^func \(Test[A-Za-z0-9_]*\)(.*/\1/p' \
+            connector/sink/postgresql/sink_integration_test.go)
+          if (( missing > 0 )); then
+            exit 1
+          fi
+          echo "OK: every test in sink_integration_test.go passed against PostgreSQL."
+
+      # Distinguishes a broken server from a failing assertion after the fact.
+      - name: Dump PostgreSQL logs on failure
+        if: failure()
+        run: |
+          set -uo pipefail
+          for id in $(docker ps -aq --filter ancestor=postgres:16.4); do
+            echo "=== docker logs ${id} (tail 200) ==="
+            docker logs --tail 200 "${id}" 2>&1
+          done

@@ -237,6 +237,11 @@ func TestParseElasticsearchKeysAreSinkScoped(t *testing.T) {
 		{"buckets on elasticsearch", "  type: elasticsearch\n  hosts: [http://127.0.0.1:9200]\n  buckets: 8", "sink.buckets"},
 		{"sql-port on elasticsearch", "  type: elasticsearch\n  hosts: [http://127.0.0.1:9200]\n  sql-port: 9030", "sink.sql-port"},
 		{"delete.enabled on elasticsearch", "  type: elasticsearch\n  hosts: [http://127.0.0.1:9200]\n  delete.enabled: true", "sink.delete.enabled"},
+		// schema / sslmode / connect-timeout belong to the PostgreSQL sink only, so
+		// accepting them here would silently drop the setting.
+		{"schema on elasticsearch", "  type: elasticsearch\n  hosts: [http://127.0.0.1:9200]\n  schema: ods", "sink.schema"},
+		{"sslmode on elasticsearch", "  type: elasticsearch\n  hosts: [http://127.0.0.1:9200]\n  sslmode: require", "sink.sslmode"},
+		{"connect-timeout on elasticsearch", "  type: elasticsearch\n  hosts: [http://127.0.0.1:9200]\n  connect-timeout: 5s", "sink.connect-timeout"},
 		// request-timeout is shared by Doris and Elasticsearch only.
 		{"request-timeout on stdout", "  type: stdout\n  request-timeout: 10s", "sink.request-timeout"},
 		// flush-timeout only bounds the Kafka producer Flush/Close.

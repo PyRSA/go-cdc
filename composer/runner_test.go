@@ -219,6 +219,41 @@ func TestFanoutWriteToMissingSinkFailsJob(t *testing.T) {
 	}
 }
 
+func TestRouteMarksRoutedBeforeSink(t *testing.T) {
+	sk := &batchSink{}
+	msgs := make(chan source.Message, 2)
+	msgs <- source.Message{Event: &event.Event{
+		Op: event.OpCreate, Database: "db", Table: "t", SourceDatabase: "db", SourceTable: "t",
+		Columns: []string{"id"}, Keys: []string{"id"}, After: map[string]any{"id": int64(1)},
+	}}
+	// No rule covers db.other.
+	msgs <- source.Message{Event: &event.Event{
+		Op: event.OpCreate, Database: "db", Table: "other", SourceDatabase: "db", SourceTable: "other",
+		Columns: []string{"id"}, Keys: []string{"id"}, After: map[string]any{"id": int64(2)},
+	}}
+	close(msgs)
+	pipe := &definition.Pipeline{
+		Sink:       definition.Sink{Type: "mysql", WriteBatchSize: 10},
+		Routes:     []definition.Route{{SourceTable: `db\.t`, SinkTable: "db.t"}},
+		Runtime:    definition.Runtime{RouteMode: definition.RouteAllMatch},
+		Checkpoint: definition.Checkpoint{Interval: time.Hour},
+	}
+	path := filepath.Join(t.TempDir(), "checkpoint.ckpt")
+	if err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(sk.batches) != 1 || len(sk.batches[0]) != 2 {
+		t.Fatalf("batches %#v", sk.batches)
+	}
+	// The identity route matches even though the database name is unchanged.
+	if !sk.batches[0][0].Routed {
+		t.Fatalf("routed event lost the mark: %#v", sk.batches[0][0])
+	}
+	if sk.batches[0][1].Routed {
+		t.Fatalf("unmatched event must stay unmarked: %#v", sk.batches[0][1])
+	}
+}
+
 func TestBatchFlushesAtConfiguredSize(t *testing.T) {
 	sk := &orderSink{}
 	msgs := make(chan source.Message, 4)
@@ -457,6 +492,34 @@ func TestShutdownSaveErrorIsReturned(t *testing.T) {
 	err = Run(ctx, pipe, nil, &orderSink{}, checkpoint.Store{Path: filepath.Join(blocked, "checkpoint.ckpt")}, checkpoint.State{}, nil)
 	if err == nil {
 		t.Fatal("save failure on shutdown was ignored")
+	}
+}
+
+// TestCanceledWriteDoesNotAdvanceCheckpoint pins the shutdown contract at the
+// runner level: when the sink reports the cancellation, Run returns from save()
+// before store.Save, so the batch is replayed on restart instead of skipped.
+func TestCanceledWriteDoesNotAdvanceCheckpoint(t *testing.T) {
+	sk := &canceledWriteSink{}
+	msgs := make(chan source.Message, 2)
+	msgs <- source.Message{Event: &event.Event{
+		Op: event.OpCreate, Database: "db", Table: "t",
+		SourceDatabase: "db", SourceTable: "t",
+		After: map[string]any{"id": int64(1)}, Columns: []string{"id"}, Keys: []string{"id"},
+	}}
+	msgs <- source.Message{Position: &source.Position{File: "mysql-bin.000001", Pos: 42}}
+	close(msgs)
+	path := filepath.Join(t.TempDir(), "checkpoint.ckpt")
+	pipe := &definition.Pipeline{
+		Sink:       definition.Sink{Type: "postgresql"},
+		Runtime:    definition.Runtime{RouteMode: definition.RouteAllMatch},
+		Checkpoint: definition.Checkpoint{Interval: time.Hour},
+	}
+	err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil)
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("error %v", err)
+	}
+	if _, statErr := os.Stat(path); statErr == nil {
+		t.Fatal("checkpoint advanced past a canceled write")
 	}
 }
 
@@ -708,6 +771,86 @@ func TestCapturedSaveFailureSkipsRemove(t *testing.T) {
 		t.Fatalf("Remove ran despite save failure: %#v", spill.removed)
 	}
 }
+
+func TestPostgresDDLFailsFast(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  source.Message
+	}{
+		{
+			name: "alter table",
+			msg: source.Message{Event: &event.Event{
+				Op: event.OpDDL, Database: "db", Table: "t", SourceDatabase: "db", SourceTable: "t",
+				DDL: "ALTER TABLE db.t ADD COLUMN c INT",
+			}},
+		},
+		{
+			name: "create table with catalog",
+			msg: source.Message{
+				Schema: &schema.Table{
+					Database: "db", Table: "t",
+					Columns:     []schema.Column{{Name: "id", Type: "int"}},
+					PrimaryKeys: []string{"id"},
+				},
+				Event: &event.Event{
+					Op: event.OpDDL, Database: "db", Table: "t", SourceDatabase: "db", SourceTable: "t",
+					DDL: "CREATE TABLE db.t (id int)",
+				},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sk := &schemaSink{}
+			msgs := make(chan source.Message, 2)
+			msgs <- tc.msg
+			msgs <- source.Message{Position: &source.Position{File: "mysql-bin.000001", Pos: 90}}
+			close(msgs)
+			pipe := &definition.Pipeline{
+				Sink:       definition.Sink{Type: "postgresql"},
+				Runtime:    definition.Runtime{RouteMode: definition.RouteAllMatch},
+				Checkpoint: definition.Checkpoint{Interval: time.Hour},
+			}
+			path := filepath.Join(t.TempDir(), "checkpoint.ckpt")
+			err := Run(context.Background(), pipe, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil)
+			if err == nil {
+				t.Fatal("expected fail fast")
+			}
+			if !strings.Contains(err.Error(), "schema change is not supported") || !strings.Contains(err.Error(), "db.t") {
+				t.Fatalf("error %q", err)
+			}
+			if len(sk.applied) != 0 {
+				t.Fatalf("sink received DDL: %#v", sk.applied)
+			}
+			if _, statErr := os.Stat(path); statErr == nil {
+				t.Fatal("checkpoint advanced past the failed DDL")
+			}
+		})
+	}
+}
+
+// batchSink records the batches the runner hands to the sink.
+type batchSink struct {
+	batches [][]event.Event
+}
+
+func (s *batchSink) Open(context.Context) error     { return nil }
+func (s *batchSink) CreateTable(schema.Table) error { return nil }
+func (s *batchSink) ApplySchema(schema.Change) error {
+	return nil
+}
+func (s *batchSink) Write(batch []event.Event) error {
+	s.batches = append(s.batches, append([]event.Event(nil), batch...))
+	return nil
+}
+func (s *batchSink) Flush() error { return nil }
+func (s *batchSink) Close() error { return nil }
+
+// canceledWriteSink reports the shutdown cancellation the PostgreSQL sink wraps
+// when the signal lands while a batch is in flight.
+type canceledWriteSink struct{ batchSink }
+
+func (s *canceledWriteSink) Write([]event.Event) error { return context.Canceled }
 
 type recordingSpill struct {
 	removed []string

@@ -1,5 +1,5 @@
 // Command go-cdc runs one YAML pipeline.
-// sink.type selects stdout, mysql, kafka, doris, or elasticsearch.
+// sink.type selects stdout, mysql, kafka, doris, elasticsearch, or postgresql.
 package main
 
 import (
@@ -20,6 +20,7 @@ import (
 	esSink "github.com/PyRSA/go-cdc/connector/sink/elasticsearch"
 	kafkasink "github.com/PyRSA/go-cdc/connector/sink/kafka"
 	mysqlsink "github.com/PyRSA/go-cdc/connector/sink/mysql"
+	pgxsink "github.com/PyRSA/go-cdc/connector/sink/postgresql"
 	"github.com/PyRSA/go-cdc/connector/sink/stdout"
 	mysqlsrc "github.com/PyRSA/go-cdc/connector/source/mysql"
 	"github.com/PyRSA/go-cdc/runtime/checkpoint"
@@ -38,7 +39,7 @@ func run(args []string) (code int) {
 		fmt.Fprintln(os.Stderr, "usage: go-cdc <pipeline.yaml>")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Run one YAML pipeline (source → transform/route → sink).")
-		fmt.Fprintln(os.Stderr, "Supported sinks in this release: stdout, mysql, kafka, doris, elasticsearch.")
+		fmt.Fprintln(os.Stderr, "Supported sinks in this release: stdout, mysql, kafka, doris, elasticsearch, postgresql.")
 		return 0
 	}
 	if len(args) != 1 {
@@ -57,16 +58,26 @@ func run(args []string) (code int) {
 	}
 	logger.Info("pipeline loaded", "name", pipe.Runtime.Name, "sink", pipe.Sink.Type, "startup", pipe.Source.StartupMode)
 
+	// SIGINT/SIGTERM cancels startup and in-flight work. Created before the sink
+	// opens so a Ctrl-C during the first connection is not ignored; the runner
+	// still drains the pending batch before it saves the checkpoint.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	store := checkpoint.Store{Path: pipe.Checkpoint.FilePath}
 	state, err := store.Load()
 	if err != nil {
 		logger.Error("load checkpoint", "err", err)
 		return 1
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	sk, err := openSink(ctx, pipe)
 	if err != nil {
+		// A signal during startup cancels the first connect; that is a stop, not a
+		// failure, and matches the clean exit of a cancelled run.
+		if errors.Is(err, context.Canceled) {
+			logger.Info("pipeline stopped during startup", "name", pipe.Runtime.Name)
+			return 0
+		}
 		logger.Error("open sink", "err", err)
 		return 1
 	}
@@ -228,6 +239,15 @@ func openSink(ctx context.Context, pipe *definition.Pipeline) (sink.Sink, error)
 		}
 		if err := sk.Open(ctx); err != nil {
 			// Open already released the client it created on failure.
+			return nil, err
+		}
+		return sk, nil
+	case "postgresql":
+		sk, err := pgxsink.Open(pipe.Sink, pipe.Source.TimeZone)
+		if err != nil {
+			return nil, err
+		}
+		if err := sk.Open(ctx); err != nil {
 			return nil, err
 		}
 		return sk, nil
