@@ -1061,7 +1061,7 @@ func TestPostgresFlushesPendingRowsBeforeDDL(t *testing.T) {
 			ddl = i
 		}
 	}
-	if write < 0 || flush < 0 || ddl < 0 || !(write < flush && flush < ddl) {
+	if write < 0 || flush < 0 || ddl < 0 || write >= flush || flush >= ddl {
 		t.Fatalf("expected write -> flush -> ddl, got: %#v", sk.order)
 	}
 }
