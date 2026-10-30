@@ -7,7 +7,6 @@ import shutil
 from pathlib import Path
 
 _GiB = 1024**3
-_MiB = 1024**2
 
 # (idle, total) jiffies from previous /proc/stat sample for delta CPU %.
 _last_cpu: tuple[int, int] | None = None
@@ -57,10 +56,49 @@ def format_disk(path: str | Path | None = None) -> str:
     return f"disk free={free_g:.1f}GiB/{total_g:.1f}GiB used={used_pct:.0f}% path={target}"
 
 
-def format_cpu_mem() -> str:
-    """Host loadavg + /proc CPU% since last call + MemAvailable/MemTotal."""
+def cpu_busy_pct() -> float | None:
+    """Host CPU busy % since the previous call (None on the first call, non-Linux)."""
     global _last_cpu
 
+    cur = _read_cpu_jiffies()
+    if cur is None:
+        return None
+    busy: float | None = None
+    if _last_cpu is not None:
+        d_idle = cur[0] - _last_cpu[0]
+        d_total = cur[1] - _last_cpu[1]
+        if d_total > 0:
+            busy = 100.0 * (1.0 - d_idle / d_total)
+    _last_cpu = cur
+    return busy
+
+
+def mem_mib() -> tuple[float, float] | None:
+    """(available MiB, total MiB) from /proc/meminfo; None when unavailable."""
+    mem = _read_meminfo()
+    total_kb = mem.get("MemTotal", 0)
+    if total_kb <= 0:
+        return None
+    avail_kb = mem.get("MemAvailable", mem.get("MemFree", 0))
+    return avail_kb / 1024.0, total_kb / 1024.0
+
+
+def proc_rss_mib(pid: int | None) -> float | None:
+    """Resident set size of ``pid`` in MiB; None when it cannot be read (non-Linux)."""
+    if pid is None or pid <= 0:
+        return None
+    try:
+        with open(f"/proc/{pid}/status", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def format_cpu_mem() -> str:
+    """Host loadavg + /proc CPU% since last call + MemAvailable/MemTotal."""
     parts: list[str] = []
     try:
         load1, load5, load15 = os.getloadavg()
@@ -68,28 +106,16 @@ def format_cpu_mem() -> str:
     except OSError:
         parts.append("load=?")
 
-    cur = _read_cpu_jiffies()
-    if cur is not None and _last_cpu is not None:
-        d_idle = cur[0] - _last_cpu[0]
-        d_total = cur[1] - _last_cpu[1]
-        if d_total > 0:
-            busy_pct = 100.0 * (1.0 - d_idle / d_total)
-            parts.append(f"cpu={busy_pct:.0f}%")
-        else:
-            parts.append("cpu=?")
-    else:
-        parts.append("cpu=?")
-    if cur is not None:
-        _last_cpu = cur
+    busy = cpu_busy_pct()
+    parts.append(f"cpu={busy:.0f}%" if busy is not None else "cpu=?")
 
-    mem = _read_meminfo()
-    total_kb = mem.get("MemTotal", 0)
-    avail_kb = mem.get("MemAvailable", mem.get("MemFree", 0))
-    if total_kb > 0:
-        avail_g = avail_kb * 1024 / _GiB
-        total_g = total_kb * 1024 / _GiB
-        used_pct = 100.0 * (1.0 - avail_kb / total_kb)
-        parts.append(f"mem avail={avail_g:.1f}GiB/{total_g:.1f}GiB used={used_pct:.0f}%")
+    usage = mem_mib()
+    if usage is not None:
+        avail_mib, total_mib = usage
+        used_pct = 100.0 * (1.0 - avail_mib / total_mib) if total_mib else 0.0
+        parts.append(
+            f"mem avail={avail_mib / 1024:.1f}GiB/{total_mib / 1024:.1f}GiB used={used_pct:.0f}%"
+        )
     else:
         parts.append("mem=?")
 
@@ -100,15 +126,10 @@ def format_proc_rss(pid: int | None) -> str:
     """Optional process RSS for go-cdc (or any pid)."""
     if pid is None or pid <= 0:
         return ""
-    try:
-        with open(f"/proc/{pid}/status", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("VmRSS:"):
-                    kb = int(line.split()[1])
-                    return f"cdc_rss={kb * 1024 / _MiB:.0f}MiB"
-    except (OSError, ValueError, IndexError):
+    rss = proc_rss_mib(pid)
+    if rss is None:
         return f"cdc_rss=? pid={pid}"
-    return f"cdc_rss=? pid={pid}"
+    return f"cdc_rss={rss:.0f}MiB"
 
 
 def format_host_res(pid: int | None = None) -> str:

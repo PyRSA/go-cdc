@@ -6,6 +6,7 @@
 # Elasticsearch 8 (security off, single node): bash scripts/es-up.sh
 # Elasticsearch 7.17 (security off, single node): bash scripts/es7-up.sh
 # Elasticsearch 9 (security off, single node): bash scripts/es9-up.sh
+# PostgreSQL sink target: bash scripts/pg-up.sh (PG_IMAGE pins the major version)
 services:
   mysql:
     image: ${MYSQL_IMAGE:-mysql:8.0.36}
@@ -35,6 +36,34 @@ services:
       timeout: 5s
       retries: 40
       start_period: 20s
+
+  # PostgreSQL sink for the mysql2postgresql suites (host → 127.0.0.1:${PG_HOST_PORT}).
+  # One database (cdc_it): the PostgreSQL sink connects to exactly one database and
+  # isolates suites by schema, so a suite's "sink DB" is a schema here.
+  postgres:
+    image: ${PG_IMAGE:-postgres:16.4}
+    ports:
+      - "${PG_HOST_PORT:-15432}:5432"
+    environment:
+      POSTGRES_USER: ${PG_USER:-postgres}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-postgres}
+      POSTGRES_DB: ${PG_DB:-cdc_it}
+      TZ: Asia/Shanghai
+    command:
+      - -c
+      - max_connections=200
+      - -c
+      - logging_collector=off
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${PG_USER:-postgres} -d ${PG_DB:-cdc_it}",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
 
   # KRaft single-node broker for Kafka sink IT (host → 127.0.0.1:${KAFKA_HOST_PORT}).
   kafka:

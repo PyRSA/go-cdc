@@ -9,6 +9,11 @@ CREATE DATABASE IF NOT EXISTS db_tp_load_src DEFAULT CHARACTER SET utf8mb4;
 CREATE DATABASE IF NOT EXISTS db_tp_load_snk DEFAULT CHARACTER SET utf8mb4;
 -- Elasticsearch sink suites read MySQL and write indices (no MySQL sink DB needed).
 CREATE DATABASE IF NOT EXISTS db_tp_es_src DEFAULT CHARACTER SET utf8mb4;
+-- PostgreSQL sink suites: MySQL is the source only; two databases so the same
+-- table name can live in two of them and each routes to its own PG schema.
+CREATE DATABASE IF NOT EXISTS db_tp_pg_src_a DEFAULT CHARACTER SET utf8mb4;
+CREATE DATABASE IF NOT EXISTS db_tp_pg_src_b DEFAULT CHARACTER SET utf8mb4;
+CREATE DATABASE IF NOT EXISTS db_tp_pg_load_src DEFAULT CHARACTER SET utf8mb4;
 
 CREATE USER IF NOT EXISTS 'u_a7k9m2x4'@'%' IDENTIFIED BY 'P_w8q3n5v1r6';
 CREATE USER IF NOT EXISTS 'u_b3j6c8y1'@'%' IDENTIFIED BY 'P_z2h5t9k4m7';
@@ -17,6 +22,9 @@ GRANT ALL PRIVILEGES ON db_tp_func_src.* TO 'u_a7k9m2x4'@'%';
 GRANT ALL PRIVILEGES ON db_tp_types_src.* TO 'u_a7k9m2x4'@'%';
 GRANT ALL PRIVILEGES ON db_tp_load_src.* TO 'u_a7k9m2x4'@'%';
 GRANT ALL PRIVILEGES ON db_tp_es_src.* TO 'u_a7k9m2x4'@'%';
+GRANT ALL PRIVILEGES ON db_tp_pg_src_a.* TO 'u_a7k9m2x4'@'%';
+GRANT ALL PRIVILEGES ON db_tp_pg_src_b.* TO 'u_a7k9m2x4'@'%';
+GRANT ALL PRIVILEGES ON db_tp_pg_load_src.* TO 'u_a7k9m2x4'@'%';
 GRANT REPLICATION SLAVE, REPLICATION CLIENT, RELOAD, PROCESS ON *.* TO 'u_a7k9m2x4'@'%';
 
 GRANT ALL PRIVILEGES ON db_tp_func_snk.* TO 'u_b3j6c8y1'@'%';
