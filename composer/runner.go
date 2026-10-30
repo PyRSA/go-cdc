@@ -307,9 +307,12 @@ func applyDDL(pipe *definition.Pipeline, rules *transform.Set, routes *route.Set
 // The sink is the authority on what it may do: it knows the type mapping, the
 // routed target, and the switches that authorise a change, so every kind except
 // CREATE TABLE goes to it, including the ones it refuses. A refused or failed
-// change stops the job, because the checkpoint has already moved past the
-// statement and a target that keeps the old structure diverges with nothing to
-// show for it.
+// change stops the job before the checkpoint moves past the statement: the
+// binlog position is recorded only after the message is applied, and the error
+// path saves nothing, so a restart re-reads the same statement and asks the sink
+// again instead of leaving the target behind with nothing to show for it. A
+// change that did succeed is replayed the same way when the job stops before the
+// next save, so the sink must treat a repeated DDL as a no-op.
 func applyPostgresDDL(sk sink.Sink, state *checkpoint.State, dst event.Event, decision schemaevol.Decision, change schema.Change, catalogApplied bool) error {
 	// The sink renders its own DDL from the structured change, so it needs the
 	// source statement for diagnostics and the source table for the definition a

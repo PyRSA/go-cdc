@@ -1051,15 +1051,18 @@ func TestPostgresFlushesPendingRowsBeforeDDL(t *testing.T) {
 		case "write":
 			write = i
 		case "flush":
-			if flush < 0 {
+			// The shutdown save flushes again with an empty batch, so take the
+			// first flush that follows the write: that is the one that drains
+			// the pending rows.
+			if flush < 0 && write >= 0 {
 				flush = i
 			}
 		case "ddl":
 			ddl = i
 		}
 	}
-	if ddl < 0 || write < 0 || flush < 0 || flush > ddl || write > ddl {
-		t.Fatalf("DDL ran before the pending rows were flushed: %#v", sk.order)
+	if write < 0 || flush < 0 || ddl < 0 || !(write < flush && flush < ddl) {
+		t.Fatalf("expected write -> flush -> ddl, got: %#v", sk.order)
 	}
 }
 
