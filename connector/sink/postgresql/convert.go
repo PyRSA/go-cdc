@@ -9,10 +9,15 @@ import (
 // ConvertValue maps one normalized source value onto a pgx argument.
 //
 // The source normalizes every MySQL value to nil, int64, uint64, string, or
-// []byte (floats, DECIMAL, dates, and ENUM/SET become strings). PostgreSQL
-// infers each parameter type from the target column, and pgx always sends
-// string parameters in text format, so the server parses the text according to
-// the column type. Values therefore never pass through float64 here.
+// []byte. Both capture paths agree on integers, blobs, NULL, DECIMAL, and the
+// date/time text, and they differ only for the types this sink refuses at table
+// creation (enum, set, bit, whose binlog value is an integer while the snapshot
+// value is the label or the packed bytes).
+//
+// PostgreSQL infers each parameter type from the target column, and pgx sends a
+// string parameter in text format and a []byte parameter verbatim to a text or
+// json column, so the server parses the text according to the column type.
+// Values therefore never pass through float64 here.
 func ConvertValue(value any) any {
 	switch v := value.(type) {
 	case nil:

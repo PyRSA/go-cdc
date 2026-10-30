@@ -3,6 +3,8 @@ package postgresql
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -45,6 +47,7 @@ type fakeTx struct {
 	commitErr   error
 	rollbackErr error
 	queued      int
+	sqls        []string
 	paramCount  int
 	committed   bool
 	rolledBack  bool
@@ -58,6 +61,7 @@ type fakeTx struct {
 func (f *fakeTx) SendBatch(ctx context.Context, batch *pgx.Batch) pgx.BatchResults {
 	f.queued = batch.Len()
 	for _, item := range batch.QueuedQueries {
+		f.sqls = append(f.sqls, item.SQL)
 		f.paramCount += len(item.Arguments)
 	}
 	return f.results
@@ -82,6 +86,9 @@ type fakePool struct {
 	pingErr     error
 	beginErr    error
 	rollbackErr error
+	// commitErr fails the COMMIT of every transaction this pool opens, which is
+	// how a test shows a commit whose result the client never learned.
+	commitErr error
 	// onBegin runs before the context check, so a test can cancel the lifecycle
 	// context while a transaction is being opened.
 	onBegin func()
@@ -109,7 +116,7 @@ func (f *fakePool) Begin(ctx context.Context) (tx, error) {
 	if f.resultsFor != nil {
 		results = f.resultsFor(f.begins)
 	}
-	handle := &fakeTx{results: results, rollbackErr: f.rollbackErr}
+	handle := &fakeTx{results: results, commitErr: f.commitErr, rollbackErr: f.rollbackErr}
 	f.txs = append(f.txs, handle)
 	return handle, nil
 }
@@ -127,13 +134,22 @@ func (f *fakePool) Close() {
 }
 
 func newTestSink(p pool, maxRetries int) *Sink {
+	return newTestSinkWithCatalogue(p, maxRetries, &fakeQuerier{})
+}
+
+// newTestSinkWithCatalogue builds a sink whose target catalogue reads answer
+// with the rows a test prepares, which is how a DDL test shows the table as it
+// looks before and after the statement the sink runs.
+func newTestSinkWithCatalogue(p pool, maxRetries int, q *fakeQuerier) *Sink {
 	return &Sink{
 		cfg:       definition.Sink{Schema: "public", MaxRetries: maxRetries},
 		builder:   NewBuilder("public"),
 		pool:      p,
+		meta:      newMetadata(q),
 		opTimeout: time.Second,
 		sleep:     func(context.Context, time.Duration) error { return nil },
 		baseCtx:   context.Background(),
+		log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 }
 
@@ -630,17 +646,57 @@ func TestValidateTimeZone(t *testing.T) {
 	}
 }
 
-func TestCreateTableAndApplySchemaFail(t *testing.T) {
+// TestCreateTableAndApplySchemaRefuseByDefault is the PR2 default-on-safety
+// contract: neither creating a table nor applying a column change happens unless
+// the operator asked for it, and the refusal names the option to turn on.
+func TestCreateTableAndApplySchemaRefuseByDefault(t *testing.T) {
 	sink := newTestSink(&fakePool{}, 0)
-	table := schema.Table{Database: "public", Table: "users"}
-	if err := sink.CreateTable(table); err == nil {
-		t.Fatal("CreateTable must fail")
+	table := schema.Table{Database: "public", Table: "users",
+		Columns:     []schema.Column{{Name: "id", Type: "bigint", Nullable: false}},
+		PrimaryKeys: []string{"id"}}
+	err := sink.CreateTable(table)
+	if err == nil || !strings.Contains(err.Error(), "auto-create-table is false") {
+		t.Fatalf("CreateTable without the option: %v", err)
 	}
-	change := schema.Change{Database: "public", Table: "users", DDL: "ALTER TABLE users ADD COLUMN c int"}
-	if err := sink.ApplySchema(change); err == nil {
-		t.Fatal("ApplySchema must fail")
+	change := schema.Change{Action: schema.ActionAddColumn, Database: "public", Table: "users",
+		Column: "note", DDL: "ALTER TABLE users ADD COLUMN note text"}
+	err = sink.ApplySchema(change)
+	if err == nil || !strings.Contains(err.Error(), "schema changes are disabled") {
+		t.Fatalf("ApplySchema with the switch off: %v", err)
 	}
 	if err := sink.Flush(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestCreateTableValidatesAnExistingTarget covers the case that must keep
+// working when the option is off: a hand-made table the sink can write to is
+// accepted, so a snapshot pipeline that only reads DML never depends on
+// auto-create-table.
+func TestCreateTableValidatesAnExistingTarget(t *testing.T) {
+	querier := &fakeQuerier{
+		columns: [][]any{columnRow("id", "bigint", true, "", false)},
+		keys:    [][]any{{"users_pkey", "p", "id"}},
+	}
+	sink := newTestSinkWithCatalogue(&fakePool{}, 0, querier)
+	table := schema.Table{Database: "public", Table: "users",
+		Columns:     []schema.Column{{Name: "id", Type: "bigint", Nullable: false}},
+		PrimaryKeys: []string{"id"}}
+	if err := sink.CreateTable(table); err != nil {
+		t.Fatal(err)
+	}
+	table.Columns[0].Name = "missing"
+	if err := sink.CreateTable(table); err == nil {
+		t.Fatal("a target that cannot hold the rows was accepted")
+	}
+}
+
+// TestCreateTableWithoutSchemaNamesTarget proves the refusal is diagnosable: the
+// operator sees which table is missing rather than a nil-map style failure.
+func TestCreateTableWithoutSchemaNamesTarget(t *testing.T) {
+	sink := newTestSink(&fakePool{}, 0)
+	err := sink.CreateTable(schema.Table{Table: "users"})
+	if err == nil || !strings.Contains(err.Error(), "public.users") {
+		t.Fatalf("err %v", err)
 	}
 }

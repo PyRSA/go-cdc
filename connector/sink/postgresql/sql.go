@@ -264,6 +264,22 @@ func (b *Builder) store(key, sql string) {
 	b.cache[key] = sql
 }
 
+// Forget drops every template rendered for one target. A schema change alters
+// the column list or the conflict keys the statement embeds, so a cached
+// template for the table would write the previous shape into the new table.
+func (b *Builder) Forget(target Target) {
+	name := target.String()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for key := range b.cache {
+		// Both templates start with the operation, then the target name.
+		parts := strings.SplitN(key, "\x00", 3)
+		if len(parts) == 3 && parts[1] == name {
+			delete(b.cache, key)
+		}
+	}
+}
+
 func columnsOf(item event.Event, row map[string]any) []string {
 	if len(item.Columns) > 0 {
 		return item.Columns

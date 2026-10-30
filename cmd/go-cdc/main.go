@@ -105,6 +105,12 @@ func run(args []string) (code int) {
 	db.SetWarn(func(msg string, args ...any) {
 		logger.Warn(msg, args...)
 	})
+	// The PostgreSQL sink reads the current source definition to turn a column
+	// change that restates it into PostgreSQL DDL. It borrows the catalogue handle
+	// the capture already owns and never closes it.
+	if setter, ok := sk.(interface{ SetTableDescriber(pgxsink.TableDescriber) }); ok {
+		setter.SetTableDescriber(db)
+	}
 	pipe.Source.ServerID = db.ServerID()
 	stream, err := mysqlsrc.OpenStream(pipe.Source, db)
 	if err != nil {

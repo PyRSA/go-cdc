@@ -242,33 +242,48 @@ func TestPostgresSinkRollsBackWholeBatch(t *testing.T) {
 	}
 }
 
+// TestPostgresSinkTypeFidelity writes values in the shapes the source really
+// produces — an unsigned BIGINT as uint64, DECIMAL and the temporal types as
+// text, a blob as a byte slice, a JSON document as text, an absent column as
+// nil — and reads the stored text back, so every assertion is against what
+// PostgreSQL holds rather than against the sink's own opinion.
 func TestPostgresSinkTypeFidelity(t *testing.T) {
 	env := newITEnv(t, func(s string) []string {
 		return []string{"CREATE TABLE " + qual(s, "metrics") +
-			" (id bigint PRIMARY KEY, big numeric(20,0), f8 double precision, d date, t timestamp, note text)"}
+			" (id bigint PRIMARY KEY, big numeric(20,0), as_bigint bigint, f8 double precision," +
+			" d date, t timestamp, note text, raw bytea, doc json)"}
 	})
-	columns := []string{"id", "big", "f8", "d", "t", "note"}
+	columns := []string{"id", "big", "as_bigint", "f8", "d", "t", "note", "raw", "doc"}
 	keys := []string{"id"}
+	doc := `{"a":1,"b":[1,2]}`
 	row := map[string]any{
-		"id":   int64(1),
-		"big":  fmt.Sprintf("%d", uint64(1)<<63), // uint64 above MaxInt64 keeps exact text
-		"f8":   "0.123456789012345",
-		"d":    "2024-02-29",
-		"t":    "2024-02-29 23:59:59.123456",
-		"note": "plain",
+		"id":        int64(1),
+		"big":       uint64(1) << 63,   // above MaxInt64: reaches the sink as exact decimal text
+		"as_bigint": uint64(1)<<63 - 1, // the largest unsigned value a bigint can hold
+		"f8":        "0.123456789012345",
+		"d":         "2024-02-29",
+		"t":         "2024-02-29 23:59:59.123456",
+		"note":      nil,
+		"raw":       []byte{0x00, 0x01, 0xff},
+		"doc":       doc,
 	}
 	if err := env.sink.Write([]event.Event{env.event(event.OpCreate, "metrics", columns, keys, row)}); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	var big, f8, d, ts, note string
+	var big, asBig, f8, d, ts, note, docText string
+	var raw []byte
 	err := env.conn.QueryRow(env.ctx,
-		"SELECT big::text, f8::text, d::text, t::text, note FROM "+qual(env.schema, "metrics")+" WHERE id = 1").
-		Scan(&big, &f8, &d, &ts, &note)
+		"SELECT big::text, as_bigint::text, f8::text, d::text, t::text, coalesce(note, '<null>'), raw, doc::text FROM "+
+			qual(env.schema, "metrics")+" WHERE id = 1").
+		Scan(&big, &asBig, &f8, &d, &ts, &note, &raw, &docText)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if big != "9223372036854775808" {
 		t.Fatalf("numeric lost precision: %q", big)
+	}
+	if asBig != "9223372036854775807" {
+		t.Fatalf("bigint %q", asBig)
 	}
 	if f8 != "0.123456789012345" {
 		t.Fatalf("float8 %q", f8)
@@ -276,8 +291,45 @@ func TestPostgresSinkTypeFidelity(t *testing.T) {
 	if d != "2024-02-29" || ts != "2024-02-29 23:59:59.123456" {
 		t.Fatalf("temporal %q %q", d, ts)
 	}
-	if note != "plain" {
-		t.Fatalf("note %q", note)
+	if note != "<null>" {
+		t.Fatalf("nil did not become SQL NULL: %q", note)
+	}
+	if string(raw) != string([]byte{0x00, 0x01, 0xff}) {
+		t.Fatalf("bytea %v", raw)
+	}
+	if docText != doc {
+		t.Fatalf("json was re-rendered: %q", docText)
+	}
+
+	// A value the hand-made column cannot hold is refused by the server instead
+	// of being rounded or truncated: NUMERIC keeps every digit, BIGINT does not.
+	overflow := env.event(event.OpCreate, "metrics", []string{"id", "as_bigint"}, keys,
+		map[string]any{"id": int64(2), "as_bigint": ^uint64(0)})
+	err = env.sink.Write([]event.Event{overflow})
+	if err == nil || !strings.Contains(err.Error(), "22003") {
+		t.Fatalf("a bigint overflow must fail with 22003: %v", err)
+	}
+	if retryable(err) {
+		t.Fatalf("a value out of range must be permanent: %v", err)
+	}
+	if env.exists(t, "metrics", 2) {
+		t.Fatal("the rejected row was written anyway")
+	}
+
+	// The MySQL zero date has no PostgreSQL value. The sink passes the text
+	// through unchanged, so the server rejects the row: nothing turns it into
+	// NULL and nothing retypes the column.
+	zero := env.event(event.OpCreate, "metrics", []string{"id", "d"}, keys,
+		map[string]any{"id": int64(3), "d": "0000-00-00"})
+	err = env.sink.Write([]event.Event{zero})
+	if err == nil {
+		t.Fatal("the zero date was accepted")
+	}
+	if retryable(err) {
+		t.Fatalf("a value the column cannot hold must be permanent: %v", err)
+	}
+	if env.exists(t, "metrics", 3) {
+		t.Fatal("the rejected zero date was written anyway")
 	}
 }
 
@@ -404,15 +456,325 @@ func TestPostgresSinkConflictWithoutConstraintIsPermanent(t *testing.T) {
 	}
 }
 
-func TestPostgresSinkRejectsTableDDL(t *testing.T) {
+// itUsersTable is the source definition the create tests hand to the sink.
+func itUsersTable() schema.Table {
+	return schema.Table{
+		Table: "users",
+		Columns: []schema.Column{
+			{Name: "id", Type: "bigint", Nullable: false},
+			{Name: "name", Type: "varchar(64)", Nullable: true},
+			{Name: "amount", Type: "decimal(10,2)", Nullable: true},
+			{Name: "created_at", Type: "datetime(3)", Nullable: true},
+		},
+		PrimaryKeys: []string{"id"},
+	}
+}
+
+// tableExists asks the server, not the sink, whether the relation is there.
+func (e *itEnv) tableExists(t *testing.T, table string) bool {
+	t.Helper()
+	var found bool
+	if err := e.conn.QueryRow(e.ctx, "SELECT to_regclass($1) IS NOT NULL", qual(e.schema, table)).Scan(&found); err != nil {
+		t.Fatalf("regclass %s: %v", table, err)
+	}
+	return found
+}
+
+// columnType reads one column of the live table through the same catalogue view
+// the sink reads, so an assertion describes what PostgreSQL holds.
+func (e *itEnv) columnType(t *testing.T, table, column string) (string, bool) {
+	t.Helper()
+	var dataType string
+	err := e.conn.QueryRow(e.ctx,
+		"SELECT format_type(atttypid, atttypmod) FROM pg_catalog.pg_attribute"+
+			" WHERE attrelid = $1::regclass AND attname = $2 AND attnum > 0 AND NOT attisdropped",
+		qual(e.schema, table), column).Scan(&dataType)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false
+	}
+	if err != nil {
+		t.Fatalf("read column %s of %s: %v", column, table, err)
+	}
+	return dataType, true
+}
+
+// TestPostgresSinkRefusesTableDDLByDefault is the PR2 default proven on a real
+// server: the sink neither creates nor alters a table until told to, and the
+// refusal leaves nothing behind.
+func TestPostgresSinkRefusesTableDDLByDefault(t *testing.T) {
 	env := newITEnv(t, nil)
-	if err := env.sink.CreateTable(schema.Table{Database: env.schema, Table: "users"}); err == nil {
-		t.Fatal("CreateTable must fail")
+	err := env.sink.CreateTable(itUsersTable())
+	if err == nil || !strings.Contains(err.Error(), "auto-create-table is false") {
+		t.Fatalf("create: %v", err)
 	}
-	change := schema.Change{Database: env.schema, Table: "users", DDL: "ALTER TABLE users ADD COLUMN c int"}
-	if err := env.sink.ApplySchema(change); err == nil {
-		t.Fatal("ApplySchema must fail")
+	if env.tableExists(t, "users") {
+		t.Fatal("a refused create still made a table")
 	}
+	change := schema.Change{
+		Action: schema.ActionAddColumn, Database: env.schema, Table: "users",
+		Column: "note", AddColumns: []string{"note"},
+		ColumnDef: &schema.Column{Name: "note", Type: "varchar(32)", Nullable: true},
+		DDL:       "ALTER TABLE users ADD COLUMN note varchar(32)",
+	}
+	err = env.sink.ApplySchema(change)
+	if err == nil || !strings.Contains(err.Error(), "schema changes are disabled") {
+		t.Fatalf("apply: %v", err)
+	}
+}
+
+// TestPostgresSinkCreatesTableFromSourceDefinition proves the created table is
+// the one the source described: the types, the key, and a real upsert are
+// checked against the server rather than against the sink's own opinion.
+func TestPostgresSinkCreatesTableFromSourceDefinition(t *testing.T) {
+	env := newITEnv(t, nil)
+	env.sink.cfg.AutoCreate = true
+	if err := env.sink.CreateTable(itUsersTable()); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	for column, want := range map[string]string{
+		"id":         "bigint",
+		"name":       "character varying(64)",
+		"amount":     "numeric(10,2)",
+		"created_at": "timestamp(3) without time zone",
+	} {
+		got, ok := env.columnType(t, "users", column)
+		if !ok {
+			t.Fatalf("column %s is missing after the create", column)
+		}
+		if got != want {
+			t.Fatalf("column %s is %s, want %s", column, got, want)
+		}
+	}
+	columns := []string{"id", "name", "amount", "created_at"}
+	item := env.event(event.OpCreate, "users", columns, []string{"id"}, map[string]any{
+		"id": int64(1), "name": "alice", "amount": "1.25", "created_at": "2024-01-02 03:04:05",
+	})
+	if err := env.sink.Write([]event.Event{item}); err != nil {
+		t.Fatalf("write after create: %v", err)
+	}
+	item.After["name"] = "bob"
+	if err := env.sink.Write([]event.Event{item}); err != nil {
+		t.Fatalf("upsert after create: %v", err)
+	}
+	if rows := env.count(t, "users"); rows != 1 {
+		t.Fatalf("the created key is not a conflict target: %d rows", rows)
+	}
+	// Creating over an existing compatible table validates it instead of failing.
+	if err := env.sink.CreateTable(itUsersTable()); err != nil {
+		t.Fatalf("create again: %v", err)
+	}
+	// The same definition with a column the target does not have is refused.
+	wider := itUsersTable()
+	wider.Columns = append(wider.Columns, schema.Column{Name: "gone", Type: "text", Nullable: true})
+	if err := env.sink.CreateTable(wider); err == nil {
+		t.Fatal("a target that cannot hold the rows was accepted")
+	}
+}
+
+// TestPostgresSinkAppliesColumnChanges runs the column changes against a real
+// server. The write after the rename is the point of the test: it can only
+// succeed if the statement templates of the changed target were dropped.
+func TestPostgresSinkAppliesColumnChanges(t *testing.T) {
+	env := newITEnv(t, func(s string) []string {
+		return []string{"CREATE TABLE " + qual(s, "users") +
+			" (id bigint PRIMARY KEY, name varchar(32), note text)"}
+	})
+	env.sink.cfg.SchemaChange = true
+	env.sink.SetTableDescriber(&fakeDescriber{table: schema.Table{
+		Database: "app", Table: "users",
+		Columns: []schema.Column{
+			{Name: "id", Type: "bigint", Nullable: false},
+			{Name: "label", Type: "varchar(64)", Nullable: true},
+			{Name: "note", Type: "text", Nullable: true},
+			{Name: "amount", Type: "decimal(12,2)", Nullable: true},
+		},
+		PrimaryKeys: []string{"id"},
+	}})
+
+	add := schema.Change{
+		Action: schema.ActionAddColumn, Database: env.schema, Table: "users",
+		Column: "amount", AddColumns: []string{"amount"},
+		ColumnDef: &schema.Column{Name: "amount", Type: "decimal(10,2)", Nullable: true},
+		DDL:       "ALTER TABLE users ADD COLUMN amount decimal(10,2)",
+	}
+	if err := env.sink.ApplySchema(add); err != nil {
+		t.Fatalf("add column: %v", err)
+	}
+	if got, ok := env.columnType(t, "users", "amount"); !ok || got != "numeric(10,2)" {
+		t.Fatalf("amount is %q present %v", got, ok)
+	}
+	refused := schema.Change{
+		Action: schema.ActionAddColumn, Database: env.schema, Table: "users",
+		Column: "code", AddColumns: []string{"code"},
+		ColumnDef: &schema.Column{Name: "code", Type: "varchar(8)", Nullable: false},
+		DDL:       "ALTER TABLE users ADD COLUMN code varchar(8) NOT NULL",
+	}
+	if err := env.sink.ApplySchema(refused); err == nil {
+		t.Fatal("NOT NULL without a default was accepted")
+	}
+	if _, ok := env.columnType(t, "users", "code"); ok {
+		t.Fatal("the refused column was created anyway")
+	}
+
+	// CHANGE COLUMN renames and widens in one transaction.
+	change := schema.Change{
+		Action: schema.ActionRenameColumn, Database: env.schema, Table: "users",
+		Column: "name", NewName: "label", SourceDatabase: "app", SourceTable: "users",
+		DDL: "ALTER TABLE users CHANGE name label varchar(64)",
+	}
+	if err := env.sink.ApplySchema(change); err != nil {
+		t.Fatalf("change column: %v", err)
+	}
+	if _, ok := env.columnType(t, "users", "name"); ok {
+		t.Fatal("the old name is still there")
+	}
+	if got, ok := env.columnType(t, "users", "label"); !ok || got != "character varying(64)" {
+		t.Fatalf("label is %q present %v", got, ok)
+	}
+
+	// A MODIFY whose statement text is behind the source. The catalogue says the
+	// column is decimal(12,2) now, so that is what the target becomes and the
+	// (10,2) written in the statement is ignored: a replayed statement is
+	// interpreted against the definition the source holds, never against its own
+	// text, which carries no type information the sink could trust.
+	restate := schema.Change{
+		Action: schema.ActionModifyColumn, Database: env.schema, Table: "users",
+		Column: "amount", SourceDatabase: "app", SourceTable: "users",
+		DDL: "ALTER TABLE users MODIFY amount decimal(10,2)",
+	}
+	if err := env.sink.ApplySchema(restate); err != nil {
+		t.Fatalf("modify amount: %v", err)
+	}
+	if got, _ := env.columnType(t, "users", "amount"); got != "numeric(12,2)" {
+		t.Fatalf("amount after the source restatement is %q, want the catalogue's numeric(12,2)", got)
+	}
+
+	// The next write names the new columns; a stale template would fail with
+	// SQLSTATE 42703 on the column the target no longer has.
+	columns := []string{"id", "label", "note", "amount"}
+	item := env.event(event.OpCreate, "users", columns, []string{"id"}, map[string]any{
+		"id": int64(1), "label": "alice", "note": "x", "amount": "2.50",
+	})
+	if err := env.sink.Write([]event.Event{item}); err != nil {
+		t.Fatalf("write after the change: %v", err)
+	}
+
+	drop := schema.Change{
+		Action: schema.ActionDropColumn, Database: env.schema, Table: "users", Column: "note",
+		DDL: "ALTER TABLE users DROP COLUMN note",
+	}
+	if err := env.sink.ApplySchema(drop); err != nil {
+		t.Fatalf("drop column: %v", err)
+	}
+	if _, ok := env.columnType(t, "users", "note"); ok {
+		t.Fatal("the dropped column is still there")
+	}
+	// A key column cannot be dropped without taking the conflict target with it.
+	keyed := schema.Change{
+		Action: schema.ActionDropColumn, Database: env.schema, Table: "users", Column: "id",
+		DDL: "ALTER TABLE users DROP COLUMN id",
+	}
+	if err := env.sink.ApplySchema(keyed); err == nil {
+		t.Fatal("dropping the primary key column was accepted")
+	}
+	if _, ok := env.columnType(t, "users", "id"); !ok {
+		t.Fatal("the refused drop removed the key")
+	}
+
+	// A plain secondary index is skipped, so the target keeps its own plan.
+	index := schema.Change{
+		Action: schema.ActionIndex, Database: env.schema, Table: "users",
+		DDL: "ALTER TABLE users ADD INDEX idx_label (label)",
+	}
+	if err := env.sink.ApplySchema(index); err != nil {
+		t.Fatalf("index change: %v", err)
+	}
+	constraints := env.countWhere(t, "pg_catalog.pg_indexes", "schemaname = $1 AND indexname = 'idx_label'")
+	if constraints != 0 {
+		t.Fatalf("a skipped index was created: %d", constraints)
+	}
+
+	// Destructive changes wait for their own switch.
+	truncate := schema.Change{Action: schema.ActionTruncate, Database: env.schema, Table: "users",
+		DDL: "TRUNCATE TABLE users"}
+	if err := env.sink.ApplySchema(truncate); err == nil {
+		t.Fatal("truncate without the switch was accepted")
+	}
+	env.sink.cfg.DropTruncate = true
+	if err := env.sink.ApplySchema(truncate); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if rows := env.count(t, "users"); rows != 0 {
+		t.Fatalf("truncate left %d row(s)", rows)
+	}
+	dropped := schema.Change{Action: schema.ActionDropTable, Database: env.schema, Table: "users",
+		DDL: "DROP TABLE users"}
+	if err := env.sink.ApplySchema(dropped); err != nil {
+		t.Fatalf("drop table: %v", err)
+	}
+	if env.tableExists(t, "users") {
+		t.Fatal("the table is still there after DROP TABLE")
+	}
+}
+
+// TestPostgresSinkDropColumnLeavesAViewToTheServer marks the boundary of the
+// sink's own dependency read. That read inspects the constraints and the
+// indexes the target table owns, so a view that reads the column is not in it,
+// and the guard is PostgreSQL's: DROP COLUMN carries no CASCADE, the server
+// refuses to strand the view, the one transaction rolls back, and the job stops
+// with the server's error rather than dropping data the target still needs.
+func TestPostgresSinkDropColumnLeavesAViewToTheServer(t *testing.T) {
+	env := newITEnv(t, func(s string) []string {
+		return []string{
+			"CREATE TABLE " + qual(s, "users") + " (id bigint PRIMARY KEY, name text, note text)",
+			"CREATE VIEW " + qual(s, "user_names") + " AS SELECT name FROM " + qual(s, "users"),
+		}
+	})
+	env.sink.cfg.SchemaChange = true
+	drop := schema.Change{
+		Action: schema.ActionDropColumn, Database: env.schema, Table: "users", Column: "name",
+		DDL: "ALTER TABLE users DROP COLUMN name",
+	}
+	err := env.sink.ApplySchema(drop)
+	if err == nil {
+		t.Fatal("dropping a column a view reads was accepted")
+	}
+	if retryable(err) {
+		t.Fatalf("a dependency refusal must be permanent: %v", err)
+	}
+	if _, ok := env.columnType(t, "users", "name"); !ok {
+		t.Fatal("the refused drop removed the column")
+	}
+	if !env.tableExists(t, "user_names") {
+		t.Fatal("the refused drop removed the view")
+	}
+	// The untouched column proves the sink did not need the refused one to be a
+	// key: the guard fires on the object that depends on the column, not on the
+	// column's role in the conflict target.
+	keep := schema.Change{
+		Action: schema.ActionDropColumn, Database: env.schema, Table: "users", Column: "note",
+		DDL: "ALTER TABLE users DROP COLUMN note",
+	}
+	if err := env.sink.ApplySchema(keep); err != nil {
+		t.Fatalf("drop an unreferenced column: %v", err)
+	}
+	if _, ok := env.columnType(t, "users", "note"); ok {
+		t.Fatal("the column is still there after a clean drop")
+	}
+}
+
+// countWhere reads one count from the catalogue, so an assertion about a skipped
+// index comes from the server. The predicate spells the schema as $1, so the
+// schema is bound here: a placeholder without a matching argument makes pgx fail
+// with "expected 1 arguments, got 0" before the statement ever reaches the server.
+func (e *itEnv) countWhere(t *testing.T, relation, predicate string) int {
+	t.Helper()
+	var rows int
+	query := "SELECT count(*) FROM " + relation + " WHERE " + predicate
+	if err := e.conn.QueryRow(e.ctx, query, e.schema).Scan(&rows); err != nil {
+		t.Fatalf("count %s: %v", relation, err)
+	}
+	return rows
 }
 
 func (e *itEnv) readUser(t *testing.T, id int64) (name, amount, createdAt, createdTZ string, raw []byte, qty int) {

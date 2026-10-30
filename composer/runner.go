@@ -89,7 +89,12 @@ func Run(ctx context.Context, pipe *definition.Pipeline, msgs <-chan source.Mess
 				}
 				return msg.Err
 			}
-			if msg.Schema != nil {
+			if msg.Schema != nil || (pipe.Sink.Type == "postgresql" && msg.Event != nil && msg.Event.Op == event.OpDDL) {
+				// A schema change must not overtake the rows that came before it: the
+				// PostgreSQL sink applies DDL in its own transaction, so an unflushed
+				// batch would be written against the shape the statement is changing.
+				// Only PostgreSQL is drained here; the other sinks keep the ordering
+				// they had before this sink existed.
 				if err := flush(); err != nil {
 					return err
 				}
@@ -170,6 +175,30 @@ func applyCatalog(pipe *definition.Pipeline, rules *transform.Set, routes *route
 	if err := rules.Validate(table.Database, table.Table, names); err != nil {
 		return err
 	}
+	if pipe.Sink.Type == "postgresql" {
+		// The PostgreSQL sink resolves its schema the way its DML does: a matched
+		// route names the schema, and nothing else does, so a MySQL database name
+		// never becomes a schema by accident. The target is then either created
+		// from the source definition or validated against it, and a failure stops
+		// the job before a row is written into a table of the wrong shape.
+		projected := rules.ProjectTable(table)
+		routed := routes.Apply(event.Event{
+			Database: table.Database, Table: table.Table,
+			SourceDatabase: table.Database, SourceTable: table.Table,
+		})
+		for _, dst := range routed {
+			sinkTable := projected
+			sinkTable.Table = dst.Table
+			sinkTable.Database = ""
+			if dst.Routed {
+				sinkTable.Database = dst.Database
+			}
+			if err := sk.CreateTable(sinkTable); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	if pipe.Sink.Type == "doris" {
 		// Doris must validate every routed table before it becomes writable.
 		// Unlike the MySQL branch below, a failure stops the job.
@@ -209,11 +238,6 @@ func applyCatalog(pipe *definition.Pipeline, rules *transform.Set, routes *route
 }
 
 func applyDDL(pipe *definition.Pipeline, rules *transform.Set, routes *route.Set, sk sink.Sink, state *checkpoint.State, item event.Event, catalogApplied bool) error {
-	// The PostgreSQL sink does not map types or create tables in this release, so
-	// a schema change stops the job instead of letting the target table drift.
-	if pipe.Sink.Type == "postgresql" {
-		return fmt.Errorf("sink.postgresql: schema change is not supported in this release (table %s.%s, ddl %q)", item.Database, item.Table, item.DDL)
-	}
 	routed := routes.Apply(item)
 	for _, dst := range routed {
 		projection := rules.ProjectedColumns(dst.SourceDatabase, dst.SourceTable)
@@ -227,6 +251,12 @@ func applyDDL(pipe *definition.Pipeline, rules *transform.Set, routes *route.Set
 			// re-infer column type/nullability/default from DDL text.
 			change.AddColumns = item.Change.AddColumns
 			change.ColumnDef = item.Change.ColumnDef
+		}
+		if pipe.Sink.Type == "postgresql" {
+			if err := applyPostgresDDL(sk, state, dst, decision, change, catalogApplied); err != nil {
+				return err
+			}
+			continue
 		}
 		if pipe.Sink.Type == "stdout" || pipe.Sink.Type == "kafka" {
 			// Keep Database/Table as the routed sink id (topic = DML). Envelope source.*
@@ -270,6 +300,51 @@ func applyDDL(pipe *definition.Pipeline, rules *transform.Set, routes *route.Set
 		}
 	}
 	return nil
+}
+
+// applyPostgresDDL hands one schema change to the PostgreSQL sink.
+//
+// The sink is the authority on what it may do: it knows the type mapping, the
+// routed target, and the switches that authorise a change, so every kind except
+// CREATE TABLE goes to it, including the ones it refuses. A refused or failed
+// change stops the job before the checkpoint moves past the statement: the
+// binlog position is recorded only after the message is applied, and the error
+// path saves nothing, so a restart re-reads the same statement and asks the sink
+// again instead of leaving the target behind with nothing to show for it. A
+// change that did succeed is replayed the same way when the job stops before the
+// next save, so the sink must treat a repeated DDL as a no-op.
+func applyPostgresDDL(sk sink.Sink, state *checkpoint.State, dst event.Event, decision schemaevol.Decision, change schema.Change, catalogApplied bool) error {
+	// The sink renders its own DDL from the structured change, so it needs the
+	// source statement for diagnostics and the source table for the definition a
+	// restated column is read from.
+	change.DDL = dst.DDL
+	change.SourceDatabase = dst.SourceDatabase
+	change.SourceTable = dst.SourceTable
+	if !dst.Routed {
+		// No route named a schema: sink.schema applies, as it does for DML.
+		change.Database = ""
+	}
+	switch decision.Change.Action {
+	case schema.ActionCreate:
+		if !catalogApplied {
+			return fmt.Errorf("sink.postgresql: CREATE TABLE for %s arrived without a source table definition; the sink does not parse CREATE TABLE text", dst.SinkID())
+		}
+		// applyCatalog created or validated the table before this point, which is
+		// also what makes the source table capturable.
+		state.AddCaptured(dst.SourceID())
+		return nil
+	case schema.ActionAddColumn, schema.ActionDropColumn, schema.ActionRenameColumn, schema.ActionModifyColumn:
+		if !decision.Execute {
+			// The column is outside the projection, so the target never had it.
+			return nil
+		}
+		return sk.ApplySchema(change)
+	default:
+		// DROP TABLE, TRUNCATE, index changes, and anything the classifier could not
+		// name. The sink skips a plain secondary index and refuses the rest; the
+		// dangerous-table switches are its configuration to enforce.
+		return sk.ApplySchema(change)
+	}
 }
 
 func columnsOf(item event.Event) []schema.Column {

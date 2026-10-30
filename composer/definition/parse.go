@@ -126,12 +126,6 @@ var postgresSSLModes = map[string]struct{}{
 	"verify-full": {},
 }
 
-// mysqlOnlySinkFields are rejected for postgresql: this release does not
-// create tables or apply table-level DDL.
-var mysqlOnlySinkFields = []string{
-	"schema.change.drop-truncate.enabled",
-}
-
 // kafkaOnlySinkFields are rejected for postgresql.
 var kafkaOnlySinkFields = []string{
 	"brokers",
@@ -202,6 +196,53 @@ func rejectKeysForSinkType(sinkType string, seen map[string]struct{}, keyLists .
 		}
 	}
 	return nil
+}
+
+// postgresRejectedDorisKeys is the dorisOnlySinkKeys list with the two schema
+// change switches the PostgreSQL sink owns taken out. The shared list is
+// filtered rather than edited so mysql, kafka, and stdout keep rejecting every
+// Doris key exactly as before.
+var postgresRejectedDorisKeys = withoutKeys(dorisOnlySinkKeys,
+	"schema.change.enabled", "schema.change.include")
+
+// postgresChangeKinds is the sink.schema.change.include vocabulary of the
+// PostgreSQL sink. The connector package owns the authoritative list, but it
+// imports this package, so the copy lives here and a test in the connector
+// package keeps the two equal.
+var postgresChangeKinds = []string{
+	"add.column", "drop.column", "rename.column", "modify.column", "drop.table", "truncate",
+}
+
+// isPostgresChangeKind reports whether the include list names a change the
+// PostgreSQL sink can apply.
+func isPostgresChangeKind(name string) bool {
+	for _, kind := range postgresChangeKinds {
+		if kind == name {
+			return true
+		}
+	}
+	return false
+}
+
+// PostgresChangeKinds returns the sink.schema.change.include vocabulary of the
+// PostgreSQL sink. It is exported so the connector package can prove the copy
+// here matches the list its sink enforces.
+func PostgresChangeKinds() []string {
+	return append([]string(nil), postgresChangeKinds...)
+}
+
+func withoutKeys(keys []string, drop ...string) []string {
+	out := make([]string, 0, len(keys))
+outer:
+	for _, key := range keys {
+		for _, skip := range drop {
+			if key == skip {
+				continue outer
+			}
+		}
+		out = append(out, key)
+	}
+	return out
 }
 
 // Parse decodes a pipeline YAML document and applies defaults.
@@ -905,15 +946,13 @@ func validateElasticsearchIndexName(name string) error {
 // MySQL-oriented defaults (port 3306, auto-create-table true) before the type is
 // known, so those two are recomputed here and explicit config always wins.
 func parsePostgresSink(out *Sink, raw map[string]any) error {
-	if err := rejectSinkFields(raw, out.Type, mysqlOnlySinkFields...); err != nil {
-		return err
-	}
 	if err := rejectSinkFields(raw, out.Type, kafkaOnlySinkFields...); err != nil {
 		return err
 	}
-	// Doris-only keys stay rejected here too: this sink has no DDL or Stream Load
-	// equivalent, so accepting them would silently drop the setting.
-	if err := rejectSinkFields(raw, out.Type, dorisOnlySinkKeys...); err != nil {
+	// The Doris-only keys stay rejected here except the schema change switches,
+	// which this sink implements: schema.change.wait-timeout has no PostgreSQL
+	// equivalent because PostgreSQL DDL is synchronous, so it is still refused.
+	if err := rejectSinkFields(raw, out.Type, postgresRejectedDorisKeys...); err != nil {
 		return err
 	}
 	// request-timeout bounds a Doris Stream Load or an Elasticsearch bulk request.
@@ -922,10 +961,17 @@ func parsePostgresSink(out *Sink, raw map[string]any) error {
 	if err := rejectSinkFields(raw, out.Type, requestTimeoutSinkKeys...); err != nil {
 		return err
 	}
-	if _, ok := raw["auto-create-table"]; ok && out.AutoCreate {
-		return configErr("sink.auto-create-table", "must not be true: the postgresql sink does not create tables in this release")
+	if _, ok := raw["auto-create-table"]; !ok {
+		// parseSink defaults it to true. Creating a PostgreSQL table changes the
+		// target's structure, so it stays an explicit authorisation.
+		out.AutoCreate = false
 	}
-	out.AutoCreate = false
+	for _, item := range out.SchemaChangeInclude {
+		if !isPostgresChangeKind(item) {
+			return configf("sink.schema.change.include", "unsupported schema change %q; the postgresql sink supports %s",
+				item, strings.Join(postgresChangeKinds, ", "))
+		}
+	}
 	if _, ok := raw["port"]; !ok {
 		out.Port = defaultPostgresPort
 	}

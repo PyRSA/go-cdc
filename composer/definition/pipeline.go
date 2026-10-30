@@ -81,9 +81,9 @@ type Sink struct {
 	// the PostgreSQL sink existed)
 	SQLPort             int           // sql-port; FE MySQL protocol; default 9030 via parseSink
 	Database            string        // database; required for postgresql, optional default target database for doris
-	SchemaChange        bool          // schema.change.enabled; default false
-	SchemaChangeInclude []string      // schema.change.include; v1 allows only add.column
-	SchemaChangeWait    time.Duration // schema.change.wait-timeout; ADD COLUMN visibility budget
+	SchemaChange        bool          // schema.change.enabled; default false; doris and postgresql
+	SchemaChangeInclude []string      // schema.change.include; doris allows add.column, postgresql the kinds its sink lists
+	SchemaChangeWait    time.Duration // schema.change.wait-timeout; ADD COLUMN visibility budget, doris only
 	PartialUpdate       bool          // partial-update.enabled; must stay false
 	DeleteEnabled       bool          // delete.enabled; must stay false
 	Buckets             string        // buckets; "auto" or a positive integer

@@ -1,12 +1,15 @@
 // Package postgresql is the PostgreSQL sink: row-level DML applied in one
-// transaction per batch. This release does not create tables, does not map
-// source types, and rejects schema changes at startup.
+// transaction per batch, plus the schema evolution that keeps the target table
+// shaped like the source table. Table creation is opt-in through
+// sink.auto-create-table, and every change the sink cannot reproduce faithfully
+// stops the job instead of being skipped.
 package postgresql
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/url"
 	"strconv"
@@ -19,7 +22,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/PyRSA/go-cdc/common/event"
-	"github.com/PyRSA/go-cdc/common/schema"
 	"github.com/PyRSA/go-cdc/composer/definition"
 	"github.com/PyRSA/go-cdc/connector/sink"
 )
@@ -95,14 +97,28 @@ type Sink struct {
 	cfg       definition.Sink
 	builder   *Builder
 	pool      pool
+	meta      *metadata
 	opTimeout time.Duration
 	sleep     sleepFunc
+	log       *slog.Logger
 
 	baseCtx context.Context
 	cancel  context.CancelFunc
 
-	mu     sync.Mutex
-	closed bool
+	// mu guards closed and describer. The composition root injects the source
+	// catalogue after Open, and a shutdown may run concurrently with a describe.
+	mu        sync.Mutex
+	closed    bool
+	describer TableDescriber
+}
+
+// logger returns the sink logger. A Sink built without one still reports
+// through the process logger installed by main.
+func (s *Sink) logger() *slog.Logger {
+	if s.log != nil {
+		return s.log
+	}
+	return slog.Default()
 }
 
 // Open builds the connection pool from pipeline config. It does not connect;
@@ -121,8 +137,10 @@ func Open(cfg definition.Sink, timeZone string) (*Sink, error) {
 		cfg:       cfg,
 		builder:   NewBuilder(cfg.Schema),
 		pool:      pgPool{inner: p},
+		meta:      newMetadata(poolQuerier{inner: p}),
 		opTimeout: defaultOpTimeout,
 		sleep:     sleepContext,
+		log:       slog.Default(),
 		baseCtx:   context.Background(),
 	}, nil
 }
@@ -146,18 +164,6 @@ func (s *Sink) Open(ctx context.Context) error {
 		return fmt.Errorf("sink.postgresql: connect %s:%d/%s: %w", s.cfg.Hostname, s.cfg.Port, s.cfg.Database, err)
 	}
 	return nil
-}
-
-// CreateTable always fails: this release requires pre-created tables. The
-// runner rejects DDL for this sink before calling it.
-func (s *Sink) CreateTable(table schema.Table) error {
-	return fmt.Errorf("sink.postgresql: create table is not supported in this release (table %s.%s)", table.Database, table.Table)
-}
-
-// ApplySchema always fails: this release does not apply schema changes. The
-// runner rejects DDL for this sink before calling it.
-func (s *Sink) ApplySchema(change schema.Change) error {
-	return fmt.Errorf("sink.postgresql: schema change is not supported in this release (table %s.%s)", change.Database, change.Table)
 }
 
 // Write applies the batch in one transaction, retrying transient SQLSTATEs.
