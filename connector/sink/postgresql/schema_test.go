@@ -250,6 +250,38 @@ func TestColumnClauseSpellsDefaultsByTargetType(t *testing.T) {
 		{"time expression",
 			schema.Column{Name: "created", Type: "datetime", Nullable: true, Default: "CURRENT_TIMESTAMP", HasDefault: true, DefaultExpr: true},
 			`"created" TIMESTAMP DEFAULT CURRENT_TIMESTAMP`},
+		// MySQL 5.7 reports the same default without DEFAULT_GENERATED, so the
+		// target type, not the flag, has to decide.
+		{"time expression without the generated flag",
+			schema.Column{Name: "created", Type: "datetime", Nullable: true, Default: "current_timestamp", HasDefault: true},
+			`"created" TIMESTAMP DEFAULT CURRENT_TIMESTAMP`},
+		{"time expression with precision",
+			schema.Column{Name: "created", Type: "datetime(3)", Nullable: true, Default: "CURRENT_TIMESTAMP(3)", HasDefault: true},
+			`"created" TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP(3)`},
+		{"timestamp expression",
+			schema.Column{Name: "created", Type: "timestamp(6)", Nullable: true, Default: "CURRENT_TIMESTAMP(6)", HasDefault: true, DefaultExpr: true},
+			`"created" TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP(6)`},
+		{"time expression precision out of range",
+			schema.Column{Name: "created", Type: "datetime(6)", Nullable: true, Default: "CURRENT_TIMESTAMP(9)", HasDefault: true, DefaultExpr: true},
+			`"created" TIMESTAMP(6)`},
+		{"unsupported default expression",
+			schema.Column{Name: "created", Type: "datetime", Nullable: true, Default: "now()", HasDefault: true, DefaultExpr: true},
+			`"created" TIMESTAMP`},
+		// information_schema spells the literal string the same way it spells the
+		// function: on a character column it is the value, and PostgreSQL would
+		// accept the function there through an I/O cast, so it has to be quoted.
+		{"current timestamp as a character default",
+			schema.Column{Name: "note", Type: "varchar(32)", Nullable: true, Default: "CURRENT_TIMESTAMP", HasDefault: true},
+			`"note" VARCHAR(32) DEFAULT 'CURRENT_TIMESTAMP'`},
+		{"current timestamp with precision as a character default",
+			schema.Column{Name: "note", Type: "varchar(32)", Nullable: true, Default: "CURRENT_TIMESTAMP(3)", HasDefault: true},
+			`"note" VARCHAR(32) DEFAULT 'CURRENT_TIMESTAMP(3)'`},
+		{"current timestamp as a text default",
+			schema.Column{Name: "note", Type: "text", Nullable: true, Default: "CURRENT_TIMESTAMP", HasDefault: true},
+			`"note" TEXT DEFAULT 'CURRENT_TIMESTAMP'`},
+		{"quoted current timestamp",
+			schema.Column{Name: "note", Type: "varchar(32)", Nullable: true, Default: "it's CURRENT_TIMESTAMP", HasDefault: true},
+			`"note" VARCHAR(32) DEFAULT 'it''s CURRENT_TIMESTAMP'`},
 		{"zero date",
 			schema.Column{Name: "created", Type: "date", Nullable: true, Default: "0000-00-00", HasDefault: true},
 			`"created" DATE`},
@@ -303,6 +335,10 @@ func TestAddColumnSpellsDefaultsByTargetType(t *testing.T) {
 			schema.Column{Name: "created_at", Type: "datetime", Nullable: true, Default: "CURRENT_TIMESTAMP", HasDefault: true, DefaultExpr: true},
 			"timestamp without time zone", "CURRENT_TIMESTAMP",
 			`ADD COLUMN IF NOT EXISTS "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP`},
+		{"current timestamp as a character default",
+			schema.Column{Name: "note", Type: "varchar(32)", Nullable: true, Default: "CURRENT_TIMESTAMP", HasDefault: true},
+			"character varying(32)", "'CURRENT_TIMESTAMP'::character varying",
+			`ADD COLUMN IF NOT EXISTS "note" VARCHAR(32) DEFAULT 'CURRENT_TIMESTAMP'`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -593,6 +629,86 @@ func TestKeyCarryingIndexChangeFailsClosed(t *testing.T) {
 		if p.begins != 0 {
 			t.Fatalf("%s: runs %d", ddl, p.begins)
 		}
+	}
+}
+
+// TestCompoundIndexStatementIsNotASecondaryIndexChange covers what the classifier
+// alone cannot promise: MySQL accepts a compound ALTER TABLE, and a statement
+// that carries an index clause is classified as an index change even when the
+// same statement adds, drops, or retypes a column. The skip is only allowed for a
+// statement whose every clause is a plain secondary index.
+func TestCompoundIndexStatementIsNotASecondaryIndexChange(t *testing.T) {
+	skippable := []string{
+		"ALTER TABLE users ADD INDEX idx_name (name)",
+		"ALTER TABLE users DROP INDEX idx_name",
+		"ALTER TABLE users ADD KEY idx_name (name)",
+		"CREATE INDEX idx_name ON users (name)",
+		"DROP INDEX idx_name ON users",
+		// Two plain indexes in one statement are still only index changes.
+		"ALTER TABLE users ADD INDEX idx_a (name), ADD INDEX idx_b (amount)",
+		// A quoted name may carry the words of an operation without being one.
+		"ALTER TABLE `users` ADD INDEX `add index` (`index`)",
+		"ALTER TABLE `app`.`users` ADD INDEX idx_name (name)",
+		"ALTER TABLE users ADD INDEX idx_name (name) COMMENT 'add unique index'",
+		"ALTER TABLE users ADD INDEX idx_name (name) /* UNIQUE */",
+		// A comma inside a comment or a string is not a clause boundary.
+		"ALTER TABLE users /* note, with a comma */ ADD INDEX idx_name (name)",
+		"ALTER TABLE users ADD INDEX idx_name (name) COMMENT 'a, b'",
+	}
+	for _, ddl := range skippable {
+		if !secondaryIndexChange(ddl) {
+			t.Fatalf("%s is a plain index change", ddl)
+		}
+	}
+	refused := []string{
+		"ALTER TABLE users ADD UNIQUE INDEX uq_email (email)",
+		"ALTER TABLE users ADD PRIMARY KEY (id)",
+		"ALTER TABLE users DROP PRIMARY KEY",
+		// The compound shapes: the index clause must not hide the rest of the
+		// statement, whichever order the clauses arrive in.
+		"ALTER TABLE users ADD INDEX idx_name (name), ADD COLUMN note VARCHAR(32)",
+		"ALTER TABLE users ADD COLUMN note VARCHAR(32), ADD INDEX idx_name (name)",
+		"ALTER TABLE users DROP INDEX idx_name, MODIFY COLUMN name VARCHAR(128)",
+		"ALTER TABLE users DROP INDEX idx_name, DROP COLUMN note",
+		"ALTER TABLE users ADD INDEX idx_name (name), ADD UNIQUE INDEX uq_amount (amount)",
+		// The index words belong to a column name or a default value, so the
+		// statement still changes the table in a way a skip would lose.
+		"ALTER TABLE users ADD COLUMN note VARCHAR(32) DEFAULT 'ADD INDEX'",
+		"ALTER TABLE users ADD COLUMN idx_name VARCHAR(32)",
+		// A backslash-escaped quote is not a doubled one, so the reader cannot
+		// find the end of the string: the statement is unreadable, not a skip.
+		"ALTER TABLE users ADD INDEX idx_name (name) COMMENT 'it\\'s', ADD COLUMN note VARCHAR(32)",
+		// A statement this check cannot read is not a plain index either.
+		"ALTER TABLE ADD INDEX idx_name (name)",
+		"ALTER TABLE users",
+	}
+	for _, ddl := range refused {
+		if secondaryIndexChange(ddl) {
+			t.Fatalf("%s must not be skipped as a plain index change", ddl)
+		}
+	}
+}
+
+// TestCompoundIndexStatementFailsClosed is the decision the table above feeds:
+// the job stops with the statement, and nothing is written to the target.
+func TestCompoundIndexStatementFailsClosed(t *testing.T) {
+	p := &fakePool{}
+	capture := &logCapture{}
+	sink := ddlSink(p, &fakeQuerier{})
+	sink.log = slog.New(capture)
+	change := schema.Change{
+		Action: schema.ActionIndex, Database: "public", Table: "users",
+		DDL: "ALTER TABLE users ADD INDEX idx_name (name), ADD COLUMN note VARCHAR(32)",
+	}
+	err := sink.ApplySchema(change)
+	if err == nil || !strings.Contains(err.Error(), "apply it by hand") {
+		t.Fatalf("err %v", err)
+	}
+	if p.begins != 0 {
+		t.Fatalf("the statement ran: %d", p.begins)
+	}
+	if capture.contains("secondary index change skipped") {
+		t.Fatalf("the compound statement was skipped: %#v", capture.messages())
 	}
 }
 
