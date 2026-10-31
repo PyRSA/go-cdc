@@ -272,10 +272,14 @@ func (h *handler) OnRow(e *canal.RowsEvent) error {
 		return nil
 	}
 	columns := make([]string, len(e.Table.Columns))
+	types := make([]string, len(e.Table.Columns))
 	for i, column := range e.Table.Columns {
 		columns[i] = column.Name
+		// The catalogue type is what tells a BINARY/VARBINARY column from a text
+		// one; the decoded value alone cannot (both arrive as Go strings).
+		types[i] = column.RawType
 	}
-	events, err := RowsToEvents(e.Action, e.Table.Schema, e.Table.Name, columns, e.Rows)
+	events, err := RowsToEvents(e.Action, e.Table.Schema, e.Table.Name, columns, types, e.Rows)
 	if err != nil {
 		return err
 	}
