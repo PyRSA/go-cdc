@@ -237,3 +237,19 @@ it_apply_variant() {
       ;;
   esac
 }
+
+# ----------------------------------------------------------------- doris endpoint
+# The FE address every Doris suite dials. It belongs here for the same reason the
+# variant table does: setup.sh is a child process - and in CI a separate workflow
+# step - so the exports made while waiting for FE die with it and never reach the
+# suites run.sh starts afterwards. Both callers resolve the endpoint through this
+# one function, and wait.sh probes it with the same five variables, so the stack is
+# always addressed the way the tests will address it. The defaults match
+# common/config.py, which keeps them for a suite run outside run.sh.
+it_doris_endpoint() {
+  export DORIS_HOST="${DORIS_HOST:-127.0.0.1}"
+  export DORIS_SQL_PORT="${DORIS_SQL_PORT:-9030}"
+  export DORIS_HTTP_PORT="${DORIS_HTTP_PORT:-8030}"
+  export DORIS_USER="${DORIS_USER:-root}"
+  export DORIS_PASSWORD="${DORIS_PASSWORD:-}"
+}

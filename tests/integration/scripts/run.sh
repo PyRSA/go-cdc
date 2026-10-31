@@ -100,6 +100,14 @@ export IT_VARIANT="${VARIANT}"
 # PG_EXPECT_MAJOR themselves, so resolve them in this process as well.
 it_apply_variant "${SINK}" "${VARIANT}"
 
+# Same child-process problem for the Doris FE address. In CI the stack is raised
+# by a separate workflow step, so whatever setup.sh exported while waiting for FE
+# is gone by the time the suites run here; the Go suite reads DORIS_HOST from the
+# environment and refuses to skip under CI, so resolve it in this process.
+if [ "${SINK}" = "doris" ]; then
+  it_doris_endpoint
+fi
+
 # ES7/ES9 keep their own report and checkpoints: locally the three variants run
 # back to back, so a shared file would let the last run overwrite the previous
 # result. CI does not need the separation (one runner and one artifact per
@@ -328,6 +336,9 @@ go_es() {
 
 go_doris() {
   log "==> go: doris sink (doris_integration)"
+  # DORIS_* arrive from it_doris_endpoint above; without DORIS_HOST the suite
+  # fails on CI instead of skipping, which is what turned a missing export into
+  # a red job rather than a green one that never touched Doris.
   (cd "${ROOT}" && go test -tags doris_integration -count=1 -timeout 20m -v \
     ./tests/integration/sinks/doris/go/)
 }

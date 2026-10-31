@@ -176,11 +176,9 @@ it_ensure_sysctl() {
 }
 
 it_wait_doris() {
-  export DORIS_HOST="${DORIS_HOST:-127.0.0.1}"
-  export DORIS_SQL_PORT="${DORIS_SQL_PORT:-9030}"
-  export DORIS_HTTP_PORT="${DORIS_HTTP_PORT:-8030}"
-  export DORIS_USER="${DORIS_USER:-root}"
-  export DORIS_PASSWORD="${DORIS_PASSWORD:-}"
+  # Resolved here as well as in run.sh: this process probes the stack it just
+  # started, run.sh probes the one it inherited from a previous CI step.
+  it_doris_endpoint
   local fe_tries="${WAIT_DORIS_FE_TRIES:-180}" be_tries="${WAIT_DORIS_BE_TRIES:-300}"
   if ! command -v mysql >/dev/null 2>&1; then
     log "mysql client is required to wait for Doris (install mysql-client)." >&2
