@@ -741,13 +741,18 @@ func typedValue(mysqlType string, raw sql.RawBytes) any {
 	if raw == nil {
 		return nil
 	}
-	base := strings.ToLower(mysqlType)
-	unsigned := strings.Contains(base, "unsigned")
-	if i := strings.IndexByte(base, '('); i >= 0 {
-		base = base[:i]
-	}
-	base = strings.TrimSpace(strings.TrimSuffix(base, "unsigned"))
+	unsigned := strings.Contains(strings.ToLower(mysqlType), "unsigned")
+	base := baseTypeName(mysqlType)
 	text := string(raw)
+	if isBinaryType(base) {
+		// A zero-length value stays a non-nil empty slice: nil reaches the sink
+		// as SQL NULL, and MySQL's empty binary value is a value. The type
+		// classifier is shared with the binlog path, so both captures agree on
+		// which columns reach the sink as []byte.
+		out := make([]byte, len(raw))
+		copy(out, raw)
+		return out
+	}
 	switch base {
 	case "tinyint", "smallint", "int", "integer", "bigint", "mediumint":
 		if unsigned {
@@ -760,12 +765,6 @@ func typedValue(mysqlType string, raw sql.RawBytes) any {
 		if err == nil {
 			return n
 		}
-	case "binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob":
-		// A zero-length value stays a non-nil empty slice: nil reaches the sink
-		// as SQL NULL, and MySQL's empty binary value is a value.
-		out := make([]byte, len(raw))
-		copy(out, raw)
-		return out
 	}
 	return text
 }
