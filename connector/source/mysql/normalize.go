@@ -35,7 +35,15 @@ func Normalize(value any) any {
 	case float32, float64:
 		return fmt.Sprint(typed)
 	case []byte:
-		return append([]byte(nil), typed...)
+		// Copy, and keep the empty value distinct from NULL: pgx writes a nil
+		// slice as SQL NULL and an empty slice as an empty bytea, and MySQL's
+		// X'' is a value rather than a missing one.
+		if typed == nil {
+			return nil
+		}
+		out := make([]byte, len(typed))
+		copy(out, typed)
+		return out
 	case time.Time:
 		// Prefer the location already attached (canal TIMESTAMP with
 		// TimestampStringLocation / ParseTime). Falling back to the instant's

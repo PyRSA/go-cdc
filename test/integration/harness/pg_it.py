@@ -252,9 +252,12 @@ _register(TableSpec(
 ))
 
 # No primary key at the source and none declared by a transform: the sink renders a
-# plain INSERT, which is the documented at-least-once limit (TP-P20).
+# plain INSERT, which is the documented at-least-once limit (TP-P20). The source
+# still needs a NOT NULL column to split the snapshot on, so the table runs in its
+# own session with `scan.incremental.snapshot.chunk.key-column` (a chunk key column
+# must exist on every table of the session, and tp_p04_pk has no `id`).
 _register(TableSpec(
-    name="tp_p20_nokey", session="main",
+    name="tp_p20_nokey", session="nokey",
     ddl="CREATE TABLE `{t}` (id INT NOT NULL, v VARCHAR(32) NOT NULL) ENGINE=InnoDB",
     columns=("id", "v"), kinds={"id": "int", "v": "text"},
 ))
@@ -642,16 +645,25 @@ def reconcile(case: Case, label: str, db: str, table: str, *, timeout: float = 0
 
     failures = once()
     if failures and timeout:
+        # A pipeline that died cannot catch up, so stop waiting as soon as the
+        # process is gone and report its last log lines instead of the diff.
+        alive_at_entry = job_alive()
         deadline = time.time() + timeout
         while failures and time.time() < deadline:
+            if alive_at_entry and not job_alive():
+                failures.append(f"the job stopped while waiting: {log_tail(4)}")
+                break
             time.sleep(2)
             failures = once()
     if failures:
-        check(case, f"{label}: {db}.{table} -> {schema}.{sink_table}", False,
-              pg_verify.summarize(failures))
+        # A diff alone does not say whether the sink is behind or already gone, so
+        # the process state and its last words travel with every failure.
+        detail = (f"{pg_verify.summarize(failures)} | job "
+                  f"{'alive' if job_alive() else 'stopped'} | last log: {log_tail(3)}")
+        check(case, f"{label}: {db}.{table} -> {schema}.{sink_table}", False, detail)
     else:
         check(case, f"{label}: {db}.{table} -> {schema}.{sink_table} reconciled", True,
-              f"{len(src_rows(db, table))} rows")
+              f"{src_count(spec, db)} rows")
     return failures
 
 
@@ -815,13 +827,13 @@ def tp_p02() -> Case:
     case = new_case(
         "TP-P02",
         "Snapshot to binlog switchover with writes landing while the snapshot is still streaming",
-        "seed 12'000 rows, start the job, and while the target still holds only part of the snapshot "
-        "run INSERT/UPDATE/DELETE on source rows",
+        "seed 6'000 rows, start the job one row per transaction, and while the target still holds "
+        "only part of the snapshot run INSERT/UPDATE/DELETE on source rows",
         "the DML provably happens before the snapshot finished (0 < target rows < baseline), and "
         "after catch-up every row is canonically equal",
     )
     spec = TABLES["tp_p02_switch"]
-    baseline = 12000
+    baseline = 6000
     fresh(spec)
     batch: list[str] = []
     for start in range(1, baseline + 1, 1000):
@@ -829,10 +841,13 @@ def tp_p02() -> Case:
         batch.append(rows)
     for rows in batch:
         insert_rows(SRC_A, spec, "id, v, tag", rows)
-    with session("switch"):
-        wait_alive(4)
+    # One row per transaction is what makes the snapshot observably partial: with
+    # the default batch of 100 the whole snapshot can land between two polls, and
+    # the window this case has to prove is gone before the DML runs.
+    with session("switch", sink={"write-batch-size": 1}):
+        wait_alive(2)
         try:
-            wait_until(lambda: 0 < count_of(spec) < baseline, timeout=180,
+            wait_until(lambda: 0 < count_of(spec) < baseline, timeout=180, interval=0.2,
                        desc="target holds a partial snapshot")
             partial = count_of(spec)
             check(case, "snapshot was still streaming when the DML ran", 0 < partial < baseline,
@@ -1483,6 +1498,19 @@ def tp_p16() -> Case:
             "c_dt = '2038-01-19 03:14:07.999999', c_ts = '2024-06-01 00:00:00.000001', "
             "c_year = 1999, c_json = '{\"z\": 0}', c_bool = 0 WHERE id = 1",
         )
+        # The widest row event in this suite: prove it reaches the target before
+        # diffing 25 columns. A pipeline that is alive but never applies it and a
+        # pipeline that died produce the same diff, so record which one it was.
+        schema, sink_table = target_of(spec, SRC_A)
+        try:
+            wait_until(
+                lambda: pg_client.q(f'SELECT c_tiny FROM "{schema}"."{sink_table}" WHERE id = 1')
+                [0]["c_tiny"] == 127,
+                timeout=60, interval=0.5, desc="the typed UPDATE reaches the target",
+            )
+        except TimeoutError as exc:
+            note(case, f"the typed UPDATE never landed: {exc} | job "
+                       f"{'alive' if job_alive() else 'stopped'} | {log_tail(6)}")
         reconcile(case, "after binlog update", SRC_A, spec.name, timeout=120)
     # TIME/SET/ENUM/BIT are refused, so a pipeline that captures such a table has
     # to stop rather than create a target column the mapping does not define. It
@@ -1580,8 +1608,12 @@ def tp_p19() -> Case:
     with session("perm"):
         code = wait_exit(timeout=120, desc="job on 42P10")
     check(case, "the job stops instead of retrying forever", code != 0, f"exit={code}")
-    check(case, "the error names the missing unique constraint",
-          "42P10" in log_text() or "unique or exclusion constraint" in log_text(), log_tail(4))
+    # The sink validates the target structure before the first write, so the
+    # refusal may name the missing key instead of surfacing ON CONFLICT's 42P10.
+    check(case, "the error names the missing key constraint",
+          any(needle in log_text() for needle in
+              ("42P10", "unique or exclusion constraint", "no primary key or unique constraint")),
+          log_tail(4))
     check(case, "no row was written to the incompatible target",
           pg_client.row_count(schema, table) == 0, f"{pg_client.row_count(schema, table)} rows")
     pg_client.exec_sql(f'ALTER TABLE "{schema}"."{table}" ADD PRIMARY KEY (id)')
@@ -1605,7 +1637,7 @@ def tp_p20() -> Case:
     spec = TABLES["tp_p20_nokey"]
     fresh(spec)
     insert_rows(SRC_A, spec, "id, v", "(1, 'a'), (2, 'b'), (3, 'c')")
-    with session("main"):
+    with session("nokey", source={"scan.incremental.snapshot.chunk.key-column": "id"}):
         wait_alive(6)
         wait_for_sink_rows(case, SRC_A, spec.name, 3)
         reconcile(case, "keyless snapshot", SRC_A, spec.name, timeout=90)
@@ -1740,6 +1772,12 @@ def write_report() -> Path:
         "uses a nested null (`{\"n\": null}`) instead.",
         "- `TIMESTAMP` is read with `SET time_zone = '+08:00'`, the pipeline's "
         "`server-time-zone`, so both sides are compared as the same wall clock.",
+        "- TP-P02 runs its pipeline with `write-batch-size: 1`. One row per transaction is "
+        "what makes the snapshot observably partial: with the default batch of 100 the "
+        "whole snapshot lands between two polls and the overlap can never be proven.",
+        "- TP-P20 runs alone with `scan.incremental.snapshot.chunk.key-column: id`: the "
+        "source needs a NOT NULL chunk key to split a keyless table, and the option names "
+        "one column, so it cannot be set for a session that also captures `tp_p04_pk`.",
         "",
         "## 3. Test points\n",
     ]

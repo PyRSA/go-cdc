@@ -761,7 +761,11 @@ func typedValue(mysqlType string, raw sql.RawBytes) any {
 			return n
 		}
 	case "binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob":
-		return append([]byte(nil), raw...)
+		// A zero-length value stays a non-nil empty slice: nil reaches the sink
+		// as SQL NULL, and MySQL's empty binary value is a value.
+		out := make([]byte, len(raw))
+		copy(out, raw)
+		return out
 	}
 	return text
 }

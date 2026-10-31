@@ -281,7 +281,16 @@ def set_role_login(role: str, enabled: bool) -> None:
 
 
 def drop_login_role(role: str) -> None:
-    exec_sql(f'DROP ROLE IF EXISTS "{role}"')
+    """Drop the role and everything it still owns.
+
+    A sink that runs as this role creates its target tables, so those tables are
+    owned by it and DROP ROLE would fail with DependentObjectsStillExist.
+    """
+    rows = q("SELECT 1 AS ok FROM pg_catalog.pg_roles WHERE rolname = %s", (role,))
+    if not rows:
+        return
+    exec_sql(f'DROP OWNED BY "{role}" CASCADE')
+    exec_sql(f'DROP ROLE "{role}"')
 
 
 def grant_database(role: str, privileges: str = "CONNECT, CREATE") -> None:
