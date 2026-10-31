@@ -2,14 +2,14 @@
 
 // Elasticsearch 7 integration suite for the v7 client adapter.
 //
-// It reuses the ES 8 harness in es_integration_test.go (same raw HTTP cluster
+// It reuses the ES 8 harness in es8_integration_test.go (same raw HTTP cluster
 // helpers, same production Sink); only the expected server version and the
 // configured sink.version differ. The test names start with "TestElasticsearch7"
 // on purpose: the ES 8 runner filters `-run TestES`, so a machine with only an
 // ES 8 node never picks these up.
 //
-//	docker compose up -d --wait elasticsearch7   # test/integration
-//	bash test/integration/scripts/run-es7-integration.sh
+//	docker compose up -d --wait elasticsearch7   # tests/integration
+//	bash tests/integration/scripts/run.sh elasticsearch normal es7 go
 //
 // Verified server: Elasticsearch 7.17.x. ES 7.0-7.16 are not verified: the Go
 // 7.17 client performs a product check that older 7.x servers may not satisfy.

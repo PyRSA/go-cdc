@@ -112,10 +112,10 @@ go test ./connector/sink/kafka/ ./common/cdcjson/ ./composer/ -count=1
 # requires a reachable broker; default allow.auto.create.topics=true (or pre-create topics)
 KAFKA_BROKERS=127.0.0.1:9092 go test -tags kafka_integration ./connector/sink/kafka/ -count=1 -v
 
-# Docker Compose IT (MySQL 8 + Kafka 3.8) — CI: mysql-mysql-e2e (8.0 matrix only)
-bash test/integration/scripts/mysql-up.sh
-bash test/integration/scripts/kafka-up.sh
-bash test/integration/scripts/run-kafka-e2e.sh
+# Docker Compose IT (MySQL 8 + Kafka 3.8) — CI: sink-kafka job
+bash tests/integration/scripts/run.sh mysql          # build + seed the shared MySQL
+bash tests/integration/scripts/run.sh kafka          # func: snapshot + load + peak
+bash tests/integration/scripts/run.sh kafka heavy    # same suite, larger knobs
 # report written at: docs/test/reports/mysql-kafka.md (after a successful run)
 ```
 
@@ -123,7 +123,7 @@ bash test/integration/scripts/run-kafka-e2e.sh
 | --- | --- | --- |
 | `go test ./connector/sink/kafka/` (no tags) | No | Yes (`make test`) |
 | `go test -tags kafka_integration ./connector/sink/kafka/` | Yes (`KAFKA_BROKERS`) | No (local optional) |
-| `test/integration` Python TP-K01–K08 | Yes (compose Kafka 3.8) | Yes (MySQL 8.0 matrix) |
+| `tests/integration` TP-K01–K08 | Yes (compose Kafka 3.8) | Yes (`sink-kafka`) |
 
 ## Related Docs
 

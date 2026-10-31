@@ -1,0 +1,83 @@
+# Reusable sink workflow: PostgreSQL.
+#
+#   profile  normal -> func                         (one major, from the variant)
+#            heavy  -> func,load,bench,scale,compat (compat loops pg14..pg18)
+#   variant  pg14..pg18 -> PG_IMAGE + PG_EXPECT_MAJOR
+#
+# `compat` runs last on purpose: it restarts the stack once per major through
+# setup.sh, so it is the only suite allowed to change what is running.
+name: CI / postgresql
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: "Run tier: normal | heavy"
+        required: true
+        type: string
+      matrix:
+        description: 'Rows owned by this sink, e.g. {"include": [{"sink": "postgresql", "variant": "pg16"}]}'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  run:
+    name: postgresql ${{ matrix.variant || 'pg16' }}
+    runs-on: ubuntu-latest
+    # The heavy tier runs the five-major compat matrix, which alone needs ~20m.
+    timeout-minutes: ${{ inputs.profile == 'heavy' && 300 || 150 }}
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.profile == 'heavy' && 2 || 6 }}
+      # An empty string means "no rows"; strategy.matrix still needs an object.
+      matrix: ${{ fromJSON(inputs.matrix || '{"include":[]}') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install client tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          # psql for the readiness probe and for pg_compat's per-major servers.
+          sudo apt-get install -y --no-install-recommends mysql-client postgresql-client
+          python3 -m pip install -r tests/integration/common/requirements.txt
+
+      # setup raises the stack and blocks on pg_isready, run only executes the
+      # suites (IT_SKIP_SETUP=1), teardown always fires.
+      - name: Setup stack
+        run: bash tests/integration/scripts/setup.sh postgresql "${{ matrix.variant }}" "${{ inputs.profile }}"
+
+      - name: Run suites
+        env:
+          IT_SKIP_SETUP: "1"
+        run: |
+          set -euo pipefail
+          bash tests/integration/scripts/run.sh postgresql "${{ inputs.profile }}" "${{ matrix.variant }}"
+
+      - name: Upload reports
+        if: always() && (inputs.profile == 'heavy' || failure())
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-postgresql-${{ matrix.variant || 'pg16' }}-${{ inputs.profile }}
+          path: docs/test/reports/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Teardown
+        if: always()
+        run: bash tests/integration/scripts/teardown.sh postgresql "${{ matrix.variant }}"

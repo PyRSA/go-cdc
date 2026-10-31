@@ -1,6 +1,6 @@
 # go-cdc
 
-[中文](README.zh.md)
+[Chinese](README.zh.md)
 
 ## Introduction
 
@@ -191,10 +191,11 @@ For detailed workload definitions, test methodology, and CI results, see
   - `make fmt-check`
   - `make lint`
   - `make test`
-  - For behavior that touches sync paths, run integration tests when possible: `make integration-up && make integration-test && make integration-down`
+  - For behavior that touches sync paths, run integration tests when possible:
+    `make it-mysql && make it-down SINK=mysql`
 4. Describe the problem and how you verified the fix in the PR description.
 
-Integration harness notes: [test/integration/README.md](test/integration/README.md).
+Integration harness notes: [tests/integration/README.md](tests/integration/README.md).
 
 ## License
 

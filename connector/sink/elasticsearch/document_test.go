@@ -106,11 +106,11 @@ func TestIDUnicodeAndCaseInsensitiveLookup(t *testing.T) {
 		Database: "shop", Table: "people", PrimaryKeys: []string{"Name"},
 		Columns: []schema.Column{{Name: "Name", Type: "varchar(64)"}},
 	})
-	lower, err := meta.idFor(map[string]any{"Name": "张三"})
+	lower, err := meta.idFor(map[string]any{"Name": "José"})
 	if err != nil {
 		t.Fatalf("idFor: %v", err)
 	}
-	upper, err := meta.idFor(map[string]any{"NAME": "张三"})
+	upper, err := meta.idFor(map[string]any{"NAME": "José"})
 	if err != nil {
 		t.Fatalf("idFor: %v", err)
 	}

@@ -8,7 +8,7 @@ Applies pipeline changes to a PostgreSQL table as current-state writes (`INSERT 
 
 | Item | Support |
 | --- | --- |
-| Target PostgreSQL | **14 – 18**. The everyday suites pin **16.4**; the same functional core is exercised on 14/15/16/17/18 by `harness/pg_compat.py` (`scripts/run-pg-compat.sh`). A version counts as validated only when its row in `mysql-postgresql-compat.md` reports `PASS` — nothing else is claimed. See [PostgreSQL test suites](../test/POSTGRESQL.md#34-compatibility-and-benchmark) |
+| Target PostgreSQL | **14 – 18**. The everyday suites pin **16.4**; the same functional core is exercised on 14/15/16/17/18 by `sinks/postgresql/harness/pg_compat.py` (`scripts/run.sh postgresql heavy pg16 compat`). A version counts as validated only when its row in `mysql-postgresql-compat.md` reports `PASS` — nothing else is claimed. See [PostgreSQL test suites](../test/POSTGRESQL.md#34-compatibility-and-benchmark) |
 | SQL driver | `github.com/jackc/pgx/v5` (linked into `go-cdc`) |
 | Packaging | Shipped inside the `go-cdc` binary |
 | Time zone | **No sink-side time-zone option**; the connection session `TimeZone` follows `source.server-time-zone` |
@@ -256,11 +256,11 @@ PG_DSN='postgres://cdc:cdc@127.0.0.1:5432/cdc?sslmode=disable' \
 
 Without `PG_DSN` the test reports `SKIP`, which means nothing was verified against a server. The suite covers the DML path, the value shapes this document describes (unsigned `BIGINT`, `DECIMAL`, the temporal types, `BYTEA`, `JSON`, `NULL`, and the rejected zero date), and the DDL path (create, add, refuse, change, modify, drop, key-column guard, view dependency, index skip, truncate, drop table) against a real server.
 
-The Go test is the unit of the sink package. The end-to-end suites that drive the built binary from MySQL to PostgreSQL — functional `TP-P01…TP-P20`, load, scale, the 14–18 matrix, and the benchmark — live under `test/integration/` and are described in [PostgreSQL test suites](../test/POSTGRESQL.md). They are Python harnesses and are not part of `go test`:
+The Go test is the unit of the sink package. The end-to-end suites that drive the built binary from MySQL to PostgreSQL — functional `TP-P01…TP-P20`, load, scale, the 14–18 matrix, and the benchmark — live under `tests/integration/` and are described in [PostgreSQL test suites](../test/POSTGRESQL.md). They are Python harnesses and are not part of `go test`:
 
 ```bash
-bash test/integration/scripts/run-pg-e2e.sh     # functional E2E
-bash test/integration/scripts/run-pg-compat.sh  # PG 14 15 16 17 18
+bash tests/integration/scripts/run.sh postgresql normal pg16     # functional E2E
+bash tests/integration/scripts/run.sh postgresql heavy pg16 compat  # PG 14 15 16 17 18
 ```
 
 A run counts only when its report says so (`PASS` / `FAIL` / `SKIPPED` / `NOT RUN` / `ENV BLOCKED`); the vocabulary and the evidence each status needs are defined in that document, §9.

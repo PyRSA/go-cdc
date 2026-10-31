@@ -7,7 +7,7 @@
 - Run time: 2026-10-11 21:59:57
 - Source: `127.0.0.1:13306` / `u_a7k9m2x4` / `db_tp_func_src`
 - Sink: `127.0.0.1:13306` / `u_b3j6c8y1` / `db_tp_func_snk`
-- Entry point: `${PROJECT_ROOT}/test/integration/workdir/go-cdc <pipeline.yaml>`
+- Entry point: `${PROJECT_ROOT}/tests/integration/workdir/go-cdc <pipeline.yaml>`
 - **Summary: pass 20 / fail 0 / total 20** → **all passed**
 
 | TP | Name | Result |
@@ -209,7 +209,7 @@ time=2026-10-11T21:59:38.322+08:00 level=ERROR msg="pipeline failed" err="sink.m
 
 - [↑ Overview](#overview)
 - **Result: ✅ PASS**
-- **Action:** ADD remark/tag；MODIFY name VARCHAR(128)
+- **Action:** ADD remark/tag; MODIFY name VARCHAR(128)
 - **Expected:** Columns still id,name,city; name=varchar(128)
 
 ### Expected vs actual
@@ -284,7 +284,7 @@ time=2026-10-11T21:59:38.322+08:00 level=ERROR msg="pipeline failed" err="sink.m
 
 - [↑ Overview](#overview)
 - **Result: ✅ PASS**
-- **Action:** stdout sink；UPDATE cara→cara2；ADD tag2
+- **Action:** stdout sink; UPDATE cara->cara2; ADD tag2
 - **Expected:** Single-line u(before+after) and ddl(tag2) appear
 
 ### Expected vs actual

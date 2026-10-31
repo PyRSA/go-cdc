@@ -1,4 +1,7 @@
-test/integration/workdir/
+# Integration harness output: binary, logs, checkpoints, rendered pipelines and
+# report drafts. Kept narrow so the tracked inputs next to it (compose files,
+# fixtures, harness sources) stay visible to git.
+tests/integration/workdir/
 **/__pycache__/
 **/.pytest_cache/
 *.pyc

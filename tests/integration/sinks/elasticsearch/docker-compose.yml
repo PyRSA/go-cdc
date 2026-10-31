@@ -1,0 +1,96 @@
+# Elasticsearch sink targets: one file, three variant nodes.
+#
+#   es8 (default)  service ``elasticsearch``   host port 19200  - load + scale layers
+#   es7            service ``elasticsearch7``  host port 19201  - v7 client adapter
+#   es9            service ``elasticsearch9``  host port 19202  - v9 client adapter
+#
+# Only the variant named by setup.sh is started: ES7/ES9 sit behind compose
+# profiles, so a plain `docker compose up` (the ES8 run, or any other sink's
+# run that shares the MySQL source project) never starts the extra nodes and
+# their extra heap.
+#
+# Security is disabled on purpose: the harness talks plain HTTP to a throwaway
+# node. Heap stays small so it fits next to MySQL in CI; the suites are
+# correctness-first.
+services:
+  elasticsearch:
+    image: ${ES_IMAGE:-docker.elastic.co/elasticsearch/elasticsearch:8.15.3}
+    ports:
+      - "${ES_HOST_PORT:-19200}:9200"
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      xpack.security.http.ssl.enabled: "false"
+      xpack.security.transport.ssl.enabled: "false"
+      ES_JAVA_OPTS: "-Xms${ES_HEAP:-512m} -Xmx${ES_HEAP:-512m}"
+      # Bulk/scroll plus a small disk image: never trip the watermark checks.
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+      action.destructive_requires_name: "true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS 'http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+      start_period: 30s
+
+  elasticsearch7:
+    image: ${ES7_IMAGE:-docker.elastic.co/elasticsearch/elasticsearch:7.17.24}
+    profiles: ["es7"]
+    ports:
+      - "${ES7_HOST_PORT:-19201}:9200"
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms${ES7_HEAP:-512m} -Xmx${ES7_HEAP:-512m}"
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+      action.destructive_requires_name: "true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS 'http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+      start_period: 30s
+
+  elasticsearch9:
+    image: ${ES9_IMAGE:-docker.elastic.co/elasticsearch/elasticsearch:9.5.2}
+    profiles: ["es9"]
+    ports:
+      - "${ES9_HOST_PORT:-19202}:9200"
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      xpack.security.http.ssl.enabled: "false"
+      xpack.security.transport.ssl.enabled: "false"
+      ES_JAVA_OPTS: "-Xms${ES9_HEAP:-512m} -Xmx${ES9_HEAP:-512m}"
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+      action.destructive_requires_name: "true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS 'http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+      start_period: 30s

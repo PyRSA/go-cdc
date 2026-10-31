@@ -1,0 +1,89 @@
+# Reusable sink workflow: Elasticsearch.
+#
+# Three variants share one compose file; ES7 and ES9 sit behind compose
+# profiles, so the variant only decides which node starts and which Go test
+# build tag pattern runs.
+#
+#   profile  normal -> go,func
+#            heavy  -> go,func,load,scale   (es7/es9 stay correctness-only)
+#   variant  es8 | es7 | es9 -> ES_SINK_VERSION + host port (19200/1/2)
+name: CI / elasticsearch
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: "Run tier: normal | heavy"
+        required: true
+        type: string
+      matrix:
+        description: 'Rows owned by this sink, e.g. {"include": [{"sink": "elasticsearch", "variant": "es8"}]}'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  run:
+    name: elasticsearch ${{ matrix.variant || 'es8' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.profile == 'heavy' && 300 || 150 }}
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.profile == 'heavy' && 2 || 6 }}
+      # An empty string means "no rows"; strategy.matrix still needs an object.
+      matrix: ${{ fromJSON(inputs.matrix || '{"include":[]}') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install client tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends mysql-client
+          python3 -m pip install -r tests/integration/common/requirements.txt
+
+      # Elasticsearch refuses to boot with the runner default (65530 mmap areas).
+      # setup.sh raises kernel limits only for Doris, so do it here.
+      - name: Raise vm.max_map_count
+        run: sudo sysctl -w vm.max_map_count=262144
+
+      # setup starts the variant's node behind its compose profile, run only
+      # executes the suites (IT_SKIP_SETUP=1), teardown always fires.
+      - name: Setup stack
+        run: bash tests/integration/scripts/setup.sh elasticsearch "${{ matrix.variant }}" "${{ inputs.profile }}"
+
+      - name: Run suites
+        env:
+          IT_SKIP_SETUP: "1"
+        run: |
+          set -euo pipefail
+          bash tests/integration/scripts/run.sh elasticsearch "${{ inputs.profile }}" "${{ matrix.variant }}"
+
+      - name: Upload reports
+        if: always() && (inputs.profile == 'heavy' || failure())
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-elasticsearch-${{ matrix.variant || 'es8' }}-${{ inputs.profile }}
+          path: docs/test/reports/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # Teardown passes both profiles: the ES7/ES9 nodes are not stopped by a
+      # plain `down` and would keep holding their host port.
+      - name: Teardown
+        if: always()
+        run: bash tests/integration/scripts/teardown.sh elasticsearch "${{ matrix.variant }}"

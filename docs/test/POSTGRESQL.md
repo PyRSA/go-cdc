@@ -19,21 +19,21 @@ of them is a Go test.
 
 | Suite | Entry | Orchestrator | Data | Verification |
 |---|---|---|---|---|
-| E2E functional | `scripts/run-e2e.sh` | `harness/run_it.py` (TP-01…TP-20) | `fixtures/seed.sql`, per-case DML | row/column compare via `pymysql`, `side_by_side()` diff |
-| E2E types | same | `harness/types_it.py` (TP-D01…TP-D04) | `fixtures/seed_types.sql` | per-type canonical compare (temporal wall clock, decimal, JSON) |
-| E2E load | same | `harness/load_it.py` (TP-L01…TP-L04) | generated `tp01_t1..t4`, `tpl01_typed`, `tpl01_large` | baseline + peak reconcile, per-row diff on failure |
-| E2E scale | `scale/run-scale.sh {normal\|heavy}` | `scale/scale_it.py` + `profiles.py` + `schemas.py` | normal: 5 DBs / 20 tables / 50 000 rows / 4 workers; heavy: 10 DBs / 50 tables / 300 000 rows / 8 workers | `checksum_sql()` triples `(count, sum(id), crc32(col))` per table, eventual re-verify, then `verify_update_markers()` |
-| ES E2E / load / scale | `scripts/run-es-*.sh` | `harness/es_it.py`, `es_load_it.py`, `scale/es_scale_it.py` | same generators | independent oracle `es_verify.py` + `es_client.py` (no driver from the sink) |
+| E2E functional | `scripts/run.sh mysql` | `sinks/mysql/harness/run_it.py` (TP-01…TP-20) | `fixtures/seed.sql`, per-case DML | row/column compare via `pymysql`, `side_by_side()` diff |
+| E2E types | same | `sinks/mysql/harness/types_it.py` (TP-D01…TP-D04) | `fixtures/seed_types.sql` | per-type canonical compare (temporal wall clock, decimal, JSON) |
+| E2E load | same | `sinks/mysql/harness/load_it.py` (TP-L01…TP-L04) | generated `tp01_t1..t4`, `tpl01_typed`, `tpl01_large` | baseline + peak reconcile, per-row diff on failure |
+| E2E scale | `scripts/run.sh mysql {normal\|heavy}` | `common/scale_it.py` + `profiles.py` + `schemas.py` | normal: 5 DBs / 20 tables / 50 000 rows / 4 workers; heavy: 10 DBs / 50 tables / 300 000 rows / 8 workers | `checksum_sql()` triples `(count, sum(id), crc32(col))` per table, eventual re-verify, then `verify_update_markers()` |
+| ES E2E / load / scale | `scripts/run.sh elasticsearch` | `sinks/elasticsearch/harness/es_it.py`, `es_load_it.py`, `sinks/elasticsearch/scale/es_scale_it.py` | same generators | independent oracle `es_verify.py` + `es_client.py` (no driver from the sink) |
 
 Reusable as-is (no new framework):
 
-- `harness/config.py` — one place for host/port/credentials, suite DBs, server
+- `common/config.py` — one place for host/port/credentials, suite DBs, server
   ids, checkpoint dirs, pipeline names, `${VAR}` fixture rendering, report path
   rewriting. Extended with the `PG_*` block.
-- `harness/logutil.py`, `harness/sysstat.py` — logging and CPU/RSS sampling.
-- `harness/load_it.py` — table DDL, baseline seeding, `peak_writer()`,
+- `common/logutil.py`, `common/sysstat.py` — logging and CPU/RSS sampling.
+- `sinks/mysql/harness/load_it.py` — table DDL, baseline seeding, `peak_writer()`,
   `wait_peak_catchup()` (60 s × 4 writers with `LOAD_PEAK_*`).
-- `scale/profiles.py`, `scale/schemas.py` — profile topology, row allocation,
+- `common/profiles.py`, `common/schemas.py` — profile topology, row allocation,
   templates, `checksum_sql()`.
 - `scripts/_log.sh` helpers: `absolutize_go_cdc`, `absolutize_checkpoint_dirs`,
   `resolve_python_bin`, `KEEP_IT_*`, teardown ownership under CI.
@@ -54,22 +54,22 @@ generators.
 
 | File | Role | Reuses |
 |---|---|---|
-| `harness/pg_client.py` | `psycopg2` connection/DSN, `exec_sql()`, `fetch_all()`, target ping, schema cleanup | `config.PG_*` |
-| `harness/pg_verify.py` | canonicalization + primary-key-set/row diff; **stdlib only** so it is unit-testable without a database | — |
-| `harness/pg_it.py` | functional E2E, `TP-P01…TP-P20`, report `mysql-postgresql-func.md` | `run_it.start_job/stop_job/kill_job_hard`, `load_it.ensure_schema` |
-| `harness/test_pg_verify.py` | offline `unittest` for the oracle | — |
-| `harness/pg_load_it.py` | load E2E, `TP-PL01…TP-PL04`, report `mysql-postgresql-load.md` | `load_it` seeding + `peak_writer` |
-| `harness/test_pg_load.py` | offline `unittest` for the load adapter | — |
-| `harness/pg_compat.py` | PG 14–18 matrix, report `mysql-postgresql-compat.md` + one per-version E2E report | `harness.pg_it`, `scripts/pg-up.sh` |
-| `harness/test_pg_compat.py` | offline `unittest` for the matrix planning/statuses | — |
-| `harness/pg_bench_it.py` | PG-210 benchmark, report `mysql-postgresql-benchmark.md` | `sysstat.py`, `harness.config` |
-| `harness/test_pg_bench.py` | offline `unittest`: matrix, planner, metrics, report honesty | — |
-| `scale/pg_schemas.py` | PG-safe copy of `schemas.py` (see §4) | `schemas.py` |
-| `scale/test_pg_schemas.py` | offline `unittest` for the PG templates | — |
-| `scale/pg_scale_it.py` | scale normal/heavy, report `mysql-postgresql-scale-{profile}.md` | `profiles.py`, `pg_schemas.py` |
-| `scale/test_pg_scale_pipeline.py` | offline `unittest` for the scale pipeline rendering | — |
-| `scripts/pg-up.sh`, `pg-down.sh`, `wait-for-postgres.sh` | compose lifecycle for the `postgres` service | `_log.sh` |
-| `scripts/run-pg-e2e.sh`, `run-pg-load.sh`, `run-pg-scale.sh`, `run-pg-compat.sh`, `run-pg-bench.sh` | entrypoints | `run-e2e.sh` conventions |
+| `sinks/postgresql/harness/pg_client.py` | `psycopg2` connection/DSN, `exec_sql()`, `fetch_all()`, target ping, schema cleanup | `config.PG_*` |
+| `sinks/postgresql/harness/pg_verify.py` | canonicalization + primary-key-set/row diff; **stdlib only** so it is unit-testable without a database | — |
+| `sinks/postgresql/harness/pg_it.py` | functional E2E, `TP-P01…TP-P20`, report `mysql-postgresql-func.md` | `run_it.start_job/stop_job/kill_job_hard`, `load_it.ensure_schema` |
+| `sinks/postgresql/tests/test_pg_verify.py` | offline `unittest` for the oracle | — |
+| `sinks/postgresql/harness/pg_load_it.py` | load E2E, `TP-PL01…TP-PL04`, report `mysql-postgresql-load.md` | `load_it` seeding + `peak_writer` |
+| `sinks/postgresql/tests/test_pg_load.py` | offline `unittest` for the load adapter | — |
+| `sinks/postgresql/harness/pg_compat.py` | PG 14–18 matrix, report `mysql-postgresql-compat.md` + one per-version E2E report | `harness.pg_it`, `scripts/run.sh postgresql` |
+| `sinks/postgresql/tests/test_pg_compat.py` | offline `unittest` for the matrix planning/statuses | — |
+| `sinks/postgresql/harness/pg_bench_it.py` | PG-210 benchmark, report `mysql-postgresql-benchmark.md` | `sysstat.py`, `harness.config` |
+| `sinks/postgresql/tests/test_pg_bench.py` | offline `unittest`: matrix, planner, metrics, report honesty | — |
+| `sinks/postgresql/scale/pg_schemas.py` | PG-safe copy of `schemas.py` (see §4) | `schemas.py` |
+| `sinks/postgresql/tests/test_pg_schemas.py` | offline `unittest` for the PG templates | — |
+| `sinks/postgresql/scale/pg_scale_it.py` | scale normal/heavy, report `mysql-postgresql-scale-{profile}.md` | `profiles.py`, `pg_schemas.py` |
+| `sinks/postgresql/tests/test_pg_scale_pipeline.py` | offline `unittest` for the scale pipeline rendering | — |
+| `scripts/setup.sh postgresql`, `scripts/wait.sh postgresql`, `scripts/teardown.sh postgresql` | compose lifecycle for the `postgres` service (bring-up + readiness wait, then `down -v`); the probes live in `wait.sh`, which `setup.sh` sources | `_log.sh`, `wait.sh` |
+| `scripts/run.sh postgresql [profile] [variant] [suites]` | the only entrypoint; `pg_compat`/`pg_bench_it` are suites of it, not separate scripts | `_log.sh` conventions |
 
 MySQL stays the only source; the target is one PostgreSQL database (`cdc_it`)
 because `sink.database` is required and single-valued. Isolation is by schema:
@@ -85,7 +85,7 @@ because `sink.database` is required and single-valued. Isolation is by schema:
 
 ## 3. Test points
 
-### 3.1 Functional E2E — `harness/pg_it.py`
+### 3.1 Functional E2E — `sinks/postgresql/harness/pg_it.py`
 
 Each case recreates its source tables and drops the routed target table, then
 starts a fresh `go-cdc` on a fresh checkpoint; one pipeline runs at a time.
@@ -113,13 +113,14 @@ starts a fresh `go-cdc` on a fresh checkpoint; one pipeline runs at a time.
 | TP-P19 | Permanent target error: a target table with no key constraint that could serve as the `ON CONFLICT` target | the job exits instead of retrying, and the checkpoint does not advance. The sink validates the target structure before the first write, so the refusal normally names the missing key (`no primary key or unique constraint covers the source key`) instead of surfacing `42P10`; the assertion accepts either form |
 | TP-P20 | Keyless source table | plain `INSERT` (no conflict target); a replay inserts a second row — the documented limitation, reported rather than "fixed" |
 
-### 3.2 Load — `harness/pg_load_it.py`
+### 3.2 Load — `sinks/postgresql/harness/pg_load_it.py`
 
-Same generator, 4 writers × 60 s (`LOAD_PEAK_*`), all writes on the MySQL
+Same generator, `LOAD_PEAK_WORKERS` writers (4 `normal` / 8 `heavy`) × the tier
+peak (`15 s` / `60 s`, `LOAD_PEAK_*`), all writes on the MySQL
 source. The writers are **Python threads inserting into MySQL**; `go-cdc` only
 reads the binlog, and nothing is ever written to PostgreSQL by the test. The
-pipeline's own concurrency is `LOAD_PARALLELISM`, which `run-pg-load.sh`
-defaults to `LOAD_PEAK_WORKERS` (4).
+pipeline's own concurrency is `LOAD_PARALLELISM`, which `scripts/run.sh postgresql
+heavy pg16 func,load` defaults to `LOAD_PEAK_WORKERS` (4 `normal` / 8 `heavy`).
 
 | ID | Scenario | Key assertions |
 |---|---|---|
@@ -132,14 +133,14 @@ The catch-up budget is `PG_LOAD_CATCHUP_BUDGET_S` = 3600 s. The PR3 spec's
 historical design value was 1800 s; that number is neither enforced nor printed,
 so read the reported timings rather than the budget.
 
-### 3.3 Scale — `scale/pg_scale_it.py`
+### 3.3 Scale — `sinks/postgresql/scale/pg_scale_it.py`
 
-Profiles and topology come from `scale/profiles.py`, unchanged:
+Profiles and topology come from `common/profiles.py`, unchanged:
 
 | Profile | DBs | Tables | Total rows | Workers | Peak stage |
 |---|---|---|---|---|---|
 | normal | 5 | 20 | 50 000 | 4 | none (mutations only) |
-| heavy | 10 | 50 | 300 000 | 8 | 50 000 rows/hotspot burst, 8×45 s, catch-up budget 3 600 s |
+| heavy | 10 | 50 | 300 000 | 8 | 50 000 rows/hotspot burst, 8×60 s, catch-up budget 5 400 s (`heavy`) / 1 800 s (`normal`) |
 
 Reconciliation is two-stage, and the first stage is only a gate:
 
@@ -152,10 +153,11 @@ Reconciliation is two-stage, and the first stage is only a gate:
    the target. A mismatch names the table and the first differing ids.
 
 A count-only or aggregate-only result is never reported as a pass. One budget
-(`PEAK_CATCHUP_BUDGET_S = 3600`) spans hotspot convergence plus the aggregate and
+(`PEAK_CATCHUP_BUDGET_S`, default `3600`, which `run.sh` overrides per tier to
+`1800` normal / `5400` heavy) spans hotspot convergence plus the aggregate and
 row-level verification that follows it, so the phases never re-time
-independently; the value lives in `scale/pg_scale_it.py` and mirrors
-`scale/scale_it.py`'s.
+independently; the value lives in `sinks/postgresql/scale/pg_scale_it.py` and mirrors
+`common/scale_it.py`'s.
 
 Isolation is per profile, by construction: source databases are
 `db_tp_pg_scale_src_<nn>`, target schemas are `tp_pg_scale_<profile>_<nn>`, and
@@ -166,16 +168,16 @@ other profile's schemas are out of reach of the cleanup.
 
 **PG-209 — version matrix.** The same functional core (connect, snapshot, DML,
 batch/txn, auto-create, supported DDL, type conversion, checkpoint resume,
-replay) runs against 14/15/16/17/18 through `scripts/run-pg-compat.sh`. Nothing is
+replay) runs against 14/15/16/17/18 through `scripts/run.sh postgresql heavy pg16 compat`. Nothing is
 copied per version: the per-version inputs are the image (`postgres:<major>`, or
 `PG_COMPAT_IMAGE_<major>` to pin a minor), the `PG_EXPECT_MAJOR` guard, and the
 report/checkpoint paths. Execution is serial inside one compose project, because
-the matrix owns the `postgres` service and `scripts/pg-up.sh` recreates it when
+the matrix owns the `postgres` service and `scripts/run.sh postgresql` recreates it when
 the image changes (an initialized data directory is version-bound). A version
 that could not run is `ENV BLOCKED`; the report is `COMPLETE` only when all five
 rows really ran and passed.
 
-**PG-210 — benchmark.** `harness/pg_bench_it.py` sweeps `write-batch-size`
+**PG-210 — benchmark.** `sinks/postgresql/harness/pg_bench_it.py` sweeps `write-batch-size`
 100/1000/5000 for an INSERT/UPSERT-only and an UPDATE/DELETE-mixed workload (6
 cells). Each cell: seed + snapshot (not measured), a measured write window all on
 the MySQL source, then stop writing, wait for catch-up and compare every row and
@@ -199,12 +201,12 @@ target.
 The sink refuses `ENUM`, `SET`, `BIT`, `TIME` and the spatial types
 (`docs/connectors/postgresql-sink.md`, "Column Type Mapping"). Two existing
 generators create exactly those columns, so the PostgreSQL suites derive their
-own templates the way `scale/doris_schemas.py` already does:
+own templates the way `sinks/doris/scale/doris_schemas.py` already does:
 
 | Template | Column | Action | Reason |
 |---|---|---|---|
-| `scale/schemas.py` `wide` | `c_time TIME` | dropped in `scale/pg_schemas.py` | `TIME` is refused by the sink (MySQL time spans negative and over-24-hour values) |
-| `harness/load_it.py` `tpl01_typed` | `c_enum ENUM`, `c_bit BIT(8)` | dropped by `harness/pg_load_it.py` after seeding | same |
+| `common/schemas.py` `wide` | `c_time TIME` | dropped in `sinks/postgresql/scale/pg_schemas.py` | `TIME` is refused by the sink (MySQL time spans negative and over-24-hour values) |
+| `sinks/mysql/harness/load_it.py` `tpl01_typed` | `c_enum ENUM`, `c_bit BIT(8)` | dropped by `sinks/postgresql/harness/pg_load_it.py` after seeding | same |
 
 Rules: the deviation is asserted (seeding fails if the column is still there, and
 `create_table_sql` fails when the column it expects to drop is missing), printed
@@ -311,20 +313,20 @@ columns say what has actually been executed.
 
 | Requirement | Suite | Scenario | Source Test | PostgreSQL Test | Command | Profile | Assertion | Status | Evidence |
 |---|---|---|---|---|---|---|---|---|---|
-| PG-201 | E2E | Multi-DB snapshot, same table names, empty/NULL/default | `run_it` TP-01, `types_it` TP-D01 | TP-P01, TP-P16 | `scripts/run-pg-e2e.sh` | — | PK sets + canonical field values + schema/table mapping; no `COUNT(*)`-only check | NOT RUN | none yet |
-| PG-202 | E2E | CRUD, consecutive updates, delete→insert, insert→delete, NULL/default, PK change | `run_it` TP-02/TP-03/TP-06 | TP-P03, TP-P04, TP-P06 (composite key is TP-P06 only) | `scripts/run-pg-e2e.sh` | — | final row-set equality per case | NOT RUN | none yet |
-| PG-203 | E2E | DML during snapshot (overlap proven before the writes) | `load_it` TP-L02 (partial) | TP-P02 | `scripts/run-pg-e2e.sh` | — | `0 < target rows < baseline` proven, then full catch-up equality | NOT RUN | none yet |
-| PG-204 | E2E | Allowed DDL + immediate DML; default-off DDL; unsupported DDL | `run_it` TP-07/TP-09/TP-15…TP-20 | TP-P07, TP-P08, TP-P09 | `scripts/run-pg-e2e.sh` | — | target DDL state + post-DDL rows; refused DDL surfaces as error, not silent loss | NOT RUN | none yet |
-| PG-205 | E2E | Graceful / hard restart, replay, PR2 M3 limitation, scale restart phase | `run_it` TP-13, TP-14 | TP-P11, TP-P12, TP-P13 | `scripts/run-pg-e2e.sh`, `scripts/run-pg-scale.sh` | — | final state equal after resume; M3 behaviour documented; commit-after-checkpoint not isolated (§7) | NOT RUN | none yet |
-| PG-206 | E2E | Txn failure, cancelled statement, NOLOGIN 28000, missing key constraint (startup check or 42P10); optional server restart | none | TP-P14, TP-P17 (`SKIPPED` by default), TP-P18 (`SKIPPED`, no injector), TP-P19 | `scripts/run-pg-e2e.sh` (`PG_RESTART_ENABLED=1` for TP-P17) | — | diagnosable error + recovery to equal state; injections cleaned up; network case recorded `SKIPPED` | NOT RUN | none yet |
-| PG-207 | E2E | Replay duplicates, multi-writer same PK, ordering limits | `run_it` TP-03, TP-14 | TP-P15, TP-P05 | `scripts/run-pg-e2e.sh` | — | replayed window reproduces the same final state; unsupported ordering recorded | NOT RUN | none yet |
-| PG-208 | E2E | Cross-DB route, schema isolation, renamed target tables, identifier case | `run_it` TP-10/TP-11 (single DB only) | TP-P10, TP-P01 | `scripts/run-pg-e2e.sh` | — | isolation per schema/table; no cross-schema leakage | NOT RUN | none yet |
-| PG-209 | Compatibility | Same core on 14/15/16/17/18 | E2E core | TP-P01…TP-P20 per version | `scripts/run-pg-compat.sh` | 5 versions, serial | per-version PASS/FAIL/SKIPPED/ENV BLOCKED + server/Go/pgx versions | NOT RUN (dry-run report only) | `mysql-postgresql-compat.md` = 5 × NOT RUN |
-| PG-210 | Benchmark | INSERT/UPSERT and UPDATE/DELETE at batch 100/1000/5000 | — | `harness/pg_bench_it.py` | `scripts/run-pg-bench.sh` | 6 cells | throughput, P50/P95, CPU/RSS, connections, failure rate, `n/a` retries + §9.3 metadata | OFFLINE PASS / NOT RUN | `test_pg_bench.py`, dry-run report |
-| PG-211 | Regression | MySQL sink + shared pipeline still green | `run_it`, `types_it`, `load_it`, `scale_it`, Go unit tests | — | `make build && make test`, `scripts/run-e2e.sh`, `scale/run-scale.sh normal` | — | unchanged suites pass | OFFLINE PASS (Go unit tests) / NOT RUN (IT) | CI not re-run here |
+| PG-201 | E2E | Multi-DB snapshot, same table names, empty/NULL/default | `run_it` TP-01, `types_it` TP-D01 | TP-P01, TP-P16 | `scripts/run.sh postgresql` | — | PK sets + canonical field values + schema/table mapping; no `COUNT(*)`-only check | NOT RUN | none yet |
+| PG-202 | E2E | CRUD, consecutive updates, delete→insert, insert→delete, NULL/default, PK change | `run_it` TP-02/TP-03/TP-06 | TP-P03, TP-P04, TP-P06 (composite key is TP-P06 only) | `scripts/run.sh postgresql` | — | final row-set equality per case | NOT RUN | none yet |
+| PG-203 | E2E | DML during snapshot (overlap proven before the writes) | `load_it` TP-L02 (partial) | TP-P02 | `scripts/run.sh postgresql` | — | `0 < target rows < baseline` proven, then full catch-up equality | NOT RUN | none yet |
+| PG-204 | E2E | Allowed DDL + immediate DML; default-off DDL; unsupported DDL | `run_it` TP-07/TP-09/TP-15…TP-20 | TP-P07, TP-P08, TP-P09 | `scripts/run.sh postgresql` | — | target DDL state + post-DDL rows; refused DDL surfaces as error, not silent loss | NOT RUN | none yet |
+| PG-205 | E2E | Graceful / hard restart, replay, PR2 M3 limitation, scale restart phase | `run_it` TP-13, TP-14 | TP-P11, TP-P12, TP-P13 | `scripts/run.sh postgresql`, `scripts/run.sh postgresql heavy pg16 scale` | — | final state equal after resume; M3 behaviour documented; commit-after-checkpoint not isolated (§7) | NOT RUN | none yet |
+| PG-206 | E2E | Txn failure, cancelled statement, NOLOGIN 28000, missing key constraint (startup check or 42P10); optional server restart | none | TP-P14, TP-P17 (`SKIPPED` by default), TP-P18 (`SKIPPED`, no injector), TP-P19 | `scripts/run.sh postgresql` (`PG_RESTART_ENABLED=1` for TP-P17) | — | diagnosable error + recovery to equal state; injections cleaned up; network case recorded `SKIPPED` | NOT RUN | none yet |
+| PG-207 | E2E | Replay duplicates, multi-writer same PK, ordering limits | `run_it` TP-03, TP-14 | TP-P15, TP-P05 | `scripts/run.sh postgresql` | — | replayed window reproduces the same final state; unsupported ordering recorded | NOT RUN | none yet |
+| PG-208 | E2E | Cross-DB route, schema isolation, renamed target tables, identifier case | `run_it` TP-10/TP-11 (single DB only) | TP-P10, TP-P01 | `scripts/run.sh postgresql` | — | isolation per schema/table; no cross-schema leakage | NOT RUN | none yet |
+| PG-209 | Compatibility | Same core on 14/15/16/17/18 | E2E core | TP-P01…TP-P20 per version | `scripts/run.sh postgresql heavy pg16 compat` | 5 versions, serial | per-version PASS/FAIL/SKIPPED/ENV BLOCKED + server/Go/pgx versions | NOT RUN (dry-run report only) | `mysql-postgresql-compat.md` = 5 × NOT RUN |
+| PG-210 | Benchmark | INSERT/UPSERT and UPDATE/DELETE at batch 100/1000/5000 | — | `sinks/postgresql/harness/pg_bench_it.py` | `scripts/run.sh postgresql heavy pg16 bench` | 6 cells | throughput, P50/P95, CPU/RSS, connections, failure rate, `n/a` retries + §9.3 metadata | OFFLINE PASS / NOT RUN | `test_pg_bench.py`, dry-run report |
+| PG-211 | Regression | MySQL sink + shared pipeline still green | `run_it`, `types_it`, `load_it`, `scale_it`, Go unit tests | — | `make build && make test`, `scripts/run.sh mysql`, `scripts/run.sh mysql normal` | — | unchanged suites pass | OFFLINE PASS (Go unit tests) / NOT RUN (IT) | CI not re-run here |
 | PG-212 | Docs | Full config, defaults, YAML example, security options | — | — | — | — | `docs/connectors/postgresql-sink.md` | IMPLEMENTED | connector doc |
 | PG-213 | Docs | Types, DDL matrix, recovery, version compatibility, limits, SQLSTATE | — | — | — | — | connector doc + this file | IMPLEMENTED | connector doc, this file |
-| PG-214 | CI | E2E/Load/Scale/Compat/Benchmark wired into CI, layered | `integration.yml` | — | `.github/workflows/postgresql-integration.yml` | normal / heavy / matrix | PR jobs run the light suites; heavy, matrix and benchmark are dispatch- or schedule-only; exit codes propagate | IMPLEMENTED (YAML checked offline) / NOT RUN (jobs) | §12 |
+| PG-214 | CI | E2E/Load/Scale/Compat/Benchmark wired into CI, layered | `ci.yml` | — | `.github/workflows/ci.yml` + `ci-postgresql.yml` | normal / variant | PRs run the `normal` tier in the `sink-postgresql` job; load, scale, compat and benchmark are reachable only from the `heavy` tier; exit codes propagate | IMPLEMENTED (YAML checked offline) / NOT RUN (jobs) | §12 |
 
 ## 9. Status vocabulary
 
@@ -343,32 +345,31 @@ usable ran (`ENV BLOCKED` / `NOT RUN`).
 
 ```bash
 # one-time: MySQL + PostgreSQL
-bash test/integration/scripts/mysql-up.sh
-bash test/integration/scripts/pg-up.sh
+bash tests/integration/scripts/run.sh mysql
+bash tests/integration/scripts/run.sh postgresql normal pg16
 
 # functional E2E (TP-P01..TP-P20); a subset re-runs a single failure
-bash test/integration/scripts/run-pg-e2e.sh
-bash test/integration/scripts/run-pg-e2e.sh TP-P05 TP-P14
-PG_RESTART_ENABLED=1 bash test/integration/scripts/run-pg-e2e.sh TP-P17
+bash tests/integration/scripts/run.sh postgresql normal pg16
+bash tests/integration/scripts/run.sh postgresql normal pg16 TP-P05 TP-P14
+PG_RESTART_ENABLED=1 bash tests/integration/scripts/run.sh postgresql normal pg16 TP-P17
 
 # load (4 writers × 60 s, all writes on MySQL)
-bash test/integration/scripts/run-pg-load.sh
+bash tests/integration/scripts/run.sh postgresql heavy pg16 func,load
 
 # scale (`heavy` needs both the argument and PG_SCALE_HEAVY=1)
-bash test/integration/scripts/run-pg-scale.sh normal
-PG_SCALE_HEAVY=1 bash test/integration/scripts/run-pg-scale.sh heavy
+bash tests/integration/scripts/run.sh postgresql normal pg16 scale
+PG_SCALE_HEAVY=1 bash tests/integration/scripts/run.sh postgresql heavy pg16 scale
 
 # compatibility matrix / benchmark
-bash test/integration/scripts/run-pg-compat.sh              # 14 15 16 17 18
-bash test/integration/scripts/run-pg-bench.sh --list        # the 6 cells, nothing runs
-bash test/integration/scripts/run-pg-bench.sh --dry-run     # report with 6 × NOT RUN
-bash test/integration/scripts/run-pg-bench.sh
+bash tests/integration/scripts/run.sh postgresql heavy pg16 compat              # 14 15 16 17 18
+bash tests/integration/scripts/run.sh postgresql heavy pg16 bench --list        # the 6 cells, nothing runs
+bash tests/integration/scripts/run.sh postgresql heavy pg16 bench --dry-run     # report with 6 × NOT RUN
+bash tests/integration/scripts/run.sh postgresql heavy pg16 bench
 
-# offline (no database, no container)
-cd test/integration \
-  && python3 -m unittest harness.test_pg_bench harness.test_pg_compat \
-       harness.test_pg_load harness.test_pg_verify \
-  && python3 -m pytest -q scale/
+# offline (no database, no container) — one pytest tree from the repo root
+cd tests/integration \
+  && python3 -m pytest -q sinks/postgresql/tests \
+  && cd ../.. && python3 -m pytest -q tests/integration
 ```
 
 Reports land in `docs/test/reports/mysql-postgresql-*.md` (not tracked; see
@@ -392,30 +393,42 @@ Those are reported as `OFFLINE PASS`; they are not integration evidence.
 
 ## 12. CI
 
-`.github/workflows/postgresql-integration.yml` carries every PostgreSQL job; the
-MySQL, Doris and Elasticsearch suites keep their own workflows.
+`.github/workflows/ci.yml` is the only entry point; PostgreSQL is one row of its
+matrix, executed by the reusable `.github/workflows/ci-postgresql.yml`. The sink
+job is fed only the PostgreSQL rows, so a change elsewhere never starts it.
 
-| Job | Trigger | What runs |
+```text
+decide  ->  plan  ->  go-check  ->  sink-postgresql  ->  result
+```
+
+| Piece | Trigger | What runs |
 |---|---|---|
-| `decide` | every event | skips push work when an open PR already covers the head |
-| `postgres-sink-dml` | push / PR / dispatch / schedule | Go DML integration suite (`-tags postgres_integration`), one pinned PostgreSQL 16 service |
-| `postgresql-offline` | push / PR / dispatch / schedule | harness unit tests, `pg_bench_it --dry-run` honesty check, `pg_compat --list` matrix check — no database |
-| `postgresql-e2e` | push / PR / dispatch (not schedule) | `run-pg-e2e.sh`, TP-P01…TP-P20 on PostgreSQL 16.4 |
-| `postgresql-load` | `workflow_dispatch` + `run_load` | `run-pg-load.sh` |
-| `postgresql-scale` | `workflow_dispatch` + `scale_profile` = `normal`/`heavy` | `run-pg-scale.sh <profile>`; `heavy` also exports `PG_SCALE_HEAVY=1` |
-| `postgresql-compat` | weekly `schedule` (Mon 05:00 UTC) or dispatch + `run_compat` | `run-pg-compat.sh`, PG 14–18 |
-| `postgresql-benchmark` | `workflow_dispatch` + `run_benchmark` | `run-pg-bench.sh` |
+| `decide` | every event | drops a push that an open PR already covers (`run=false`), and is the only place the tier is computed (`workflow_dispatch` input > `ci-heavy` on the PR > default-branch push > `normal`) |
+| `plan` | after `decide` | `tools/ci/plan.py`: a diff touching `connector/sink/postgresql/`, `tests/integration/sinks/postgresql/`, `configs/demo-postgresql.yaml` or `.github/workflows/ci-postgresql.yml` yields `{"include": [{"sink": "postgresql", "variant": "pg16"}]}` (a docs-only diff yields `{"include": []}`) |
+| `go-check` | `normal` + `heavy` | `gofmt`, `golangci-lint`, `make test` (includes the `postgres_integration`-tagged unit tests that need no server), build, `pytest tests/integration tools/ci/test_plan.py`, `bash -n` over every script |
+| `sink-postgresql` | re-runs `ci-postgresql.yml` with `profile` + matrix | `run.sh postgresql <profile> pg16` — see the tier table below |
+| `result` | always | the single required check; `skipped` and an empty matrix both count as success |
+
+Tiers:
+
+| Tier | Trigger | Suites |
+|---|---|---|
+| `normal` | PR opened / synchronized / reopened, and a push to any other branch | `func` — TP-P01…TP-P20 on PostgreSQL 16 |
+| `heavy` | `ci-heavy` already on the PR (push after adding it) or `gh workflow run ci.yml -f profile=heavy`; push to `main`/`master` | `func,load,bench,scale,compat` — `compat` runs last because it replaces the stack once per major (14…18) |
 
 Layering rules the workflow enforces:
 
-- A pull request runs `postgres-sink-dml`, `postgresql-offline` and
-  `postgresql-e2e` only. Load, scale, matrix and benchmark are unreachable from
-  `pull_request`.
-- `heavy` scale needs the dispatch choice **and** `PG_SCALE_HEAVY=1` inside the
-  script, so it cannot start by accident.
-- Every job owns a compose project (`gocdc-pg-e2e`, `gocdc-pg-load`,
-  `gocdc-pg-scale`, `gocdc-pg-compat`, `gocdc-pg-bench`) and therefore its own
-  containers, volumes, checkpoint directories and report files.
+- Load, scale, compat and benchmark are unreachable from a pull request: they
+  only exist inside the `heavy` suite list that `run.sh` builds for
+  `PROFILE=heavy`.
+- `heavy` scale needs both the tier **and** `PG_SCALE_HEAVY=1` inside the script,
+  so it cannot start by accident.
+- One compose project per sink (`gocdc-postgresql-mysql`, the source is always
+  part of it), deliberately *not* per
+  variant: `compat` loops pg14…pg18 inside a single job and each iteration calls
+  `setup.sh`, which does `down -v` first — otherwise the previous major would keep
+  holding host port `13306`. Each job still owns its containers, volumes,
+  checkpoint directories and report files.
 - Each harness step maps the exit code to an annotation (`0` notice, `2` **ENV
   BLOCKED** error, anything else **FAIL** error) and then exits with the same
   status: an unusable environment is a red job.
@@ -423,5 +436,5 @@ Layering rules the workflow enforces:
   the pipeline YAML — which holds the sink password — is never uploaded.
 - No job sets `PG_RESTART_ENABLED`, so TP-P17 (server restart) is `SKIPPED` in CI
   and can only be produced by hand: `PG_RESTART_ENABLED=1 bash
-  test/integration/scripts/run-pg-e2e.sh TP-P17` on a machine with the compose
+  tests/integration/scripts/run.sh postgresql normal pg16 TP-P17` on a machine with the compose
   stack. The gap is recorded rather than covered by a green job.

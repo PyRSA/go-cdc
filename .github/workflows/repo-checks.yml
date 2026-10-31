@@ -5,7 +5,7 @@ on:
   pull_request:
   push:
 
-# Per-workflow group (both this and integration.yml display as "CI").
+# Per-workflow group (this and ci.yml are separate required checks).
 # Newer commit on same branch/PR cancels older repo-checks only.
 concurrency:
   group: repo-checks-${{ github.event.pull_request.number || github.ref }}
@@ -143,4 +143,4 @@ jobs:
           python-version: "3.11"
 
       - name: Scan tracked files
-        run: python3 test/check-license-decls.py
+        run: python3 tests/check-license-decls.py

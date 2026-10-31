@@ -1,0 +1,90 @@
+# Reusable sink workflow: MySQL (variants 57 and 80).
+#
+# ci.yml calls this with only the rows MySQL owns; every matrix row gets its own
+# runner, so the fixed host port in sources/mysql/docker-compose.yml (13306)
+# never collides between parallel rows.
+#
+#   profile  normal -> func,types,load
+#            heavy  -> func,types,load,scale   (5.7 stays correctness-only)
+#   variant  57 | 80 -> MYSQL_TAG / MYSQL_IMAGE, mapped by `_log.sh:
+#            it_apply_variant` (run.sh and setup.sh both call it)
+name: CI / mysql
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: "Run tier: normal | heavy"
+        required: true
+        type: string
+      matrix:
+        description: 'Rows owned by this sink, e.g. {"include": [{"sink": "mysql", "variant": "80"}]}'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  run:
+    name: mysql ${{ matrix.variant || 'default' }}
+    runs-on: ubuntu-latest
+    # Two-tier timeout: the heavy tier adds the scale suite on the same box.
+    timeout-minutes: ${{ inputs.profile == 'heavy' && 300 || 150 }}
+    strategy:
+      fail-fast: false
+      # Heavy rows each hold a Docker daemon; cap the fan-out so runners do not
+      # starve each other.
+      max-parallel: ${{ inputs.profile == 'heavy' && 2 || 6 }}
+      # An empty string means "no rows"; strategy.matrix still needs an object.
+      matrix: ${{ fromJSON(inputs.matrix || '{"include":[]}') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install client tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends mysql-client
+          python3 -m pip install -r tests/integration/common/requirements.txt
+
+      # Three steps, one lifecycle: setup raises the stack and blocks until MySQL
+      # is ready, run only executes the suites (IT_SKIP_SETUP=1 keeps it from
+      # raising the stack a second time), teardown always fires. A failed setup
+      # therefore fails its own step instead of a wall of suite noise.
+      # The variant is the third argument: it is never inferred here.
+      - name: Setup stack
+        run: bash tests/integration/scripts/setup.sh mysql "${{ matrix.variant }}" "${{ inputs.profile }}"
+
+      - name: Run suites
+        env:
+          IT_SKIP_SETUP: "1"
+        run: |
+          set -euo pipefail
+          bash tests/integration/scripts/run.sh mysql "${{ inputs.profile }}" "${{ matrix.variant }}"
+
+      - name: Upload reports
+        if: always() && (inputs.profile == 'heavy' || failure())
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-mysql-${{ matrix.variant || 'default' }}-${{ inputs.profile }}
+          path: docs/test/reports/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # Containers are torn down once, here, and only after the report upload.
+      - name: Teardown
+        if: always()
+        run: bash tests/integration/scripts/teardown.sh mysql "${{ matrix.variant }}"

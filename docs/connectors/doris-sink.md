@@ -299,7 +299,7 @@ empty-string defaults, live `ADD COLUMN` visibility and partial reconcile,
 **not** returned, the FE→BE redirect with BE authentication, and multi-table
 first-failure recovery. Still unverified: `Publish Timeout` (only forced in unit
 `httptest` runs). To check it on the target cluster, run the integration suite — see
-[`test/integration/README.md`](../../test/integration/README.md).
+[`tests/integration/README.md`](../../tests/integration/README.md).
 
 ## Related Docs
 

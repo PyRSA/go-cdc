@@ -1,8 +1,8 @@
 # 数据类型 / 时区测试说明
 
-配套 harness：`test/integration/harness/types_it.py`  
-造数：`test/integration/fixtures/seed_types.sql`  
-作业：`test/integration/fixtures/pipeline.types.yaml.tpl`
+配套 harness：`tests/integration/sinks/mysql/harness/types_it.py`  
+造数：`tests/integration/sinks/mysql/fixtures/seed_types.sql`  
+作业：`tests/integration/sinks/mysql/fixtures/pipeline.types.yaml.tpl`
 
 English: [TYPES.md](./TYPES.md)
 
@@ -21,7 +21,7 @@ CDC 最容易翻车的是：
 
 | 项 | 值 |
 |----|----|
-| MySQL `default-time-zone` | `+00:00`（UTC，见 `mysql/conf.d/my.cnf`） |
+| MySQL `default-time-zone` | `+00:00`（UTC，见 `sources/mysql/conf.d/my.cnf`） |
 | CDC `source.server-time-zone` | `Asia/Shanghai` |
 | 造数 / 断言会话 | `SET time_zone='+08:00'` |
 
@@ -47,16 +47,12 @@ CDC 最容易翻车的是：
 ## 怎么跑
 
 ```bash
-bash test/integration/scripts/mysql-up.sh
-bash test/integration/scripts/run-e2e.sh   # 会顺带跑 types harness
+bash tests/integration/scripts/run.sh mysql          # func + types + load
 # 报告：docs/test/reports/mysql-mysql-types.md
 ```
 
-只跑类型套件：
+只跑类型套件（stack 已由 `setup.sh` 拉起时）：
 
 ```bash
-# 需已 seed + 已 build go-cdc
-cd test/integration
-export GO_CDC=./workdir/go-cdc MYSQL_PORT=13306
-python3 -m harness.types_it
+bash tests/integration/scripts/run.sh mysql normal "" types
 ```

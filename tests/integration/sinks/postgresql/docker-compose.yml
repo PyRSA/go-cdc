@@ -1,0 +1,33 @@
+# PostgreSQL sink target (single node, host -> 127.0.0.1:${PG_HOST_PORT}).
+#
+# One database (cdc_it): the PostgreSQL sink connects to exactly one database and
+# isolates suites by schema, so a suite's "sink DB" is a schema here.
+#
+# A major-version switch cannot reuse an initialized data directory, so
+# scripts/setup.sh drops the container and its volume when PG_IMAGE changes
+# between runs.
+services:
+  postgres:
+    image: ${PG_IMAGE:-postgres:16.4}
+    ports:
+      - "${PG_HOST_PORT:-15432}:5432"
+    environment:
+      POSTGRES_USER: ${PG_USER:-postgres}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-postgres}
+      POSTGRES_DB: ${PG_DB:-cdc_it}
+      TZ: Asia/Shanghai
+    command:
+      - -c
+      - max_connections=200
+      - -c
+      - logging_collector=off
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${PG_USER:-postgres} -d ${PG_DB:-cdc_it}",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 10s

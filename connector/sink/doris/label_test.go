@@ -67,8 +67,9 @@ func TestClassifyLoadSuccessWithOmittedCountersIsFatal(t *testing.T) {
 
 // TestClassifyLoadPublishTimeout pins the Publish Timeout policy. Doris
 // documents the status as an import that already completed and only may become
-// visible later ("导入已经完成，但数据可能会延迟可见，无需重试"), so the load must not be
-// retried under a new label and must not look like a failure.
+// visible later ("the import has finished, but the data may still become visible
+// later; no retry is needed"), so the load must not be retried under a new label
+// and must not look like a failure.
 //
 // The responses are decoded from JSON on purpose: whether a counter is present
 // is part of the behaviour, and a hand-built struct cannot express the
