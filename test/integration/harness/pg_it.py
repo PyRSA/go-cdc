@@ -420,6 +420,31 @@ def log_tail(lines: int = 12) -> str:
     return " | ".join(body[-lines:])
 
 
+def log_errors(limit: int = 4, stack: int = 8) -> str:
+    """Return the pipeline's own fatal records, not the last lines written.
+
+    On a failure the process logs `pipeline failed` at level=ERROR and only then
+    closes the source, which appends three INFO shutdown lines (`closing canal`,
+    `syncer is closing...`, `syncer is closed`). A plain tail therefore hides the
+    one line that says why the job died, so every failure report quotes the
+    ERROR record instead and only falls back to the tail when there is none.
+
+    A Go crash is quoted together with the goroutine stack that follows it: the
+    `panic:` line names the value but never the frame, so dropping the frames
+    makes the report less useful than the tail it replaced.
+    """
+    if limit <= 0:
+        limit = 4
+    body = [ln.strip() for ln in log_text().splitlines() if ln.strip()]
+    for i, line in enumerate(body):
+        if "panic:" in line or line.startswith("fatal error:"):
+            return " | ".join(body[i:i + stack])
+    fatal = [ln for ln in body if "level=ERROR" in ln]
+    if fatal:
+        return " | ".join(fatal[-limit:])
+    return " | ".join(["no level=ERROR line", *body[-limit:]])
+
+
 # ---------------------------------------------------------------- pipeline YAML
 
 DEFAULT_SINK: dict[str, object] = {
@@ -651,7 +676,7 @@ def reconcile(case: Case, label: str, db: str, table: str, *, timeout: float = 0
         deadline = time.time() + timeout
         while failures and time.time() < deadline:
             if alive_at_entry and not job_alive():
-                failures.append(f"the job stopped while waiting: {log_tail(4)}")
+                failures.append(f"the job stopped while waiting: {log_errors()}")
                 break
             time.sleep(2)
             failures = once()
@@ -659,7 +684,7 @@ def reconcile(case: Case, label: str, db: str, table: str, *, timeout: float = 0
         # A diff alone does not say whether the sink is behind or already gone, so
         # the process state and its last words travel with every failure.
         detail = (f"{pg_verify.summarize(failures)} | job "
-                  f"{'alive' if job_alive() else 'stopped'} | last log: {log_tail(3)}")
+                  f"{'alive' if job_alive() else 'stopped'} | error: {log_errors()}")
         check(case, f"{label}: {db}.{table} -> {schema}.{sink_table}", False, detail)
     else:
         check(case, f"{label}: {db}.{table} -> {schema}.{sink_table} reconciled", True,
@@ -1510,7 +1535,7 @@ def tp_p16() -> Case:
             )
         except TimeoutError as exc:
             note(case, f"the typed UPDATE never landed: {exc} | job "
-                       f"{'alive' if job_alive() else 'stopped'} | {log_tail(6)}")
+                       f"{'alive' if job_alive() else 'stopped'} | {log_errors(6)}")
         reconcile(case, "after binlog update", SRC_A, spec.name, timeout=120)
     # TIME/SET/ENUM/BIT are refused, so a pipeline that captures such a table has
     # to stop rather than create a target column the mapping does not define. It
@@ -1711,7 +1736,8 @@ def run_case(tp_id: str, run) -> None:
         log(f"    [error] {tp_id}: {exc!r}", flush=True)
         if len(cases) > before:
             case = cases[-1]
-            check(case, "the case completed without an exception", False, repr(exc))
+            check(case, "the case completed without an exception", False,
+                  f"{exc!r} | {log_errors()}")
             if not case.status:
                 finish(case, "FAIL")
         else:
