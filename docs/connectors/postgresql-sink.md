@@ -8,7 +8,7 @@ Applies pipeline changes to a PostgreSQL table as current-state writes (`INSERT 
 
 | Item | Support |
 | --- | --- |
-| Target PostgreSQL | **16** (validated; other versions are untested in this release) |
+| Target PostgreSQL | **14 – 18**. The everyday suites pin **16.4**; the same functional core is exercised on 14/15/16/17/18 by `harness/pg_compat.py` (`scripts/run-pg-compat.sh`). A version counts as validated only when its row in `mysql-postgresql-compat.md` reports `PASS` — nothing else is claimed. See [PostgreSQL test suites](../test/POSTGRESQL.md#34-compatibility-and-benchmark) |
 | SQL driver | `github.com/jackc/pgx/v5` (linked into `go-cdc`) |
 | Packaging | Shipped inside the `go-cdc` binary |
 | Time zone | **No sink-side time-zone option**; the connection session `TimeZone` follows `source.server-time-zone` |
@@ -221,6 +221,30 @@ The MySQL zero date (`0000-00-00`, `0000-00-00 00:00:00`) has no PostgreSQL valu
 - No automatic retraction of rows that a filter or projection drops.
 - Unsigned `BIGINT` values above `MaxInt64` still arrive as decimal text and are written into `NUMERIC(20,0)`; a hand-made `BIGINT` target column rejects them with `22003`.
 
+## Troubleshooting by SQLSTATE
+
+The sink does not translate server errors: the message names the operation, `schema.table`, and the SQLSTATE the server returned, and the classification below decides whether the batch is retried or the job exits. The checkpoint never advances past an error that stopped the job, so a fixed target is replayed from the last saved position.
+
+| SQLSTATE | Server message | Where it comes from | Behaviour | What to do |
+| --- | --- | --- | --- | --- |
+| `40001` | could not serialize access | a concurrent transaction touched the same rows | retried | none; backoff starts at 100ms and doubles up to 2s |
+| `40P01` | deadlock detected | two sessions took locks in the opposite order | retried | none |
+| `57P01` | terminating connection due to administrator command | server shutdown, `pg_terminate_backend` | retried | none unless it repeats |
+| `57P03` | cannot connect now / the database system is starting up | server still recovering | retried | none |
+| `08xxx` | connection exception (broken pipe, EOF, connection refused after a restart) | network or server loss | retried | check network stability if it repeats; a socket error **without** a SQLSTATE is not retried |
+| `42P10` | there is no unique or exclusion constraint matching the `ON CONFLICT` specification | the target has no `PRIMARY KEY`/`UNIQUE` on the business key | permanent, job exits | create the constraint, or set `transform.primary-keys` to a key the target enforces |
+| `42P07` | relation already exists | a `CREATE TABLE` that lost a race | re-read from `pg_catalog` and validated; not an error in itself | none; a structure that fails validation is reported by the validation message |
+| `42703` | column … does not exist | a projection/rename mismatch, or a target that lost a column undetected | permanent | keep `transform.projection` in step with renames; re-validate the target by hand |
+| `42804` | column is of type … but expression is of type … | a value whose shape the column rejects | permanent | change the target type or the projection |
+| `22003` | value out of range for type … | an unsigned `BIGINT` above `MaxInt64` into a hand-made `BIGINT` | permanent | use the mapped `NUMERIC(20,0)` |
+| `22P02` | invalid input syntax for type … | a value the target column cannot parse | permanent | inspect the source value and the mapped type |
+| `22007` / `22008` | date/time field value out of range | the MySQL zero date (`0000-00-00 …`) | permanent | clean the source rows; the sink will not rewrite them to `NULL` |
+| `2BP01` | cannot drop column … because other objects depend on it | a view, generated column, or expression index over a dropped column | permanent, nothing dropped | drop the dependent object first |
+| `28000` | role … is not permitted to log in | the sink role lost `LOGIN`, or the credentials are wrong | permanent | restore `ALTER ROLE … LOGIN`, or fix `username`/`password` |
+| `42501` | permission denied for … | the role lacks `USAGE` on the schema, or `SELECT`/`INSERT`/`UPDATE`/`DELETE` on the table | permanent | grant the missing privilege |
+
+A failed `COMMIT` carries no classification of its own: its outcome is unknown, so the sink never retries it, exits, and replays from the last checkpoint (see [Behavior Notes](#behavior-notes)).
+
 ## Integration Test
 
 The Go integration test is build-tagged and skips when no server is configured:
@@ -230,7 +254,16 @@ PG_DSN='postgres://cdc:cdc@127.0.0.1:5432/cdc?sslmode=disable' \
   go test -tags postgres_integration ./connector/sink/postgresql/ -v
 ```
 
-Without `PG_DSN` the test reports `SKIP`, which means nothing was verified against a server. The suite covers the DML path, the value shapes this document describes (unsigned `BIGINT`, `DECIMAL`, the temporal types, `BYTEA`, `JSON`, `NULL`, and the rejected zero date), and the DDL path (create, add, refuse, change, modify, drop, key-column guard, view dependency, index skip, truncate, drop table) against a real PostgreSQL 16 instance.
+Without `PG_DSN` the test reports `SKIP`, which means nothing was verified against a server. The suite covers the DML path, the value shapes this document describes (unsigned `BIGINT`, `DECIMAL`, the temporal types, `BYTEA`, `JSON`, `NULL`, and the rejected zero date), and the DDL path (create, add, refuse, change, modify, drop, key-column guard, view dependency, index skip, truncate, drop table) against a real server.
+
+The Go test is the unit of the sink package. The end-to-end suites that drive the built binary from MySQL to PostgreSQL — functional `TP-P01…TP-P20`, load, scale, the 14–18 matrix, and the benchmark — live under `test/integration/` and are described in [PostgreSQL test suites](../test/POSTGRESQL.md). They are Python harnesses and are not part of `go test`:
+
+```bash
+bash test/integration/scripts/run-pg-e2e.sh     # functional E2E
+bash test/integration/scripts/run-pg-compat.sh  # PG 14 15 16 17 18
+```
+
+A run counts only when its report says so (`PASS` / `FAIL` / `SKIPPED` / `NOT RUN` / `ENV BLOCKED`); the vocabulary and the evidence each status needs are defined in that document, §9.
 
 ## Related Docs
 
@@ -243,3 +276,5 @@ Without `PG_DSN` the test reports `SKIP`, which means nothing was verified again
   - [MySQL Sink](mysql-sink.md)
   - [Kafka Sink](kafka-sink.md)
   - [Doris Sink](doris-sink.md)
+- Testing
+  - [PostgreSQL test suites (E2E / Load / Scale / compatibility / benchmark)](../test/POSTGRESQL.md)
