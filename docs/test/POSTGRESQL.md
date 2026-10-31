@@ -35,7 +35,7 @@ Reusable as-is (no new framework):
   `wait_peak_catchup()` (60 s × 4 writers with `LOAD_PEAK_*`).
 - `common/profiles.py`, `common/schemas.py` — profile topology, row allocation,
   templates, `checksum_sql()`.
-- `scripts/_log.sh` helpers: `absolutize_go_cdc`, `absolutize_checkpoint_dirs`,
+- `scripts/logger.sh` helpers: `absolutize_go_cdc`, `absolutize_checkpoint_dirs`,
   `resolve_python_bin`, `KEEP_IT_*`, teardown ownership under CI.
 
 Gaps that PR3 must fill (they do not exist for any non-MySQL target either):
@@ -68,8 +68,8 @@ generators.
 | `sinks/postgresql/tests/test_pg_schemas.py` | offline `unittest` for the PG templates | — |
 | `sinks/postgresql/scale/pg_scale_it.py` | scale normal/heavy, report `mysql-postgresql-scale-{profile}.md` | `profiles.py`, `pg_schemas.py` |
 | `sinks/postgresql/tests/test_pg_scale_pipeline.py` | offline `unittest` for the scale pipeline rendering | — |
-| `scripts/setup.sh postgresql`, `scripts/wait.sh postgresql`, `scripts/teardown.sh postgresql` | compose lifecycle for the `postgres` service (bring-up + readiness wait, then `down -v`); the probes live in `wait.sh`, which `setup.sh` sources | `_log.sh`, `wait.sh` |
-| `scripts/run.sh postgresql [profile] [variant] [suites]` | the only entrypoint; `pg_compat`/`pg_bench_it` are suites of it, not separate scripts | `_log.sh` conventions |
+| `scripts/setup.sh postgresql`, `scripts/wait.sh postgresql`, `scripts/teardown.sh postgresql` | compose lifecycle for the `postgres` service (bring-up + readiness wait, then `down -v`); the probes live in `wait.sh`, which `setup.sh` sources | `logger.sh`, `wait.sh` |
+| `scripts/run.sh postgresql [profile] [variant] [suites]` | the only entrypoint; `pg_compat`/`pg_bench_it` are suites of it, not separate scripts | `logger.sh` conventions |
 
 MySQL stays the only source; the target is one PostgreSQL database (`cdc_it`)
 because `sink.database` is required and single-valued. Isolation is by schema:

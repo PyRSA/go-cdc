@@ -143,4 +143,4 @@ jobs:
           python-version: "3.11"
 
       - name: Scan tracked files
-        run: python3 tests/check-license-decls.py
+        run: python3 tools/ci/check-license-decls.py

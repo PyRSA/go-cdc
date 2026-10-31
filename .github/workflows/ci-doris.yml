@@ -6,7 +6,7 @@
 #
 #   profile  normal -> go,func
 #            heavy  -> go,func,scale
-#   variant  empty | 2.1.x -> DORIS_VERSION (mapped by `_log.sh:
+#   variant  empty | 2.1.x -> DORIS_VERSION (mapped by `logger.sh:
 #            it_apply_variant`, called by run.sh and setup.sh)
 name: CI / doris
 

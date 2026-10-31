@@ -17,7 +17,7 @@ bash tests/integration/scripts/run.sh <sink> [profile] [variant] [suites] [test-
 | `postgresql` | `func` TP-P01..P20 → `load`、`bench`、`scale`、`compat`（PG 14..18） |
 
 `profile` 决定**跑多少**，`variant` 决定**跑在哪个版本上**（`57`/`80`、`pg14`..`pg18`、`es7`/`es8`/`es9`、
-Doris 的 `2.1.x` tag）。两者都不从环境推断。映射表只有一处：`_log.sh: it_apply_variant`；
+Doris 的 `2.1.x` tag）。两者都不从环境推断。映射表只有一处：`logger.sh: it_apply_variant`；
 它被调用两次，因为子进程的 export 无法回传给父进程 —— `run.sh` 在自己进程里调它（套件要读
 `ES_URL`、`ES_SINK_VERSION`、`PG_EXPECT_MAJOR`），`setup.sh` 在子进程里调它来选镜像
 （`MYSQL_IMAGE`、`PG_IMAGE`、`DORIS_VERSION`）。
@@ -65,7 +65,7 @@ tests/integration/
 │   ├── tests/               # 该 harness 的 pytest 单测
 │   └── go/                  # 仅 doris：sink 级 Go 套件
 ├── common/                  # config、日志、集群 profile、共享规模套件
-├── scripts/                 # setup.sh · wait.sh · teardown.sh · run.sh · _log.sh
+├── scripts/                 # setup.sh · wait.sh · teardown.sh · run.sh · logger.sh
 └── workdir/                 # 二进制、日志、checkpoint（gitignored）
 ```
 
@@ -129,10 +129,10 @@ make it-doris PROFILE=heavy
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `LOAD_ROWS_PER_TABLE` | 跟随档位：`30000` normal / `100000` heavy | 普通表行数（t1–t4 + typed） |
+| `LOAD_ROWS_PER_TABLE` | `100000`（两档相同） | 普通表行数（t1–t4 + typed） |
 | `LOAD_LARGE_ROWS` | `50` | 大字段表 `tpl01_large` 行数 |
 | `LOAD_LARGE_FIELD_BYTES` | `2097152`（2MiB，限制在 1–5MiB） | 单字段大小：图片 `LONGBLOB` + `LONGTEXT` |
-| `LOAD_PEAK_SECONDS` | 跟随档位：`15` normal / `60` heavy | 峰值写入时长 |
+| `LOAD_PEAK_SECONDS` | `60`（两档相同） | 峰值写入时长 |
 | `LOAD_PEAK_WORKERS` | 跟随档位：`4` normal / `8` heavy | 峰值写并发；**造数**用 `workers × 2`（上限 16，且不超过表数） |
 | `LOAD_PARALLELISM` | 默认同 `LOAD_PEAK_WORKERS` | 负载套件 CDC `pipeline.parallelism` |
 | `LOAD_PEAK_BATCH` | `200` | 每批 INSERT 行数 |

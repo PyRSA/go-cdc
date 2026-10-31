@@ -15,17 +15,22 @@
 #
 # The version matrix is never dropped: the variant is mapped to MYSQL_TAG /
 # MYSQL_IMAGE, PG_IMAGE / PG_EXPECT_MAJOR, ES_SINK_VERSION or DORIS_VERSION by
-# `_log.sh: it_apply_variant`, called twice so it works across the process
+# `logger.sh: it_apply_variant`, called twice so it works across the process
 # boundary: once here, in this process (the suites below read ES_URL,
 # ES_SINK_VERSION and PG_EXPECT_MAJOR themselves), and once by setup.sh in its
 # own child process (it needs the image names to start the stack). There is no
-# second copy of that table - change it in _log.sh only.
+# second copy of that table - change it in logger.sh only.
 #
 # Profile tiers (what CI's `normal` / `heavy` mean):
 #
 #             suites                                    load / scale knobs
-#   normal    correctness only                          30k rows, 10k hotspot, 15 s peak
-#   heavy     correctness + load + scale (+ bench)       100k rows, 50k hotspot, 60 s peak
+#   normal    correctness only                          100k rows, 50k hotspot, 60 s peak, 4 writers
+#   heavy     correctness + load + scale (+ bench)      100k rows, 50k hotspot, 60 s peak, 8 writers
+#
+# The seed volume, the peak duration and the hotspot burst are deliberately NOT
+# tiered: they are the shape of the measurement, not its cost, so a `normal`
+# report has to be readable against a `heavy` one. Only the peak writer count and
+# the two timeouts follow the profile (see the tier block below).
 #
 # Examples:
 #   bash scripts/run.sh mysql normal 57          # func + types + load on MySQL 5.7
@@ -38,8 +43,8 @@ IT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROOT="$(cd "${IT}/../.." && pwd)"
 WORKDIR="${IT}/workdir"
 mkdir -p "${WORKDIR}" "${ROOT}/docs/test/reports"
-# shellcheck source=tests/integration/scripts/_log.sh
-source "${SCRIPT_DIR}/_log.sh"
+# shellcheck source=tests/integration/scripts/logger.sh
+source "${SCRIPT_DIR}/logger.sh"
 
 SINK="${1:-}"
 PROFILE="${2:-normal}"
@@ -68,20 +73,22 @@ esac
 # are the same order of magnitude as the historical CI jobs, and every value is
 # still overridable from the environment.
 if [ "${PROFILE}" = "heavy" ]; then
-  TIER_ROWS=100000
-  TIER_HOTSPOT_ROWS=50000
-  TIER_PEAK_SECONDS=60
   TIER_PEAK_WORKERS=8
   TIER_CATCHUP_BUDGET=5400
   TIER_SCALE_TIMEOUT=7200
 else
-  TIER_ROWS=30000
-  TIER_HOTSPOT_ROWS=10000
-  TIER_PEAK_SECONDS=15
   TIER_PEAK_WORKERS=4
   TIER_CATCHUP_BUDGET=1800
   TIER_SCALE_TIMEOUT=2400
 fi
+# Identical in both tiers on purpose: these three are the shape of the measurement
+# (`LOAD_ROWS_PER_TABLE` seeds every suite, `peak seconds` is how long the writers
+# run, `SCALE_BURST_ROWS_PER_HOT` is the hotspot their burst creates), so a smaller
+# `normal` value silently produced a different experiment rather than a cheaper
+# one. Keep them out of the if/else above.
+TIER_ROWS=100000
+TIER_PEAK_SECONDS=60
+TIER_HOTSPOT_ROWS=50000
 
 # Which sink is under test: config.py reads this to pick sinks/<sink>/fixtures.
 export CDC_SINK="${SINK}"
@@ -132,7 +139,8 @@ fi
 absolutize_go_cdc
 
 # Load knobs (mysql func/load, kafka, doris and the ES/PG load suites share them).
-# The peak duration follows the tier like every other knob: 15s normal, 60s heavy.
+# The peak duration is 60s in both tiers (see the tier table at the top): only the
+# writer count follows the profile.
 export LOAD_PROFILE="${LOAD_PROFILE:-${PROFILE}}"
 export LOAD_ROWS_PER_TABLE="${LOAD_ROWS_PER_TABLE:-${TIER_ROWS}}"
 export LOAD_LARGE_ROWS="${LOAD_LARGE_ROWS:-50}"
@@ -143,7 +151,8 @@ export LOAD_PEAK_BATCH="${LOAD_PEAK_BATCH:-200}"
 export LOAD_PARALLELISM="${LOAD_PARALLELISM:-${LOAD_PEAK_WORKERS}}"
 
 # Scale knobs. PEAK_CATCHUP_BUDGET_S / SCALE_TOTAL_TIMEOUT are the "two-tier
-# timeout": a heavy run may wait twice as long on a slower runner.
+# timeout": a heavy run may wait twice as long on a slower runner. The hotspot
+# size itself does not follow the tier (see the tier table at the top).
 export SCALE_BURST_ROWS_PER_HOT="${SCALE_BURST_ROWS_PER_HOT:-${TIER_HOTSPOT_ROWS}}"
 export SCALE_PEAK_SECONDS="${SCALE_PEAK_SECONDS:-${TIER_PEAK_SECONDS}}"
 export SCALE_PEAK_WORKERS="${SCALE_PEAK_WORKERS:-${TIER_PEAK_WORKERS}}"

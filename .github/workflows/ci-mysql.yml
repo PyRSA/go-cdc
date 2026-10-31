@@ -6,7 +6,7 @@
 #
 #   profile  normal -> func,types,load
 #            heavy  -> func,types,load,scale   (5.7 stays correctness-only)
-#   variant  57 | 80 -> MYSQL_TAG / MYSQL_IMAGE, mapped by `_log.sh:
+#   variant  57 | 80 -> MYSQL_TAG / MYSQL_IMAGE, mapped by `logger.sh:
 #            it_apply_variant` (run.sh and setup.sh both call it)
 name: CI / mysql
 

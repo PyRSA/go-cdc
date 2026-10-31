@@ -1,5 +1,10 @@
-# Shared helpers for IT entry scripts (source this file).
+# Shared helpers for the IT entry scripts (source this file, never execute it).
 # Usage: log "==> build go-cdc"
+#
+# Everything more than one script needs lives here - logging, python discovery,
+# path absolutizing, the bind-mount cleanup and the single compose-project /
+# variant table - so setup.sh and teardown.sh cannot disagree about which stack
+# they are talking to.
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
@@ -49,6 +54,34 @@ absolutize_checkpoint_dirs() {
     if [ -n "${!name:-}" ]; then
       _absolutize_under_it "${name}"
     fi
+  done
+}
+
+# Remove one or more bind-mount directories that a container may have written as
+# root.
+#
+# A bind mount is the one place where the container's uid survives onto the host:
+# Doris' FE/BE run as root and leave `workdir/doris/**` owned by root, so the
+# runner user cannot unlink it and a plain `rm -rf` dies with EACCES. Escalate
+# first. `sudo -n` (non-interactive) is what keeps a host that would ask for a
+# password from hanging a CI job; if it is unavailable or refused, the plain rm
+# still handles the local case where the leftovers are ours.
+#
+# Best-effort by design: the path is normally absent (a fresh runner), and the
+# caller must never abort under `set -e` because a cleanup had nothing to remove.
+it_rm_rf() {
+  local path
+  for path in "$@"; do
+    # `-e` alone misses a dangling symlink; nothing here creates one, but the
+    # test is cheaper than knowing that.
+    if [ ! -e "${path}" ] && [ ! -L "${path}" ]; then
+      continue
+    fi
+    if sudo -n rm -rf "${path}" 2>/dev/null; then
+      continue
+    fi
+    rm -rf "${path}" 2>/dev/null ||
+      log "warning: could not remove ${path} (still owned by a container?)" >&2
   done
 }
 

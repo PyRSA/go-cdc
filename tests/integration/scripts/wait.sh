@@ -16,8 +16,8 @@
 # to `docker compose exec`, so a runner without mysql-client/psql still works.
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=tests/integration/scripts/_log.sh
-source "${SCRIPT_DIR}/_log.sh"
+# shellcheck source=tests/integration/scripts/logger.sh
+source "${SCRIPT_DIR}/logger.sh"
 
 it_wait_mysql() {
   local deadline=$((SECONDS + ${WAIT_MYSQL_SECONDS:-180}))

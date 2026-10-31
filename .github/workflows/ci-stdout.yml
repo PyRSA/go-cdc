@@ -5,7 +5,7 @@
 # MySQL source plus nothing else.
 #
 #   profile  normal | heavy -> func   (no load/scale layer: it writes to a file)
-#   variant  empty -> the default MySQL image (mapped by `_log.sh:
+#   variant  empty -> the default MySQL image (mapped by `logger.sh:
 #            it_apply_variant`, called by run.sh and setup.sh)
 name: CI / stdout
 

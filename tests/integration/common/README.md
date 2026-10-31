@@ -63,9 +63,17 @@ Optional overrides (env or CLI flags on `scale_it`):
 | `SCALE_TOTAL_ROWS` | profile default | Override row budget |
 | `SCALE_WORKERS` | profile default | Override seed + pipeline parallelism |
 | `SCALE_BURST_ROWS_PER_HOT` | `50000` | **heavy only**: fixed INSERT rows per hotspot table after mutate |
-| `SCALE_PEAK_SECONDS` | `45` | **heavy only**: timed peak write duration |
+| `SCALE_PEAK_SECONDS` | `45` (`run.sh` exports `60`) | **heavy only**: timed peak write duration |
 | `SCALE_PEAK_WORKERS` | same as `workers` | **heavy only**: peak writer threads |
 | `SCALE_PEAK_BATCH` | `200` | **heavy only**: rows per peak INSERT batch |
+
+Two layers of defaults live here, and only one of them is what a CI report shows.
+The `Default` column is `scale_it`'s own fallback - it applies when the module is
+run directly. `scripts/run.sh` exports every one of these variables, so a profile
+run (`make it-mysql`, CI) uses the `run.sh` tier value instead. The two agree on
+the hotspot size and the peak batch; `SCALE_PEAK_SECONDS` is the one place they
+differ, because the tier table pins the peak duration to `60` for both profiles so
+that reports stay comparable across runs.
 
 **Heavy hotspot stress** (after mutate catch-up): one hotspot table per source DB (`min(ordinal)`), then burst → timed peak → hotspot count convergence (src/sink `COUNT(*)` must be exactly equal; the delta shown in logs is trend-only) → eventual-consistency checksum verify (`COUNT + SUM(id) + name_crc`, retried every 15s). Both phases share ONE deadline (`PEAK_CATCHUP_BUDGET_S`, default 3600 s; `run.sh` sets 1800 normal / 5400 heavy, and `SCALE_TOTAL_TIMEOUT` caps the whole suite) created when peak catch-up starts (no stacked timeouts); fetch/SQL errors and a dead go-cdc process fail fast instead of being retried. Normal profile skips this.
 

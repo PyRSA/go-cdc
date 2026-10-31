@@ -246,7 +246,9 @@ jobs:
       - name: Shell script syntax
         run: |
           set -euo pipefail
-          for script in tests/integration/scripts/*.sh tools/ci/*.sh; do
+          shopt -s nullglob
+          scripts=(tests/integration/scripts/*.sh tools/ci/*.sh install.sh)
+          for script in "${scripts[@]}"; do
             bash -n "${script}"
             echo "ok ${script}"
           done

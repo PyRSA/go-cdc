@@ -14,7 +14,7 @@
 #   elasticsearch            es7 | es8 | es9         -> ES_SINK_VERSION (+ port)
 #   doris                    2.1.8                   -> DORIS_VERSION
 #
-# The mapping itself is it_apply_variant() in _log.sh, shared with run.sh.
+# The mapping itself is it_apply_variant() in logger.sh, shared with run.sh.
 #
 # Waiting lives in wait.sh (sourced below), so the readiness probes have one
 # implementation: setup.sh raises the stack and then blocks, which is why a CI
@@ -23,8 +23,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 IT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROOT="$(cd "${IT}/../.." && pwd)"
-# shellcheck source=tests/integration/scripts/_log.sh
-source "${SCRIPT_DIR}/_log.sh"
+# shellcheck source=tests/integration/scripts/logger.sh
+source "${SCRIPT_DIR}/logger.sh"
 # shellcheck source=tests/integration/scripts/wait.sh
 source "${SCRIPT_DIR}/wait.sh"
 
@@ -49,9 +49,15 @@ export PYTHON_BIN
 mkdir -p "${IT}/workdir"
 
 # --------------------------------------------------------------------- variant
-# The variant table lives in _log.sh (it_apply_variant): setup.sh is a child
+# The variant table lives in logger.sh (it_apply_variant): setup.sh is a child
 # process of run.sh, so anything exported here would die with it - and run.sh
 # needs ES_URL/ES_SINK_VERSION/PG_EXPECT_MAJOR for the suites themselves.
+#
+# An empty variant is the normal case, not an error: CI's matrix carries
+# `"variant": ""` for every sink without a version matrix (doris, kafka, stdout)
+# and `it_apply_variant` resolves "" to that sink's default. Each `${...}` in the
+# compose files also carries a `:-` fallback of its own, so an unset image name
+# can never leave compose looking for a project it cannot resolve.
 it_apply_variant "${SINK}" "${VARIANT}"
 
 # ------------------------------------------------------------------- compose set
@@ -112,8 +118,11 @@ if [ "${SINK}" = "doris" ]; then
     exit 1
   fi
   # A stale FE meta image from an interrupted run can advertise an unreachable
-  # BE; recreate the bind directories for a deterministic run.
-  rm -rf "${IT}/workdir/doris"
+  # BE; recreate the bind directories for a deterministic run. Doris writes them
+  # as root, so a previous run's leftovers cannot be unlinked by the runner user:
+  # `it_rm_rf` escalates and tolerates an absent directory. The parent `workdir/`
+  # is ours, so the `mkdir -p` below still succeeds afterwards.
+  it_rm_rf "${IT}/workdir/doris"
   mkdir -p "${IT}/workdir/doris/fe/doris-meta" "${IT}/workdir/doris/fe/log" \
     "${IT}/workdir/doris/be/storage" "${IT}/workdir/doris/be/log"
 fi

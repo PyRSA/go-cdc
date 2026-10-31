@@ -18,7 +18,7 @@ bash tests/integration/scripts/run.sh <sink> [profile] [variant] [suites] [test-
 `profile` decides *how much* runs, `variant` decides *what it runs against*
 (`57`/`80`, `pg14`..`pg18`, `es7`/`es8`/`es9`, a Doris `2.1.x` tag). Neither is
 inferred from the environment. The variant table lives in exactly one place,
-`_log.sh: it_apply_variant`, and is applied twice because a child process cannot
+`logger.sh: it_apply_variant`, and is applied twice because a child process cannot
 export back to its parent: `run.sh` calls it in its own process (the suites read
 `ES_URL`, `ES_SINK_VERSION` and `PG_EXPECT_MAJOR` themselves) and `setup.sh`
 calls it to pick the images (`MYSQL_IMAGE`, `PG_IMAGE`, `DORIS_VERSION`).
@@ -66,7 +66,7 @@ tests/integration/
 │   ├── tests/               # pytest unit tests of that harness
 │   └── go/                  # only doris: the sink-level Go suite
 ├── common/                  # config, logging, cluster profiles, shared scale
-├── scripts/                 # setup.sh · wait.sh · teardown.sh · run.sh · _log.sh
+├── scripts/                 # setup.sh · wait.sh · teardown.sh · run.sh · logger.sh
 └── workdir/                 # binary, logs, checkpoints (gitignored)
 ```
 
@@ -139,10 +139,10 @@ instead of silently comparing unlike aggregates.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `LOAD_ROWS_PER_TABLE` | follows the tier: `30000` normal / `100000` heavy | Rows per normal table (t1–t4 + typed) |
+| `LOAD_ROWS_PER_TABLE` | `100000` (both tiers) | Rows per normal table (t1–t4 + typed) |
 | `LOAD_LARGE_ROWS` | `50` | Rows in mega-field table `tpl01_large` |
 | `LOAD_LARGE_FIELD_BYTES` | `2097152` (2MiB, clamped 1–5MiB) | Per-field size: image `LONGBLOB` + `LONGTEXT` |
-| `LOAD_PEAK_SECONDS` | follows the tier: `15` normal / `60` heavy | Peak write duration |
+| `LOAD_PEAK_SECONDS` | `60` (both tiers) | Peak write duration |
 | `LOAD_PEAK_WORKERS` | follows the tier: `4` normal / `8` heavy | Peak writers; **seed** uses `workers × 2` (capped at 16 and by table count) |
 | `LOAD_PARALLELISM` | same as `LOAD_PEAK_WORKERS` | CDC `pipeline.parallelism` for the load suite |
 | `LOAD_PEAK_BATCH` | `200` | Rows per INSERT batch |
@@ -152,6 +152,11 @@ Load cases: TP-L01 multi-table snapshot (t1–t4 + typed + large), TP-L02 peak (
 
 The scale side has its own two-tier timeout: `PEAK_CATCHUP_BUDGET_S`
 (`1800` / `5400`) and `SCALE_TOTAL_TIMEOUT` (`2400` / `7200`).
+
+Seed volume, peak duration and the hotspot burst are the same in both tiers on
+purpose. They are the shape of the measurement, so a smaller `normal` value would
+describe a different experiment, not a cheaper one: only the peak writer count and
+the two timeouts follow the profile.
 
 ## GitHub Actions
 
