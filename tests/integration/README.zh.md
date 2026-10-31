@@ -7,13 +7,13 @@
 bash tests/integration/scripts/run.sh <sink> [profile] [variant] [suites] [test-point...]
 ```
 
-| Sink | 套件（`normal` → `heavy` 追加性能层） |
+| Sink | 套件（es8 两档都跑性能层；其他 sink 在 `heavy` 追加） |
 | --- | --- |
 | `mysql` | `func` TP-01..TP-13（`sinks/mysql/harness/run_it.py`）、`types` TP-D01..D04、`load` TP-L01..L04 → `scale` |
 | `stdout` | `func` — 共用的 CDC JSON 信封（`sinks/stdout/harness/stdout_it.py`） |
 | `kafka` | `func` TP-K01..TP-K08（`sinks/kafka/harness/kafka_it.py`）；负载/峰值测试点就在套件内部 |
 | `doris` | `go` sink 套件 + `func` TP-DR01..DR07 → `scale` |
-| `elasticsearch` | `go` sink 套件 + `func` → `load`、`scale`（仅 es8） |
+| `elasticsearch` | `go` sink 套件 + `func` + `load` + `scale` —— es8 两档都跑全部四项；es7/es9 仍为 `go`、`func` |
 | `postgresql` | `func` TP-P01..P20 → `load`、`bench`、`scale`、`compat`（PG 14..18） |
 
 `profile` 决定**跑多少**，`variant` 决定**跑在哪个版本上**（`57`/`80`、`pg14`..`pg18`、`es7`/`es8`/`es9`、
@@ -92,7 +92,7 @@ ls docs/test/reports/
 
 ## 规模套件
 
-`scale` 只属于 `heavy` 档。要单独跑就用第 4 个位置参数（或等价的 `IT_SUITES`）：
+`scale` 属于 `heavy` 档，唯一的例外是 es8 —— 它两档都跑。要单独跑就用第 4 个位置参数（或等价的 `IT_SUITES`）：
 
 ```bash
 bash tests/integration/scripts/run.sh mysql heavy            # func,types,load,scale
@@ -162,8 +162,8 @@ decide  ->  plan  ->  go-check  ->  ci-<sink>.yml（每个受影响的 sink 一�
 
 | 档位 | 触发 | 跑什么 |
 | --- | --- | --- |
-| `normal` | PR opened / synchronized / reopened，以及推送到其他任一分支 | 每个受支持 variant 的正确性套件（MySQL 5.7 + 8.0、PG 16、ES 8/7/9、Kafka、Doris、stdout） |
-| `heavy` | PR 上已打 `ci-heavy`（打完再 push）或 `gh workflow run ci.yml -f profile=heavy`；push 到 `master`/`main` | 同一批套件再加 load / scale / bench / PG 14–18 compat 矩阵 |
+| `normal` | PR opened / synchronized / reopened，以及推送到其他任一分支 | 每个受支持 variant 的正确性套件（MySQL 5.7 + 8.0、PG 16、ES 8/7/9、Kafka、Doris、stdout），外加 es8 的 load 与 scale 层 |
+| `heavy` | PR 上已打 `ci-heavy`（打完再 push）或 `gh workflow run ci.yml -f profile=heavy`；push 到 `master`/`main` | 同一批套件再加 load / scale / bench / PG 14–18 compat 矩阵（es8 两档都跑 load 与 scale，套件列表相同） |
 
 每一次 push 与每一个 PR 都是触发条件，`push` 不限定分支。当某次 push 已被一个 open PR 覆盖时，
 `decide` 会置 `run=false`，该次 push 不执行任何作业（`result` 仍报成功）—— 这个 commit 由 PR 的那次

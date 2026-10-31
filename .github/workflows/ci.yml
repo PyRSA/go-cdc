@@ -4,7 +4,8 @@
 #   plan     git diff -> {"include": [{"sink": ..., "variant": ...}]}
 #   go-check fmt + lint + unit tests + build + offline Python tests (pytest)
 #   sink-*   one reusable workflow per sink, fed only the rows it owns
-#   result   aggregate; `skipped` (and an empty matrix) is a success
+#   result   aggregate; `skipped` (and an empty matrix) is a success, and each
+#            stage is reported with the wall clock it took
 #
 # Profile precedence (the only place it is computed):
 #   workflow_dispatch.input  >  `ci-heavy` label on the PR  >  push to master/main
@@ -311,6 +312,11 @@ jobs:
       matrix: ${{ needs.plan.outputs.postgresql }}
 
   # Single required check: fail on any real failure, pass on skipped/no-op.
+  #
+  # The durations come from the API, not from `needs`: that context carries a
+  # result and nothing else, and one `sink-*` entry expands into a matrix of
+  # jobs. A stage is therefore measured from its earliest instance's start to
+  # its latest instance's finish, which is what the run actually waited for.
   result:
     name: Result
     if: always()
@@ -325,18 +331,90 @@ jobs:
       - sink-elasticsearch
       - sink-postgresql
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 3
+    permissions:
+      # Reading this run's job list is what turns its results into a clock.
+      actions: read
     steps:
       - name: Aggregate
         env:
           NEEDS: ${{ toJSON(needs) }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           python3 - <<'PY'
           import json
           import os
+          import subprocess
           import sys
+          from datetime import datetime
+
+          # Job display name -> the `needs` key it reports under. A reusable
+          # workflow prefixes its own job names with the caller's ("Doris /
+          # doris default"), so only the part before the slash matters. A stale
+          # entry costs one missing duration and never a red check: every
+          # timing below is optional.
+          ALIASES = {
+              "decide run": "decide",
+              "plan": "plan",
+              "build + lint + test": "go-check",
+              "mysql": "sink-mysql",
+              "stdout": "sink-stdout",
+              "kafka": "sink-kafka",
+              "doris": "sink-doris",
+              "elasticsearch": "sink-elasticsearch",
+              "postgresql": "sink-postgresql",
+          }
+
+
+          def human(seconds: float) -> str:
+              """45s, 1m, 1m23s, 1h1m20s: drop the zero units, keep the last one."""
+              hours, rest = divmod(int(round(seconds)), 3600)
+              minutes, secs = divmod(rest, 60)
+              parts = []
+              if hours:
+                  parts.append(f"{hours}h")
+              if minutes:
+                  parts.append(f"{minutes}m")
+              if secs or not parts:
+                  parts.append(f"{secs}s")
+              return "".join(parts)
+
+
+          def stage_spans() -> dict:
+              """Earliest start to latest finish, per `needs` key."""
+              api = (f"repos/{os.environ['REPO']}/actions/runs/"
+                     f"{os.environ['RUN_ID']}/jobs?per_page=100")
+              try:
+                  out = subprocess.run(
+                      ["gh", "api", api, "--paginate", "--jq",
+                       ".jobs[] | [.name, .started_at, .completed_at] | @tsv"],
+                      check=True, capture_output=True, text=True).stdout
+              except (OSError, subprocess.CalledProcessError) as exc:
+                  # A missing clock must never fail a required check.
+                  detail = getattr(exc, "stderr", "") or exc
+                  print(f"::warning::job timings unavailable: {detail}",
+                        file=sys.stderr)
+                  return {}
+
+              spans = {}
+              for row in out.splitlines():
+                  name, started, done = (row.split("\t") + ["", ""])[:3]
+                  if not started or not done:
+                      continue  # skipped, or this job, which is still running
+                  key = ALIASES.get(name.split(" / ")[0].strip().lower())
+                  if key is None:
+                      continue
+                  first = datetime.fromisoformat(started.replace("Z", "+00:00"))
+                  last = datetime.fromisoformat(done.replace("Z", "+00:00"))
+                  begin, end = spans.get(key, (first, last))
+                  spans[key] = (min(begin, first), max(end, last))
+              return spans
+
 
           needs = json.loads(os.environ["NEEDS"])
+          spans = stage_spans()
           # "skipped" is expected: an unaffected sink, a deduped push, or a
           # docs-only diff (empty matrix) all land here. Only a real failure,
           # or a cancellation, may fail this check.
@@ -347,7 +425,15 @@ jobs:
               if job.get("result") not in allowed
           }
           for name, job in needs.items():
-              print(f"{name}: {job.get('result')}")
+              span = spans.get(name)
+              took = f" ({human((span[1] - span[0]).total_seconds())})" if span else ""
+              print(f"{name}: {job.get('result')}{took}")
+          if spans:
+              # What the run cost from the first stage it started to the last it
+              # finished, which is shorter than the sum because they overlap.
+              begin = min(first for first, _ in spans.values())
+              end = max(last for _, last in spans.values())
+              print(f"total: {human((end - begin).total_seconds())}")
           if problems:
               print(f"::error::CI failed: {problems}", file=sys.stderr)
               sys.exit(1)

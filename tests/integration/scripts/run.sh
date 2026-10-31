@@ -24,8 +24,14 @@
 # Profile tiers (what CI's `normal` / `heavy` mean):
 #
 #             suites                                    load / scale knobs
-#   normal    correctness only                          100k rows, 50k hotspot, 60 s peak, 4 writers
+#   normal    correctness (+ es8 load/scale)            100k rows, 50k hotspot, 60 s peak, 4 writers
 #   heavy     correctness + load + scale (+ bench)      100k rows, 50k hotspot, 60 s peak, 8 writers
+#
+# es8 is the one exception to "normal is correctness only": its load and scale
+# suites run in both tiers, because the ES write path has no other coverage and a
+# PR that changes it has to see the numbers. The tier still changes the writer
+# count and the two timeouts, so a normal report stays readable against a heavy
+# one. es7/es9 remain `go,func` - they are adapter-compatibility nodes.
 #
 # The seed volume, the peak duration and the hotspot burst are deliberately NOT
 # tiered: they are the shape of the measurement, not its cost, so a `normal`
@@ -189,8 +195,10 @@ export CHECKPOINT_PG_BENCH_DIR="${CHECKPOINT_PG_BENCH_DIR:-${WORKDIR}/ckpts-pg-b
 absolutize_checkpoint_dirs
 
 # ---------------------------------------------------------------------- suites
-# `normal` runs the correctness layer only; `heavy` adds the whole performance
-# layer. Both stay explicit instead of "run everything and hope".
+# `normal` runs the correctness layer only, except es8, which carries its load and
+# scale suites in both tiers (see the tier table above); `heavy` adds the whole
+# performance layer for everything else. Both stay explicit instead of "run
+# everything and hope".
 default_suites() {
   local es_variant="${VARIANT:-es8}"
   case "${SINK}" in
@@ -212,7 +220,9 @@ default_suites() {
       case "${es_variant}" in
         # The v7/v9 adapter nodes are correctness-only: no load, no scale.
         es7 | 7 | es9 | 9) echo "go,func" ;;
-        *) [ "${PROFILE}" = "heavy" ] && echo "go,func,load,scale" || echo "go,func" ;;
+        # es8 carries the performance layer in both tiers: the tier changes the
+        # writer count and the timeouts, never which suites run.
+        *) echo "go,func,load,scale" ;;
       esac
       ;;
     postgresql)

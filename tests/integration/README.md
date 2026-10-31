@@ -6,13 +6,13 @@ Local runs and GitHub Actions both start a binlog-enabled MySQL via **Docker Com
 bash tests/integration/scripts/run.sh <sink> [profile] [variant] [suites] [test-point...]
 ```
 
-| Sink | Suites (`normal` → `heavy` adds the performance layer) |
+| Sink | Suites (es8 runs the performance layer in both tiers; the others add it in `heavy`) |
 | --- | --- |
 | `mysql` | `func` TP-01..TP-13 (`sinks/mysql/harness/run_it.py`), `types` TP-D01..D04, `load` TP-L01..L04 → `scale` |
 | `stdout` | `func` — the shared CDC JSON envelope (`sinks/stdout/harness/stdout_it.py`) |
 | `kafka` | `func` TP-K01..TP-K08 (`sinks/kafka/harness/kafka_it.py`); the load/peak points live inside the suite |
 | `doris` | `go` sink suite + `func` TP-DR01..DR07 → `scale` |
-| `elasticsearch` | `go` sink suite + `func` → `load`, `scale` (es8 only) |
+| `elasticsearch` | `go` sink suite + `func` + `load` + `scale` — all four in **both** tiers on es8; es7/es9 stay `go`, `func` |
 | `postgresql` | `func` TP-P01..P20 → `load`, `bench`, `scale`, `compat` (PG 14..18) |
 
 `profile` decides *how much* runs, `variant` decides *what it runs against*
@@ -98,8 +98,9 @@ upload, so an artifact can never race a `docker compose down`. Escape hatches:
 
 ## Scale suite
 
-`scale` is part of the `heavy` tier only. Ask for it explicitly with the 4th
-positional (`IT_SUITES` is the env spelling of the same thing):
+`scale` is part of the `heavy` tier for every sink except es8, which runs it in
+both tiers. Ask for it explicitly with the 4th positional (`IT_SUITES` is the env
+spelling of the same thing):
 
 ```bash
 bash tests/integration/scripts/run.sh mysql heavy            # func,types,load,scale
@@ -178,8 +179,8 @@ Tiers:
 
 | Tier | Trigger | What runs |
 | --- | --- | --- |
-| `normal` | PR opened / synchronized / reopened, and a push to any other branch | correctness suites on every supported variant (MySQL 5.7 + 8.0, PG 16, ES 8/7/9, Kafka, Doris, stdout) |
-| `heavy` | `ci-heavy` already on the PR (push after adding it) or `gh workflow run ci.yml -f profile=heavy`; a push to `master`/`main` | the same suites plus load / scale / bench / the PG 14–18 compat matrix |
+| `normal` | PR opened / synchronized / reopened, and a push to any other branch | correctness suites on every supported variant (MySQL 5.7 + 8.0, PG 16, ES 8/7/9, Kafka, Doris, stdout), plus the es8 load and scale layers |
+| `heavy` | `ci-heavy` already on the PR (push after adding it) or `gh workflow run ci.yml -f profile=heavy`; a push to `master`/`main` | the same suites plus load / scale / bench / the PG 14–18 compat matrix (es8 runs load and scale in both tiers, so its suite list is identical) |
 
 Every push and every PR is a trigger; `push` has no branch filter. When a push is
 already covered by an open PR, `decide` sets `run=false` and the push run does no
