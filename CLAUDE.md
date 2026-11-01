@@ -21,7 +21,7 @@ YAML-driven MySQL CDC. Binary: `go-cdc`.
 | `docs/connectors/postgresql-sink.md` | PostgreSQL (pgx, transactional DML, opt-in table creation and schema evolution) |
 | `docs/performance/mysql-to-mysql-e2e.md` | MySQL→MySQL CI scale/load performance detail; README has summary |
 
-Demos: `configs/demo-stdout.yaml`, `configs/demo-mysql.yaml`, `configs/demo-kafka.yaml`, `configs/demo-doris.yaml`, `configs/demo-elasticsearch.yaml`
+Demos: `configs/demo-stdout.yaml`, `configs/demo-mysql.yaml`, `configs/demo-kafka.yaml`, `configs/demo-doris.yaml`, `configs/demo-elasticsearch.yaml`, `configs/demo-postgresql.yaml`
 
 Internal design: `docs/architecture.md`
 

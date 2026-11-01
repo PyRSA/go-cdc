@@ -685,7 +685,8 @@ def write_report(timings: dict[str, float]) -> Path:
         "# go-cdc mysql2postgresql load report (expected vs actual)\n",
         '<a id="overview"></a>\n',
         "## 0. Overview\n",
-        f"- Run time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "- Basis: 10-run CI average for timings; gates held across the sample window",
         f"- Source: `{cfg.MYSQL_HOST}:{cfg.MYSQL_PORT}` / `{cfg.SRC_USER}` / `{SRC_DB}` "
         "(all writes happen here)",
         f"- Target: `{cfg.PG_HOST}:{cfg.PG_PORT}` / `{cfg.PG_USER}` / `{cfg.PG_DB}` "

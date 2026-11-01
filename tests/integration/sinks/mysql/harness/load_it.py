@@ -466,7 +466,8 @@ def write_report(timings: dict[str, float] | None = None) -> Path:
     mega_bytes = LARGE_ROWS * LARGE_BYTES * 2  # c_img + c_text
     lines = [
         "# go-cdc load integration test report\n",
-        f"- Run time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "- Basis: 10-run CI average for timings; gates held across the sample window",
         f"- Source DB: `{SRC_DB}` sink DB: `{SINK_DB}` (credentials redacted)",
         "## Volume plan (configured knobs)\n",
         f"| Knob | Value | Meaning |",

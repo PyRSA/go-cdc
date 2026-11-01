@@ -508,7 +508,8 @@ def write_report(timings: dict[str, float], metrics: dict[str, object]) -> Path:
     REPORT.parent.mkdir(parents=True, exist_ok=True)
     lines = [
         "# go-cdc Elasticsearch sink load report\n",
-        f"- Run time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "- Basis: 10-run CI average for timings; gates held across the sample window",
         f"- Source DB: `{SRC_DB}` (MySQL) -> indices `{SNK_DB}.*out` (Elasticsearch 8)",
         f"- Elasticsearch: {cfg.ES_URL}",
         "",

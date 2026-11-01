@@ -1,0 +1,50 @@
+# Quick start: MySQL → PostgreSQL (transactional DML, opt-in table creation
+# and schema evolution)
+# Edit source / sink / route, then:
+#   ./bin/go-cdc configs/demo-postgresql.yaml
+#
+# The PostgreSQL connection is bound to one database, so `database` is
+# required. Routed tables place themselves via `route.sink-table`
+# (schema.table); anything no route matches falls back to `sink.schema`.
+
+source:
+  type: mysql
+  hostname: 127.0.0.1
+  port: 3306
+  username: root
+  password: secret
+  tables: demo_db\.orders
+  server-id: 5405
+  server-time-zone: Asia/Shanghai
+  scan.startup.mode: initial
+
+sink:
+  type: postgresql
+  hostname: 127.0.0.1
+  port: 5432
+  username: cdc
+  password: secret
+  database: demo_sink
+  schema: public
+  sslmode: prefer
+  connect-timeout: 30s
+  write-batch-size: 1000
+  write-batch-interval: 1s
+  max-retries: 3
+  auto-create-table: true
+  # Optional: apply ADD COLUMN as it arrives (DROP/TRUNCATE stays off by
+  # default because it is destructive).
+  # schema.change.enabled: true
+  # schema.change.include: [add.column]
+
+route:
+  - source-table: demo_db\.orders
+    sink-table: public.orders
+
+pipeline:
+  name: demo-postgresql
+
+checkpoint:
+  storage: file
+  interval: 10s
+  file-path: ./checkpoints

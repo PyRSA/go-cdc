@@ -247,8 +247,8 @@ jobs:
       # One pytest invocation covers every sink: the harness unit tests moved
       # into tests/integration/sinks/<sink>/tests/ and conftest.py puts
       # tests/integration on sys.path so the package imports resolve.
-      - name: Python tests (harness + CI plan)
-        run: python3 -m pytest -q tests/integration tools/ci/test_plan.py
+      - name: Python tests (make it-check)
+        run: make it-check
 
       - name: Shell script syntax
         run: |
@@ -480,9 +480,14 @@ jobs:
                   summary.write("```\n" + text + "\n```\n")
 
           # "skipped" is expected: an unaffected sink, a deduped push, or a
-          # docs-only diff (empty matrix) all land here. Only a real failure,
-          # or a cancellation, may fail this check.
-          allowed = {"success", "skipped"}
+          # docs-only diff (empty matrix) all land here. "cancelled" is also
+          # tolerated: on a non-default branch concurrency.cancel-in-progress
+          # is on, so a newer commit on the same PR supersedes this run and
+          # the aggregate job still fires (if: always()) and finds its
+          # upstream needs marked cancelled. That is a cancellation semantic,
+          # not a code failure - do not paint a red X on the Checks page for
+          # it. A real failure ("failure" or "neutral") still trips the check.
+          allowed = {"success", "skipped", "cancelled"}
           problems = {
               name: job.get("result")
               for name, job in needs.items()

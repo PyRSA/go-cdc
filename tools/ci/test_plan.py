@@ -79,6 +79,31 @@ def test_sink_paths_are_owned() -> None:
     )
 
 
+def test_sink_path_templates_resolve_to_real_files() -> None:
+    # SINK_PATHS is the single routing table owner_of consults. A typo there
+    # has a fail-close failure mode: e.g. `configs/demo-postgressql.yaml`
+    # would not match the sink table, IGNORE_PREFIXES `configs/` would
+    # swallow the real file, and the sink would never run on its own demo
+    # config. This test is the backstop: walk every sink's entries and assert
+    # each one resolves on disk. Entries ending in `/` are directories, the
+    # rest are files - one assertion each, collected across every sink before
+    # failing, so a broken table reports all typos in one run.
+    root = Path(".")
+    missing: list[tuple[str, str]] = []
+    for sink, entries in planner.SINK_PATHS.items():
+        for entry in entries:
+            target = root / entry
+            if entry.endswith("/"):
+                if not target.is_dir():
+                    missing.append((sink, entry))
+            elif not target.is_file():
+                missing.append((sink, entry))
+    assert not missing, (
+        "SINK_PATHS entries that do not resolve on disk: "
+        + ", ".join(f"{sink}={entry!r}" for sink, entry in missing)
+    )
+
+
 def test_shared_and_unknown_paths_run_everything() -> None:
     for path in (
         "runtime/checkpoint/store.go",

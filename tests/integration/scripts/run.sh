@@ -307,15 +307,25 @@ reset_checkpoints() {
 
 case "${SINK}" in
   mysql | stdout)
+    # Both sinks share the fixtures under sinks/mysql/fixtures/: seed.sql lays
+    # down the func-suite tables, seed_types.sql the types-suite tables. The
+    # harnesses only read or append to those tables, they do not create them,
+    # so run.sh pipes them in here once before the suites start.
     reset_checkpoints
     seed_sql "${IT}/sinks/mysql/fixtures/seed.sql"
     seed_sql "${IT}/sinks/mysql/fixtures/seed_types.sql"
     ;;
   kafka)
+    # The kafka harness expects its source tables to already exist with the
+    # shape the topic-projection test points assume, so seed_kafka.sql carries
+    # that schema/rows and is piped in here once before kafka_it runs.
     reset_checkpoints
     seed_sql "${IT}/sinks/kafka/fixtures/seed_kafka.sql"
     ;;
   doris)
+    # Same pattern as kafka: seed_doris.sql lays down the source tables the
+    # doris harness captures, and run.sh applies them once before doris_it
+    # runs. The sink-side databases are created by Doris's auto-create-table.
     reset_checkpoints
     seed_sql "${IT}/sinks/doris/fixtures/seed_doris.sql"
     ;;

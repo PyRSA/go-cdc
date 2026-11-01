@@ -359,7 +359,7 @@ func TestIntegrationShowLoadSingleRowPerLabel(t *testing.T) {
 			// A build that records no Stream Load job cannot exhibit the duplicate
 			// label ambiguity the sink guards against. Report this probe as skipped
 			// instead of green, so CI does not claim coverage it never had.
-			t.Skipf("SHOW LOAD exposed none of %d Stream Load labels: the single-row and WHERE assertions could not run on this Doris build", len(labels))
+			t.Skipf("SHOW LOAD exposed none of %d Stream Load labels: the single-row and WHERE assertions could not execute on this Doris build", len(labels))
 		}
 	})
 }

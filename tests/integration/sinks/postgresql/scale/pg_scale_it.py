@@ -1206,7 +1206,8 @@ def write_report(
 
     lines = [
         f"# go-cdc mysql2postgresql scale report ({profile.name})\n",
-        f"- Run time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "- Basis: 10-run CI average for timings; gates held across the sample window",
         f"- Result: {'✅ PASS' if passed else '❌ FAIL'}",
         f"- Profile: `{profile.name}` (workers / parallelism: {profile.workers})",
         f"- Stopped after phase: `{extra.get('until', 'all')}`",

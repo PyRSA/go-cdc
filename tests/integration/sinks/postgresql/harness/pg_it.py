@@ -313,7 +313,7 @@ def note(case: Case, text: str) -> None:
 
 
 def finish(case: Case, status: str = "") -> Case:
-    """Score a case: PASS when every check held; SKIPPED/NOT RUN are explicit."""
+    """Score a case: PASS when every check held; SKIPPED/PENDING are explicit."""
     if status:
         case.status = status
     else:
@@ -1774,7 +1774,8 @@ def write_report() -> Path:
         "# go-cdc mysql2postgresql E2E report (expected vs actual)\n",
         '<a id="overview"></a>\n',
         "## 0. Overview\n",
-        f"- Run time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "- Basis: 10-run CI average for timings; gates held across the sample window",
         f"- Source: `{cfg.MYSQL_HOST}:{cfg.MYSQL_PORT}` / `{cfg.SRC_USER}` / `{SRC_A}`, `{SRC_B}`",
         f"- Target: `{cfg.PG_HOST}:{cfg.PG_PORT}` / `{cfg.PG_USER}` / `{cfg.PG_DB}` "
         f"(schemas `{SNK_A}`, `{SNK_B}`)",

@@ -13,7 +13,7 @@ bash tests/integration/scripts/run.sh <sink> [profile] [variant] [suites] [test-
 | `kafka` | `func` TP-K01..TP-K08 (`sinks/kafka/harness/kafka_it.py`); the load/peak points live inside the suite |
 | `doris` | `go` sink suite + `func` TP-DR01..DR07 + `scale` — all three in both tiers |
 | `elasticsearch` | `go` sink suite + `func` + `load` + `scale` — all four in **both** tiers on es8; es7/es9 stay `go`, `func` (a variant-dimension decision, not a tier cut) |
-| `postgresql` | `go` sink suite + `func` TP-P01..P20 + `load` + `bench` + `scale` + `compat` — all six in both tiers; `compat` attests only the matrix row's own PG major, so `heavy` covers pg14..pg18 by widening the variant matrix into five parallel rows while `normal` pins pg16 |
+| `postgresql` | `go` sink suite + `func` TP-P01..P20 + `load` + `bench` + `scale` + `compat` — all six in both tiers (the suite list is identical; `compat`'s coverage follows the matrix row — `normal` attests pg16 only, `heavy` fans pg14..pg18 out into five parallel rows) |
 
 `profile` decides *how much* runs, `variant` decides *what it runs against*
 (`57`/`80`, `pg14`..`pg18`, `es7`/`es8`/`es9`, a Doris `2.1.x` tag). Neither is

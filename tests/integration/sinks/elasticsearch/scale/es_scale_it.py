@@ -525,7 +525,8 @@ def write_report(profile: Profile, timings: dict[str, float], failures: list[str
     src_dbs = sorted({t.src_db for t in profile.tables})
     lines = [
         f"# go-cdc Elasticsearch sink scale report ({profile.name})\n",
-        f"- Run time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "- Basis: 10-run CI average for timings; gates held across the sample window",
         f"- Result: {'✅ PASS' if passed else '❌ FAIL'}",
         f"- Profile: `{profile.name}`",
         f"- Sink: Elasticsearch 8 at `{ES_URL}` (index per final table, `auto-create: true`)",
