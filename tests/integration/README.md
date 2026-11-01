@@ -13,7 +13,7 @@ bash tests/integration/scripts/run.sh <sink> [profile] [variant] [suites] [test-
 | `kafka` | `func` TP-K01..TP-K08 (`sinks/kafka/harness/kafka_it.py`); the load/peak points live inside the suite |
 | `doris` | `go` sink suite + `func` TP-DR01..DR07 + `scale` — all three in both tiers |
 | `elasticsearch` | `go` sink suite + `func` + `load` + `scale` — all four in **both** tiers on es8; es7/es9 stay `go`, `func` (a variant-dimension decision, not a tier cut) |
-| `postgresql` | `go` sink suite + `func` TP-P01..P20 + `load` + `bench` + `scale` + `compat` (PG 14..18) — all six in both tiers |
+| `postgresql` | `go` sink suite + `func` TP-P01..P20 + `load` + `bench` + `scale` + `compat` — all six in both tiers; `compat` attests only the matrix row's own PG major, so `heavy` covers pg14..pg18 by widening the variant matrix into five parallel rows while `normal` pins pg16 |
 
 `profile` decides *how much* runs, `variant` decides *what it runs against*
 (`57`/`80`, `pg14`..`pg18`, `es7`/`es8`/`es9`, a Doris `2.1.x` tag). Neither is
@@ -180,7 +180,7 @@ Tiers:
 | Tier | Trigger | What runs |
 | --- | --- | --- |
 | `normal` | PR opened / synchronized / reopened, and a push to any other branch | the full suite list of every sink on every supported variant (MySQL 5.7 + 8.0 `func,types,load,scale`; PG 16 `go,func,load,bench,scale,compat`; Doris `go,func,scale`; ES 8 `go,func,load,scale`; ES 7/9 `go,func`; Kafka, stdout `func`) |
-| `heavy` | `ci-heavy` already on the PR (push after adding it) or `gh workflow run ci.yml -f profile=heavy`; a push to `master`/`main` | the identical suite list; only the peak writer count (4 -> 8) and the scale timeouts (catch-up budget and total timeout) grow |
+| `heavy` | `ci-heavy` already on the PR (push after adding it) or `gh workflow run ci.yml -f profile=heavy`; a push to `master`/`main` | the identical suite list; the peak writer count (4 -> 8) and the scale timeouts (catch-up budget and total timeout) grow, and the PostgreSQL variant matrix widens from pg16 to pg14..pg18 so the compat majors run as five parallel rows |
 
 Every push and every PR is a trigger; `push` has no branch filter. When a push is
 already covered by an open PR, `decide` sets `run=false` and the push run does no

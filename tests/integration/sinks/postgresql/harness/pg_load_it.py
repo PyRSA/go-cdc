@@ -626,6 +626,16 @@ def tp_pl04_large() -> Case:
         return finish(case)
     src_rows = my(SRC_DB, mysql_sql)
     snk_rows = pg_client.q(pg_sql)
+    # The image magic comes back from two different hex encoders: MySQL
+    # `HEX(...)` emits uppercase (``FFD8``) while PostgreSQL
+    # `encode(...,'hex')` emits lowercase (``ffd8``). They are the same two bytes,
+    # so normalise the case before the cross-server diff or every row would
+    # "differ" on hex casing alone. (The sha columns already agree: both
+    # `SHA2()` and `encode(sha256(...),'hex')` are lowercase.)
+    for rows in (src_rows, snk_rows):
+        for row in rows:
+            if row.get("img_magic") is not None:
+                row["img_magic"] = str(row["img_magic"]).lower()
     truncated = [
         str(row["id"])
         for row in snk_rows

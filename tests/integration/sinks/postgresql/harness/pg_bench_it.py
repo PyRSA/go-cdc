@@ -620,11 +620,13 @@ class Probe(threading.Thread):
         interval: float,
         timeout: float,
         poll: float,
+        ready_timeout: float = 60.0,
     ) -> None:
         super().__init__(daemon=True)
         self.interval = max(0.05, interval)
         self.timeout = timeout
         self.poll = max(0.005, poll)
+        self.ready_timeout = max(0.0, ready_timeout)
         self.stop_event = threading.Event()
         self.samples: list[float] = []
         self.timeouts = 0
@@ -635,10 +637,35 @@ class Probe(threading.Thread):
         cur.execute(f'SELECT 1 AS ok FROM "{SCHEMA}"."{PROBE}" WHERE id = %s', (row_id,))
         return cur.fetchone() is not None
 
+    def _wait_ready(self) -> bool:
+        """Block until go-cdc has created the target probe table.
+
+        The probe table is empty during the snapshot and only materialises on the
+        sink's first event for that table, so the very first ``_visible`` query can
+        race a ``UndefinedTable error``. That is a startup race, not a slow query:
+        wait for the table to exist before measuring any latency, and give up (with
+        an error, never a silent wrong number) if it never appears.
+        """
+        deadline = time.time() + self.ready_timeout
+        while time.time() < deadline:
+            if self.stop_event.is_set():
+                return False
+            if pg_client.table_exists(SCHEMA, PROBE):
+                return True
+            time.sleep(max(self.poll, 0.5))
+        # One final check so a table created just before the deadline is not missed.
+        return pg_client.table_exists(SCHEMA, PROBE)
+
     def run(self) -> None:
         source = pymysql.connect(**src_cfg(SRC_DB), autocommit=True)
         target = pg_client.connect()
         try:
+            if not self._wait_ready():
+                self.errors.append(
+                    f"probe table {SCHEMA}.{PROBE} not created within "
+                    f"{self.ready_timeout:.0f}s; latency not measured"
+                )
+                return
             while not self.stop_event.is_set():
                 row_id = self._next_id
                 self._next_id += 1

@@ -98,11 +98,14 @@ IGNORE_FILES: frozenset[str] = frozenset(
 )
 IGNORE_SUFFIXES: tuple[str, ...] = (".md",)
 
-# Which variants each sink is exercised on, per profile. The version matrix is
-# never dropped: both profiles list the same variants, because the tier does not
-# decide which suites run - that is static per sink in run.sh's default_suites
-# (the PG compat suite walks pg14..pg18 from inside its own run, so a single
-# pg16 row is enough); the tier only resizes writers and timeouts.
+# Which variants each sink is exercised on, per profile. The tier still never
+# decides which suites run - that is static per sink in run.sh's default_suites;
+# the tier only resizes writers and timeouts. The one deliberate asymmetry is the
+# PostgreSQL VERSION matrix: `normal` pins the single default major (pg16) to keep
+# the PR gate cheap, while `heavy` fans the compat majors (pg14..pg18) out into
+# separate matrix rows so they run in parallel CI jobs instead of as one slow
+# pg14..pg18 loop inside a single process (run.sh's compat suite then exercises
+# just the version each row brings up).
 VARIANTS: dict[str, dict[str, tuple[str, ...]]] = {
     "normal": {
         "mysql": ("57", "80"),
@@ -118,7 +121,10 @@ VARIANTS: dict[str, dict[str, tuple[str, ...]]] = {
         "kafka": ("",),
         "doris": ("",),
         "elasticsearch": ("es8", "es7", "es9"),
-        "postgresql": ("pg16",),
+        # Compat majors become parallel rows; each runs its own server, so the
+        # in-process five-version loop is gone and the wall clock no longer pays
+        # for five container swaps.
+        "postgresql": ("pg14", "pg15", "pg16", "pg17", "pg18"),
     },
 }
 

@@ -31,6 +31,12 @@
 # the two timeouts. es7/es9 run `go,func` because they are adapter-compatibility
 # nodes - that is the variant dimension deciding, not the tier.
 #
+# The one tier asymmetry that is NOT a suite change: heavy widens the PostgreSQL
+# VERSION matrix (plan.py lists pg14..pg18 for heavy, just pg16 for normal) so the
+# compat majors run as parallel CI jobs. The `compat` suite below therefore
+# exercises only the version this row brings up rather than looping all five in
+# one process; normal keeps the single default major to hold down the PR gate.
+#
 # The seed volume, the peak duration and the hotspot burst are deliberately NOT
 # tiered: they are the shape of the measurement, not its cost, so a `normal`
 # report has to be readable against a `heavy` one. Only the peak writer count and
@@ -225,8 +231,10 @@ default_suites() {
     postgresql)
       # `go` is the sink's own Go integration tests (tag postgres_integration),
       # the correctness floor that talks to the pinned variant server directly.
-      # `compat` replaces the stack once per major (pg14..pg18 via setup.sh), so
-      # it runs last: whatever it leaves behind is then irrelevant to the run.
+      # `compat` attests the core suite per major. Heavy spreads pg14..pg18 across
+      # parallel matrix rows, so compat runs only THIS row's version (see
+      # `pg_compat_suite`) instead of a serial five-container loop; it still runs
+      # last because a version-scoped setup swaps the stack behind it.
       echo "go,func,load,bench,scale,compat"
       ;;
   esac
@@ -354,6 +362,32 @@ go_postgresql() {
     ./connector/sink/postgresql/)
 }
 
+pg_compat_suite() {
+  # compat exists to attest the shared core suite on every PostgreSQL major.
+  # Heavy now fans pg14..pg18 out into parallel CI matrix rows, each bringing up
+  # exactly one server in the workflow's Setup step, so looping all five majors
+  # again inside this one process is pure duplicated work (and was the ~20m
+  # floor). When a concrete major is pinned as the variant, exercise only that
+  # version - pg_compat takes the major as a positional and runs a single row.
+  # A variant-less local run has no such row, so it keeps the full matrix loop
+  # for developer convenience.
+  local current=""
+  case "${VARIANT:-}" in
+    pg14) current=14 ;;
+    pg15) current=15 ;;
+    pg16) current=16 ;;
+    pg17) current=17 ;;
+    pg18) current=18 ;;
+  esac
+  if [ -n "${current}" ]; then
+    log "==> compat: PostgreSQL ${current} only (matrix row; the majors run in parallel)"
+    "${PYTHON_BIN}" -m sinks.postgresql.harness.pg_compat "${current}"
+  else
+    log "==> compat: full pg14..pg18 matrix (no pinned variant)"
+    "${PYTHON_BIN}" -m sinks.postgresql.harness.pg_compat ${EXTRA[@]+"${EXTRA[@]}"}
+  fi
+}
+
 run_suite() {
   local suite="$1"
   case "${SINK}:${suite}" in
@@ -382,7 +416,7 @@ run_suite() {
     postgresql:func) "${PYTHON_BIN}" -m sinks.postgresql.harness.pg_it "${EXTRA[@]+"${EXTRA[@]}"}" ;;
     postgresql:load) "${PYTHON_BIN}" -m sinks.postgresql.harness.pg_load_it "${EXTRA[@]+"${EXTRA[@]}"}" ;;
     postgresql:bench) "${PYTHON_BIN}" -m sinks.postgresql.harness.pg_bench_it "${EXTRA[@]+"${EXTRA[@]}"}" ;;
-    postgresql:compat) "${PYTHON_BIN}" -m sinks.postgresql.harness.pg_compat "${EXTRA[@]+"${EXTRA[@]}"}" ;;
+    postgresql:compat) pg_compat_suite ;;
     postgresql:scale)
       "${PYTHON_BIN}" -m sinks.postgresql.scale.pg_scale_it "${PROFILE}" --until all
       ;;

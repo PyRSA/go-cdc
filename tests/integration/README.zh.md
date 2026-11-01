@@ -14,7 +14,7 @@ bash tests/integration/scripts/run.sh <sink> [profile] [variant] [suites] [test-
 | `kafka` | `func` TP-K01..TP-K08（`sinks/kafka/harness/kafka_it.py`）；负载/峰值测试点就在套件内部 |
 | `doris` | `go` sink 套件 + `func` TP-DR01..DR07 + `scale` —— 三项两档全跑 |
 | `elasticsearch` | `go` sink 套件 + `func` + `load` + `scale` —— es8 两档都跑全部四项；es7/es9 仍为 `go`、`func`（由变体维度决定，不是档位裁剪） |
-| `postgresql` | `go` sink 套件 + `func` TP-P01..P20 + `load`、`bench`、`scale`、`compat`（PG 14..18）—— 六项两档全跑 |
+| `postgresql` | `go` sink 套件 + `func` TP-P01..P20 + `load`、`bench`、`scale`、`compat` —— 六项两档全跑；`compat` 只验证本矩阵行自己那个 PG 大版本，故 heavy 靠把变体矩阵扩成 5 个并行行来覆盖 pg14..pg18，normal 则固定 pg16 |
 
 `profile` 决定**跑多少**，`variant` 决定**跑在哪个版本上**（`57`/`80`、`pg14`..`pg18`、`es7`/`es8`/`es9`、
 Doris 的 `2.1.x` tag）。两者都不从环境推断。映射表只有一处：`logger.sh: it_apply_variant`；
@@ -163,7 +163,7 @@ decide  ->  plan  ->  go-check  ->  ci-<sink>.yml（每个受影响的 sink 一�
 | 档位 | 触发 | 跑什么 |
 | --- | --- | --- |
 | `normal` | PR opened / synchronized / reopened，以及推送到其他任一分支 | 每个受支持 variant 的全量套件清单（MySQL 5.7 + 8.0 `func,types,load,scale`；PG 16 `go,func,load,bench,scale,compat`；Doris `go,func,scale`；ES 8 `go,func,load,scale`；ES 7/9 `go,func`；Kafka、stdout `func`） |
-| `heavy` | PR 上已打 `ci-heavy`（打完再 push）或 `gh workflow run ci.yml -f profile=heavy`；push 到 `master`/`main` | 与 normal 完全相同的套件清单；只有峰值写并发（4 → 8）与规模套件的二级超时（追平预算、总超时）随档位放大 |
+| `heavy` | PR 上已打 `ci-heavy`（打完再 push）或 `gh workflow run ci.yml -f profile=heavy`；push 到 `master`/`main` | 与 normal 完全相同的套件清单；峰值写并发（4 → 8）与规模套件的二级超时（追平预算、总超时）随档位放大，且 PostgreSQL 变体矩阵从 pg16 扩到 pg14..pg18，让 compat 的五个大版本作为 5 个并行行跑 |
 
 每一次 push 与每一个 PR 都是触发条件，`push` 不限定分支。当某次 push 已被一个 open PR 覆盖时，
 `decide` 会置 `run=false`，该次 push 不执行任何作业（`result` 仍报成功）—— 这个 commit 由 PR 的那次

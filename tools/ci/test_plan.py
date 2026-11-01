@@ -150,10 +150,23 @@ def test_per_sink_matrices_are_filtered() -> None:
     assert "mysql" not in result["per_sink"]
 
 
-def test_heavy_profile_keeps_the_same_variants() -> None:
+def test_heavy_matches_normal_except_the_pg_compat_matrix() -> None:
+    # The tier still never changes which suites run, so every sink keeps the
+    # same variants in both tiers EXCEPT PostgreSQL, whose compat majors move
+    # from a single in-process loop to parallel heavy matrix rows.
     normal = planner.plan(["common/event/event.go"], "normal")["matrix"]["include"]
     heavy = planner.plan(["common/event/event.go"], "heavy")["matrix"]["include"]
-    assert normal == heavy
+    without_pg = lambda rows: [r for r in rows if r["sink"] != "postgresql"]
+    assert without_pg(normal) == without_pg(heavy)
+    # normal pins the one default major; heavy fans the five majors out.
+    assert [r["variant"] for r in normal if r["sink"] == "postgresql"] == ["pg16"]
+    assert [r["variant"] for r in heavy if r["sink"] == "postgresql"] == [
+        "pg14",
+        "pg15",
+        "pg16",
+        "pg17",
+        "pg18",
+    ]
 
 
 # ----------------------------------------------------------------------- docker

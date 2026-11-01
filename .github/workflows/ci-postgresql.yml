@@ -2,11 +2,13 @@
 #
 #   profile  normal | heavy -> go,func,load,bench,scale,compat
 #            (the suite list is identical in both tiers; only the writer count
-#             and the timeouts follow the tier; compat loops pg14..pg18)
-#   variant  pg14..pg18 -> PG_IMAGE + PG_EXPECT_MAJOR
+#             and the timeouts follow the tier)
+#   variant  normal: pg16 | heavy: pg14..pg18 -> PG_IMAGE + PG_EXPECT_MAJOR
+#            (heavy fans the compat majors out into parallel rows, and each
+#             row's compat suite exercises only its own version)
 #
-# `compat` runs last on purpose: it restarts the stack once per major through
-# setup.sh, so it is the only suite allowed to change what is running.
+# `compat` runs last on purpose: it runs a version-scoped setup.sh, so it is the
+# only suite allowed to change what is running.
 name: CI / Integration
 
 on:
@@ -32,12 +34,15 @@ jobs:
   run:
     name: MySQL → PostgreSQL ${{ fromJSON('{"pg14":"14","pg15":"15","pg16":"16","pg17":"17","pg18":"18"}')[matrix.variant || 'pg16'] }}
     runs-on: ubuntu-latest
-    # Both tiers run the five-major compat matrix, which alone needs ~20m; heavy
-    # additionally doubles the suite timeouts.
+    # Each row runs one PostgreSQL major end to end; compat is a single version
+    # per row now (the five majors ARE the matrix), so there is no ~20m in-process
+    # loop left. heavy additionally doubles the suite timeouts.
     timeout-minutes: ${{ inputs.profile == 'heavy' && 300 || 150 }}
     strategy:
       fail-fast: false
-      max-parallel: ${{ inputs.profile == 'heavy' && 2 || 6 }}
+      # Heavy expands to five PG rows (pg14..pg18); run them concurrently so the
+      # wall clock is one row's time, not five in series.
+      max-parallel: ${{ inputs.profile == 'heavy' && 5 || 6 }}
       # An empty string means "no rows"; strategy.matrix still needs an object.
       matrix: ${{ fromJSON(inputs.matrix || '{"include":[]}') }}
     steps:
