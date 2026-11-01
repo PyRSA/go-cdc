@@ -19,15 +19,11 @@ of [mysql-to-mysql-e2e.md](mysql-to-mysql-e2e.md); per-sink naming follows
 
 - The `heavy` tier fans the PostgreSQL version matrix out into **five parallel
   CI rows, one per major** (pg14…pg18); every row runs the full suite list
-  once. The five logs are therefore **one run per major version** from the
-  same run set (2026-11-01), *not* repeated runs of one version — numbers are
-  reported per version and are never averaged across majors.
-- Phase timings and counters are quoted **verbatim** from the logs:
-  [`postgresql14.txt`](../test/log/postgresql14.txt) ·
-  [`postgresql15.txt`](../test/log/postgresql15.txt) ·
-  [`postgresql16.txt`](../test/log/postgresql16.txt) ·
-  [`postgresql17.txt`](../test/log/postgresql17.txt) ·
-  [`postgresql18.txt`](../test/log/postgresql18.txt).
+  once. The five matrix rows are therefore **one run per major version** from
+  the same run set (2026-11-01), *not* repeated runs of one version — numbers
+  are reported per version and are never averaged across majors.
+- Phase timings and counters are quoted **verbatim** from the `heavy` CI job
+  stdout of each major-version row.
 - "Derived" rates are arithmetic on those literals with the formula stated.
 - The peak-write counter tracks `tpl01_t1` only
   (`written += len(orders)` in
@@ -188,12 +184,6 @@ footprint.
 
 ## Sources
 
-- Logs (verbatim):
-  [`postgresql14.txt`](../test/log/postgresql14.txt) ·
-  [`postgresql15.txt`](../test/log/postgresql15.txt) ·
-  [`postgresql16.txt`](../test/log/postgresql16.txt) ·
-  [`postgresql17.txt`](../test/log/postgresql17.txt) ·
-  [`postgresql18.txt`](../test/log/postgresql18.txt)
 - Workflow: [`.github/workflows/ci-postgresql.yml`](../../.github/workflows/ci-postgresql.yml)
 - Tier / knob table: [`tests/integration/scripts/run.sh`](../../tests/integration/scripts/run.sh)
 - Connector: [`docs/connectors/postgresql-sink.md`](../connectors/postgresql-sink.md) ·

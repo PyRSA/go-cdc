@@ -18,8 +18,6 @@ follows `mysql-to-<sink>-e2e.md`.
 
 - Phase timings, catch-up samples, and counters are **arithmetic means across
   10 CI runs** of the Doris load suite (`profile=normal`, `suites=go,func`).
-- Representative stdout is kept at
-  [`docs/test/log/doris.txt`](../test/log/doris.txt) for line-by-line lookup.
 - “Derived” rates are arithmetic on the averaged values; the formula is stated
   next to each number.
 - The catch-up table lists mean harness sample points; nothing is interpolated.
@@ -99,7 +97,6 @@ closes with the 570s `done` timing and TP-DR06 PASS:
 
 ## Sources
 
-- Log: [`docs/test/log/doris.txt`](../test/log/doris.txt)
 - Workflow: [`.github/workflows/ci-doris.yml`](../../.github/workflows/ci-doris.yml)
 - The per-job report is uploaded as a CI artifact
   (`docs/test/reports/` is not tracked in git).

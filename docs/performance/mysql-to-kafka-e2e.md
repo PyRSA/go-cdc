@@ -19,8 +19,6 @@ follows `mysql-to-<sink>-e2e.md`.
 - Phase timings, topic counts, and derived rates are **arithmetic means
   across 10 CI runs** of the Kafka load suite (`profile=normal`,
   `suites=func` — load/volume points TP-K05..K08 run inside `func`).
-- Representative stdout is kept at
-  [`docs/test/log/kafka.txt`](../test/log/kafka.txt) for line-by-line lookup.
 - Counts are **consumer-side record observations** on topics
   (`kafka.tpl01_*`), not sink-internal throughput; gates are expressed as
   `need >=` floors (≤1% tolerance) rather than exact parity, leaving room
@@ -97,7 +95,6 @@ passed in the same job window as the peak phase.
 
 ## Sources
 
-- Log: [`docs/test/log/kafka.txt`](../test/log/kafka.txt)
 - Workflow: [`.github/workflows/ci-kafka.yml`](../../.github/workflows/ci-kafka.yml)
 - The per-job report is uploaded as a CI artifact
   (`docs/test/reports/` is not tracked in git).

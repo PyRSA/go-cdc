@@ -20,9 +20,6 @@ This document records GitHub Actions CI performance evidence for the
   the ES8 load/scale path (`profile=normal`, `suites=go,func,load,scale`).
   Only the **ES8** variant runs load/scale; ES7/ES9 are `go,func`
   compatibility variants.
-- Representative stdout is kept at
-  [`docs/test/log/elasticsearch8.txt`](../test/log/elasticsearch8.txt) for
-  line-by-line lookup.
 - “Derived” rates are arithmetic on the averaged values with the formula
   stated; the snapshot rate assumes the shared load fixture volume
   (100k × 5 tables).
@@ -112,7 +109,6 @@ load(1m) 1.27–1.63 — the fan-out workload stays small and memory-flat.
 
 ## Sources
 
-- Log: [`docs/test/log/elasticsearch8.txt`](../test/log/elasticsearch8.txt)
 - Workflow: [`.github/workflows/ci-elasticsearch.yml`](../../.github/workflows/ci-elasticsearch.yml)
 - Per-job functional/load/scale reports are uploaded as CI artifacts
   (`docs/test/reports/` is not tracked in git).
