@@ -1,6 +1,6 @@
 pymysql>=1.0.2
 pytest>=7.0.0
 kafka-python>=2.0.2
-# PostgreSQL sink target (harness/pg_client.py imports it lazily, so the offline
+# PostgreSQL sink target (sinks/postgresql/harness/pg_client.py imports it lazily, so the offline
 # oracle tests still run without it).
 psycopg2-binary>=2.9.9
