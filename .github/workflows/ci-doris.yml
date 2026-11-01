@@ -1,0 +1,77 @@
+# Reusable sink workflow: Apache Doris 2.1.x (UNIQUE KEY, Stream Load).
+#
+# The FE/BE pair runs on the host network and needs kernel limits (inotify
+# watches, vm.max_map_count); setup.sh raises them with passwordless sudo and
+# fails with an actionable message when it cannot.
+#
+#   profile  normal | heavy -> go,func,scale  (the suite list is identical in
+#            both tiers; only the writer count and the timeouts follow it)
+#   variant  empty | 2.1.x -> DORIS_VERSION (mapped by `logger.sh:
+#            it_apply_variant`, called by run.sh and setup.sh)
+name: CI / Integration
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: "Run tier: normal | heavy"
+        required: true
+        type: string
+      matrix:
+        description: 'Rows owned by this sink, e.g. {"include": [{"sink": "doris", "variant": ""}]}'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  run:
+    name: MySQL → Doris ${{ matrix.variant || '2.1.x' }}
+    runs-on: ubuntu-latest
+    # Doris needs ~3 min just to register the BE before a suite starts.
+    timeout-minutes: ${{ inputs.profile == 'heavy' && 300 || 150 }}
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.profile == 'heavy' && 2 || 6 }}
+      # An empty string means "no rows"; strategy.matrix still needs an object.
+      matrix: ${{ fromJSON(inputs.matrix || '{"include":[]}') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install client tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends mysql-client
+          python3 -m pip install -r tests/integration/common/requirements.txt
+
+      # setup raises kernel limits and the stack, run only executes the suites
+      # (IT_SKIP_SETUP=1), teardown always fires.
+      - name: Setup stack
+        run: bash tests/integration/scripts/setup.sh doris "${{ matrix.variant }}" "${{ inputs.profile }}"
+
+      - name: Run suites
+        env:
+          IT_SKIP_SETUP: "1"
+        run: |
+          set -euo pipefail
+          bash tests/integration/scripts/run.sh doris "${{ inputs.profile }}" "${{ matrix.variant }}"
+
+      # Also removes workdir/doris (the FE meta image cannot be reused across
+      # runs; setup.sh recreates the bind directories).
+      - name: Teardown
+        if: always()
+        run: bash tests/integration/scripts/teardown.sh doris "${{ matrix.variant }}"

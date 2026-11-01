@@ -128,9 +128,10 @@ func classifyLoad(resp *loadResponse, label string, wantRows int) (loadOutcome, 
 		return outcomeSuccess, nil
 	case statusPublishTimeout:
 		// Doris documents this status as an import that already completed, whose
-		// data may only become visible later ("导入已经完成，但数据可能会延迟可见，
-		// 无需重试"). The transaction is committed, so a new label would duplicate
-		// rows and must never be used.
+		// data may only become visible later ("the import has finished, but the
+		// data may still become visible later; no retry is needed"). The
+		// transaction is committed, so a new label would duplicate rows and must
+		// never be used.
 		//
 		// A counter that is present is a fact, including an explicit 0: a load
 		// that reports writing none of the sent rows is a shortfall, not an

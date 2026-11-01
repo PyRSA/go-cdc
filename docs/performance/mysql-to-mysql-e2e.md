@@ -13,7 +13,7 @@ files under `docs/performance/` using the same `mysql-to-<sink>-e2e.md` naming.
 | --- | --- |
 | Samples | Load: **10-run average** each for MySQL 5.7 / 8.0; Scale heavy: **10-run average** (8.0) |
 | CI dates | sample window 2026-09-30 · 2026-10-12 |
-| Workflow | `CI / Integration` (`.github/workflows/integration.yml`) |
+| Workflow | `CI / Integration` (`.github/workflows/ci.yml`) |
 | Runner | GitHub Actions `ubuntu-latest` (shared VM) |
 | MySQL (load) | 5.7.42 and 8.0.36 via docker compose |
 | MySQL (scale) | 8.0.36 · `SCALE_PROFILE=heavy` only |
@@ -198,8 +198,8 @@ flood. Scale wall time is especially runner-sensitive.
 
 ## Sources
 
-- CI stdout captures under `test/integration/workdir/` (local copies of job
+- CI stdout captures under `tests/integration/workdir/` (local copies of job
   logs; not committed): load 5.7 / 8.0 ×10, scale heavy ×10.
-- Workflow: [`.github/workflows/integration.yml`](../../.github/workflows/integration.yml)
-- Harness: [`test/integration/harness/load_it.py`](../../test/integration/harness/load_it.py),
-  [`test/integration/scale/`](../../test/integration/scale/)
+- Workflow: [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml)
+- Harness: [`tests/integration/sinks/mysql/harness/load_it.py`](../../tests/integration/sinks/mysql/harness/load_it.py),
+  [`tests/integration/common/`](../../tests/integration/common/)

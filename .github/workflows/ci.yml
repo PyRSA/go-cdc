@@ -1,0 +1,499 @@
+# CI entry point: one route, one place that decides what runs.
+#
+#   decide   profile tier (the only place it is computed)
+#   plan     git diff -> {"include": [{"sink": ..., "variant": ...}]}
+#   go-check fmt + lint + unit tests + build + offline Python tests (pytest)
+#   sink-*   one reusable workflow per sink, fed only the rows it owns
+#   result   aggregate; `skipped` (and an empty matrix) is a success, and every
+#            concrete job is reported on its own line with the clock it took
+#
+# Profile precedence (the only place it is computed):
+#   workflow_dispatch.input  >  `ci-heavy` label on the PR  >  push to master/main
+#                            >  any other push / PR  >  normal
+#
+# Triggers: every push (there is no branch filter) and every PR. When a push is
+# already covered by an open PR it is dropped in `decide` - the pull_request run
+# is the one that reports, so the same commit is never tested twice.
+#
+# `labeled` is deliberately NOT a trigger. A label event shares the PR's
+# concurrency group, so adding *any* label would cancel the run in flight and
+# replace it with one whose jobs are all skipped - a green `Result` for tests
+# that never ran. To promote a PR, add `ci-heavy` and push (every run reads the
+# labels), or dispatch this workflow with `profile=heavy`.
+name: CI
+
+on:
+  # No `branches` filter on purpose: a push is planned wherever it lands, and a
+  # push whose branch has an open PR is dropped by `decide`.
+  push:
+  pull_request:
+    # No `labeled` here: see the header. The tier is read from the PR's labels
+    # on every run, so a label takes effect with the next push.
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Run tier"
+        type: choice
+        options: [normal, heavy]
+        default: normal
+
+# A newer commit on the same branch/PR cancels older runs of THIS workflow only.
+# master/main are exempt: a cancelled run there leaves a release commit without a
+# verdict. A PR keys the group by its number, a push by its ref, so a PR run and
+# a push run of the same branch land in DIFFERENT groups and never cancel each
+# other on purpose: a PR must not abort the push verdict mid-flight. Dropping the
+# redundant push is decide's job (run=false), not the concurrency group's.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # Two decisions in one place: whether this event should run at all, and at
+  # which tier. Every push is a candidate (no branch filter in `on`), so a push
+  # that an open PR already covers is dropped here.
+  decide:
+    name: Decide run
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+      profile: ${{ steps.decide.outputs.profile }}
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          INPUT_PROFILE: ${{ inputs.profile }}
+        run: |
+          set -euo pipefail
+
+          # The PR endpoints are covered by `pull-requests: read`. The Issues
+          # endpoint (/issues/<n>/labels) is a different scope: calling it with
+          # only `pull-requests: read` returns 403, and swallowing that error
+          # made every later push of a `ci-heavy` PR silently run as `normal`.
+          pr_labels() {
+            gh pr view "${PR_NUMBER}" --repo "${REPO}" --json labels --jq '.labels[].name'
+          }
+
+          # ---------------- should this event run at all?
+          # A push and its PR are the same commit: only the PR run does the work.
+          # A failed query must not swallow the push CI, so the fallback is to
+          # run - loudly.
+          run=true
+          if [ "${EVENT_NAME}" = "push" ]; then
+            # Match on the head branch name alone, not `owner:branch`: a PR
+            # opened from a fork has a different head owner than this repository,
+            # so an `owner:branch` filter would miss it and let the redundant
+            # push run in full. Any open PR whose headRefName equals the pushed
+            # branch covers this commit.
+            if ! count="$(gh pr list --repo "${REPO}" --state open \
+                  --json headRefName --jq "[.[] | select(.headRefName==\"${REF_NAME}\")] | length")"; then
+              echo "::warning::cannot list the open PRs of ${REF_NAME}; running this push (fail open)"
+              count=0
+            fi
+            if [ "${count}" -gt 0 ]; then
+              run=false
+              echo "skipped: ${count} open PR(s) already cover ${REF_NAME}"
+            else
+              echo "running: no open PR covers ${REF_NAME}"
+            fi
+          fi
+
+          # ---------------- tier
+          profile=normal
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ] && [ -n "${INPUT_PROFILE}" ]; then
+            profile="${INPUT_PROFILE}"
+            echo "profile=${profile} (workflow_dispatch input)"
+          elif [ "${EVENT_NAME}" = "pull_request" ]; then
+            # Fail loud: an unreadable label list must never quietly downgrade a
+            # PR that was promoted to the heavy tier.
+            if ! labels="$(pr_labels)"; then
+              echo "::error::cannot read the labels of PR #${PR_NUMBER} in ${REPO}"
+              exit 1
+            fi
+            if grep -qx 'ci-heavy' <<<"${labels}"; then
+              profile=heavy
+              echo "profile=${profile} (PR carries ci-heavy)"
+            else
+              echo "profile=${profile} (default)"
+            fi
+          elif [ "${EVENT_NAME}" = "push" ]; then
+            # Every branch is tested; only a default-branch push is promoted.
+            if [ "${REF}" = "refs/heads/master" ] || [ "${REF}" = "refs/heads/main" ]; then
+              profile=heavy
+              echo "profile=${profile} (default branch push)"
+            else
+              echo "profile=${profile} (non-default branch push)"
+            fi
+          else
+            echo "profile=${profile} (default)"
+          fi
+
+          echo "run=${run}" >>"${GITHUB_OUTPUT}"
+          echo "profile=${profile}" >>"${GITHUB_OUTPUT}"
+
+  # The diff -> matrix contract lives in tools/ci/plan.py (unit-tested there).
+  # fetch-depth: 0 is what makes `git diff <base sha> HEAD` work on a PR.
+  plan:
+    name: Plan / Select tests and validate CI
+    needs: decide
+    if: needs.decide.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+      sinks: ${{ steps.plan.outputs.sinks }}
+      mysql: ${{ steps.plan.outputs.mysql }}
+      stdout: ${{ steps.plan.outputs.stdout }}
+      kafka: ${{ steps.plan.outputs.kafka }}
+      doris: ${{ steps.plan.outputs.doris }}
+      elasticsearch: ${{ steps.plan.outputs.elasticsearch }}
+      postgresql: ${{ steps.plan.outputs.postgresql }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - id: plan
+        env:
+          PROFILE: ${{ needs.decide.outputs.profile }}
+          # PR: base sha. Push: the previous head (`before`). Anything else
+          # (dispatch) is empty, which plan.py reads as "run it all".
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+        run: |
+          set -euo pipefail
+          python3 tools/ci/plan.py \
+            --base "${BASE}" \
+            --head HEAD \
+            --profile "${PROFILE}" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Summary
+        env:
+          COUNT: ${{ steps.plan.outputs.count }}
+          SINKS: ${{ steps.plan.outputs.sinks }}
+          MATRIX: ${{ steps.plan.outputs.matrix }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### CI plan"
+            echo
+            echo "- profile: \`${{ needs.decide.outputs.profile }}\`"
+            echo "- sinks: \`${SINKS:-none}\`"
+            echo "- jobs: \`${COUNT}\`"
+            echo
+            echo '```json'
+            echo "${MATRIX}"
+            echo '```'
+          } >>"${GITHUB_STEP_SUMMARY}"
+          # An empty matrix (docs-only change) is a legitimate, successful plan.
+          [ "${COUNT}" != "0" ] || echo "::notice::no sink is affected; nothing to run"
+
+  # Fast gate before the container jobs: formatting, lint, unit tests, build and
+  # the offline Python suites (pytest walks tests/integration as one tree).
+  go-check:
+    name: Build + Lint + Test
+    needs: [decide, plan]
+    if: needs.decide.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Check gofmt
+        run: make fmt-check
+
+      - name: golangci-lint
+        run: make lint
+
+      - name: Unit tests
+        run: make test
+
+      - name: Build go-cdc
+        run: make build
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install harness deps
+        run: python3 -m pip install -r tests/integration/common/requirements.txt
+
+      # One pytest invocation covers every sink: the harness unit tests moved
+      # into tests/integration/sinks/<sink>/tests/ and conftest.py puts
+      # tests/integration on sys.path so the package imports resolve.
+      - name: Python tests (make it-check)
+        run: make it-check
+
+      - name: Shell script syntax
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          scripts=(tests/integration/scripts/*.sh tools/ci/*.sh install.sh)
+          for script in "${scripts[@]}"; do
+            bash -n "${script}"
+            echo "ok ${script}"
+          done
+
+  # One reusable workflow per sink: it receives only the rows it owns, so a
+  # Kafka-only change never starts the PostgreSQL matrix. `skipped` means "not
+  # affected" and the result job counts it as success.
+  sink-mysql:
+    name: Integration
+    needs: [decide, plan]
+    if: needs.decide.outputs.run == 'true' && needs.plan.outputs.count != '0' && contains(needs.plan.outputs.sinks, 'mysql')
+    uses: ./.github/workflows/ci-mysql.yml
+    with:
+      profile: ${{ needs.decide.outputs.profile }}
+      matrix: ${{ needs.plan.outputs.mysql }}
+
+  sink-stdout:
+    name: Integration
+    needs: [decide, plan]
+    if: needs.decide.outputs.run == 'true' && needs.plan.outputs.count != '0' && contains(needs.plan.outputs.sinks, 'stdout')
+    uses: ./.github/workflows/ci-stdout.yml
+    with:
+      profile: ${{ needs.decide.outputs.profile }}
+      matrix: ${{ needs.plan.outputs.stdout }}
+
+  sink-kafka:
+    name: Integration
+    needs: [decide, plan]
+    if: needs.decide.outputs.run == 'true' && needs.plan.outputs.count != '0' && contains(needs.plan.outputs.sinks, 'kafka')
+    uses: ./.github/workflows/ci-kafka.yml
+    with:
+      profile: ${{ needs.decide.outputs.profile }}
+      matrix: ${{ needs.plan.outputs.kafka }}
+
+  sink-doris:
+    name: Integration
+    needs: [decide, plan]
+    if: needs.decide.outputs.run == 'true' && needs.plan.outputs.count != '0' && contains(needs.plan.outputs.sinks, 'doris')
+    uses: ./.github/workflows/ci-doris.yml
+    with:
+      profile: ${{ needs.decide.outputs.profile }}
+      matrix: ${{ needs.plan.outputs.doris }}
+
+  sink-elasticsearch:
+    name: Integration
+    needs: [decide, plan]
+    if: needs.decide.outputs.run == 'true' && needs.plan.outputs.count != '0' && contains(needs.plan.outputs.sinks, 'elasticsearch')
+    uses: ./.github/workflows/ci-elasticsearch.yml
+    with:
+      profile: ${{ needs.decide.outputs.profile }}
+      matrix: ${{ needs.plan.outputs.elasticsearch }}
+
+  sink-postgresql:
+    name: Integration
+    needs: [decide, plan]
+    if: needs.decide.outputs.run == 'true' && needs.plan.outputs.count != '0' && contains(needs.plan.outputs.sinks, 'postgresql')
+    uses: ./.github/workflows/ci-postgresql.yml
+    with:
+      profile: ${{ needs.decide.outputs.profile }}
+      matrix: ${{ needs.plan.outputs.postgresql }}
+
+  # Single required check: fail on any real failure, pass on skipped/no-op.
+  #
+  # Every concrete job gets its own line, read from the API rather than `needs`
+  # (that context carries a result and nothing else, and one `sink-*` entry
+  # expands into a matrix). Status and wall clock come from each job, so MySQL
+  # 5.7/8.0 and ES 7/8/9 stay separate; `needs` is still what the check
+  # succeeds or fails on.
+  result:
+    name: Result
+    if: always()
+    needs:
+      - decide
+      - plan
+      - go-check
+      - sink-mysql
+      - sink-stdout
+      - sink-kafka
+      - sink-doris
+      - sink-elasticsearch
+      - sink-postgresql
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      # Reading this run's job list is what turns its results into a clock.
+      actions: read
+    steps:
+      - name: Aggregate
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from datetime import datetime
+
+          # Every job in this run reports on its own row. A reusable workflow
+          # gives a sink row the flat name "CI / Integration / MySQL -> Doris
+          # 2.1.x"; an entry job is its literal ci.yml name (e.g. "Decide run").
+          # The display strips the shared "CI / Integration / " and "CI / "
+          # prefixes, folds the three gate jobs to short labels, and keeps the
+          # full-width arrow the sink rows use. Status and clock come straight
+          # from the API, so nothing is merged: MySQL 5.7 and 8.0, and ES 7/8/9,
+          # stay separate. A job with no clock (skipped) still shows its status.
+          ORDER = (
+              "decide",
+              "plan",
+              "Build + Lint + Test",
+              "MySQL \u2192 MySQL 5.7",
+              "MySQL \u2192 MySQL 8.0",
+              "MySQL \u2192 Kafka",
+              "MySQL \u2192 Doris 2.1.x",
+              "MySQL \u2192 Elasticsearch 7",
+              "MySQL \u2192 Elasticsearch 8",
+              "MySQL \u2192 Elasticsearch 9",
+              "MySQL \u2192 PostgreSQL 16",
+              "MySQL \u2192 stdout",
+          )
+
+          GATE_LABELS = (
+              ("decide", "decide"),
+              ("plan", "plan"),
+              ("build + lint + test", "Build + Lint + Test"),
+          )
+
+
+          def display_name(raw: str) -> str:
+              """Strip the shared prefixes, then fold a gate job to its label."""
+              name = raw
+              for prefix in ("CI / Integration / ", "CI / "):
+                  if name.startswith(prefix):
+                      name = name[len(prefix):]
+                      break
+              low = name.lower()
+              for frag, label in GATE_LABELS:
+                  if low.startswith(frag):
+                      return label
+              return name
+
+
+          def human(seconds: float) -> str:
+              """45s, 1m, 1m23s, 1h1m20s: drop the zero units, keep the last one."""
+              hours, rest = divmod(int(round(seconds)), 3600)
+              minutes, secs = divmod(rest, 60)
+              parts = []
+              if hours:
+                  parts.append(f"{hours}h")
+              if minutes:
+                  parts.append(f"{minutes}m")
+              if secs or not parts:
+                  parts.append(f"{secs}s")
+              return "".join(parts)
+
+
+          def job_rows():
+              """One (display, status, seconds) row per job, plus the whole span."""
+              api = (f"repos/{os.environ['REPO']}/actions/runs/"
+                     f"{os.environ['RUN_ID']}/jobs?per_page=100")
+              try:
+                  out = subprocess.run(
+                      ["gh", "api", api, "--paginate", "--jq",
+                       ".jobs[] | [.name, .started_at, .completed_at, .conclusion]"
+                       " | @tsv"],
+                      check=True, capture_output=True, text=True).stdout
+              except (OSError, subprocess.CalledProcessError) as exc:
+                  # A missing clock must never fail a required check.
+                  detail = getattr(exc, "stderr", "") or exc
+                  print(f"::warning::job timings unavailable: {detail}",
+                        file=sys.stderr)
+                  return [], (None, None)
+
+              rows = []
+              begin = end = None
+              for raw in out.splitlines():
+                  name, started, done, conclusion = (raw.split("\t") + ["", "", ""])[:4]
+                  if not conclusion:
+                      continue  # this job (still running), or never scheduled
+                  display = display_name(name)
+                  if display.lower() == "result":
+                      continue  # this very job, whatever the API calls it
+                  seconds = None
+                  if started and done:
+                      first = datetime.fromisoformat(started.replace("Z", "+00:00"))
+                      last = datetime.fromisoformat(done.replace("Z", "+00:00"))
+                      seconds = (last - first).total_seconds()
+                      begin = first if begin is None else min(begin, first)
+                      end = last if end is None else max(end, last)
+                  rows.append((display, conclusion, seconds))
+
+              rows.sort(key=lambda row: ORDER.index(row[0])
+                        if row[0] in ORDER else len(ORDER))
+              return rows, (begin, end)
+
+
+          needs = json.loads(os.environ["NEEDS"])
+          rows, (begin, end) = job_rows()
+
+          # Pad the names so the colons line up, then finish with the total.
+          width = max((len(display) for display, _, _ in rows), default=0)
+          lines = []
+          for display, status, seconds in rows:
+              took = f" ({human(seconds)})" if seconds is not None else ""
+              lines.append(f"{display.ljust(width)}: {status}{took}")
+          if begin is not None and end is not None:
+              # Wall clock from the first job started to the last finished; it is
+              # shorter than the sum because concurrent jobs overlap.
+              lines.append(f"total: {human((end - begin).total_seconds())}")
+
+          text = "\n".join(lines)
+          if lines:
+              print(text)
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          if summary_path and lines:
+              # A fenced block keeps the alignment intact in the Step Summary.
+              with open(summary_path, "a", encoding="utf-8") as summary:
+                  summary.write("```\n" + text + "\n```\n")
+
+          # "skipped" is expected: an unaffected sink, a deduped push, or a
+          # docs-only diff (empty matrix) all land here. "cancelled" is also
+          # tolerated: on a non-default branch concurrency.cancel-in-progress
+          # is on, so a newer commit on the same PR supersedes this run and
+          # the aggregate job still fires (if: always()) and finds its
+          # upstream needs marked cancelled. That is a cancellation semantic,
+          # not a code failure - do not paint a red X on the Checks page for
+          # it. A real failure ("failure" or "neutral") still trips the check.
+          allowed = {"success", "skipped", "cancelled"}
+          problems = {
+              name: job.get("result")
+              for name, job in needs.items()
+              if job.get("result") not in allowed
+          }
+          if problems:
+              print(f"::error::CI failed: {problems}", file=sys.stderr)
+              sys.exit(1)
+          PY

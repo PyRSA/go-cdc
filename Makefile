@@ -4,18 +4,9 @@ GO ?= go
 GOLANGCI_LINT_VERSION ?= v2.1.6
 
 .PHONY: all build test unit fmt fmt-check lint clean \
-	integration-up integration-test integration-down \
-	integration-kafka-up integration-kafka-test \
-	integration-doris-up integration-doris-test integration-doris-down \
-	integration-doris-scale-normal integration-doris-scale-heavy \
-	integration-scale-normal integration-scale-heavy \
-	integration-es-up integration-es-down integration-es-integration \
-	integration-es-e2e integration-es-load \
-	integration-es-scale-normal integration-es-scale-heavy \
-	integration-es7-up integration-es7-down integration-es7-integration \
-	integration-es7-e2e-up integration-es7-e2e \
-	integration-es9-up integration-es9-down integration-es9-integration \
-	integration-es9-e2e-up integration-es9-e2e
+	it-mysql it-stdout it-kafka it-doris it-es it-es7 it-es9 it-pg \
+	it-pg14 it-pg15 it-pg16 it-pg17 it-pg18 \
+	it-down it-check it-plan
 
 build:
 	$(GO) build -o bin/go-cdc ./cmd/go-cdc
@@ -46,109 +37,96 @@ ensure-golangci-lint:
 		$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
 	fi
 
-# Docker MySQL e2e (project-specific; analogous to go-mysql test-local).
-integration-up:
-	bash test/integration/scripts/mysql-up.sh
+# --------------------------------------------------------------- integration
+# Docker-backed suites. Every sink goes through ONE entry point, which owns the
+# stack (setup + wait), the build, the seed and the report:
+#
+#   bash tests/integration/scripts/run.sh <sink> [profile] [variant] [suites]
+#
+#   make it-mysql                        # correctness tier
+#   make it-mysql PROFILE=heavy          # + load/scale
+#   make it-mysql VARIANT=57             # the other side of the version matrix
+#   make it-es VARIANT=es9 SUITES=go,func
+#   make it-pg14 PROFILE=heavy
+#   make it-down SINK=postgresql         # tear one stack down
+#
+# PROFILE  normal (default) | heavy
+# VARIANT  57|80 · pg14..pg18 · es7|es8|es9 · 2.1.x   (empty = sink default)
+# SUITES   comma list that overrides the tier default (e.g. SUITES=func)
+#
+# The scripts live in tests/integration/scripts/ (setup.sh, wait.sh,
+# teardown.sh, run.sh); CI calls exactly the same entry point, so local and CI
+# cannot drift.
+IT       ?= tests/integration
+PROFILE  ?= normal
+VARIANT  ?=
+SUITES   ?=
+SINK     ?= mysql
+PATHS    ?= connector/sink/mysql/sink.go
+RUN      ?= bash $(IT)/scripts/run.sh
+DOWN     ?= bash $(IT)/scripts/teardown.sh
+# The variant is quoted so an empty VARIANT still occupies the third slot; the
+# suite list is positional #4 of run.sh and must not slide into it.
+RUN_IT   ?= $(RUN) "$(1)" "$(PROFILE)" "$(VARIANT)" $(SUITES)
 
-integration-test:
-	bash test/integration/scripts/run-e2e.sh
+it-mysql:
+	$(call RUN_IT,mysql)
 
-integration-down:
-	bash test/integration/scripts/mysql-down.sh
+it-stdout:
+	$(call RUN_IT,stdout)
 
-# MySQL + Kafka sink IT (compose kafka service; report docs/test/reports/mysql-kafka.md).
-integration-kafka-up: integration-up
-	bash test/integration/scripts/kafka-up.sh
+# kafka_it covers the load/peak test points itself; the tier only resizes them.
+it-kafka:
+	$(call RUN_IT,kafka)
 
-integration-kafka-test:
-	bash test/integration/scripts/run-kafka-e2e.sh
+# Doris FE/BE run on the host network and need the kernel knobs setup.sh raises.
+it-doris:
+	$(call RUN_IT,doris)
 
-# MySQL → Doris pipeline + sink Go IT (Linux host network; see test/integration/README.md).
-# Requires kernel knobs (inotify watches + vm.max_map_count); doris-up.sh prints the sudo lines.
-integration-doris-up: integration-up
-	bash test/integration/scripts/doris-up.sh
+# ES8 is the default variant; the adapter nodes are es7/es9.
+it-es:
+	$(RUN) elasticsearch "$(PROFILE)" "$(if $(VARIANT),$(VARIANT),es8)" $(SUITES)
 
-integration-doris-test:
-	bash test/integration/scripts/run-doris-e2e.sh
+# v7/v9 adapter nodes are correctness-only (go + func), whatever the tier.
+it-es7:
+	$(RUN) elasticsearch "$(PROFILE)" es7 $(SUITES)
 
-integration-doris-down:
-	bash test/integration/scripts/doris-down.sh
-	bash test/integration/scripts/mysql-down.sh
+it-es9:
+	$(RUN) elasticsearch "$(PROFILE)" es9 $(SUITES)
 
-integration-doris-scale-normal:
-	bash test/integration/scripts/run-doris-scale.sh normal
+it-pg:
+	$(RUN) postgresql "$(PROFILE)" "$(if $(VARIANT),$(VARIANT),pg16)" $(SUITES)
 
-integration-doris-scale-heavy:
-	bash test/integration/scripts/run-doris-scale.sh heavy
+# One target per supported major; heavy also runs the 14..18 compat matrix.
+it-pg14:
+	$(RUN) postgresql "$(PROFILE)" pg14 $(SUITES)
 
-integration-scale-normal:
-	bash test/integration/scale/run-scale.sh normal
+it-pg15:
+	$(RUN) postgresql "$(PROFILE)" pg15 $(SUITES)
 
-integration-scale-heavy:
-	bash test/integration/scale/run-scale.sh heavy
+it-pg16:
+	$(RUN) postgresql "$(PROFILE)" pg16 $(SUITES)
 
-# Elasticsearch 8 sink suites. All of them need `integration-es-up` (compose ES8)
-# plus the MySQL service; reports land in docs/test/reports/.
-integration-es-up: integration-up
-	bash test/integration/scripts/es-up.sh
+it-pg17:
+	$(RUN) postgresql "$(PROFILE)" pg17 $(SUITES)
 
-integration-es-down:
-	bash test/integration/scripts/es-down.sh
+it-pg18:
+	$(RUN) postgresql "$(PROFILE)" pg18 $(SUITES)
 
-# Go-level sink/runner IT against a real cluster (build tag esintegration).
-integration-es-integration:
-	bash test/integration/scripts/run-es-integration.sh
+# Containers + volumes of one sink; the harness's own trap already does this
+# after a local run, so this is the escape hatch for an interrupted one.
+it-down:
+	$(DOWN) "$(SINK)" "$(VARIANT)"
 
-integration-es-e2e:
-	bash test/integration/scripts/run-es-e2e.sh
+# Offline: harness unit tests (pytest walks tests/integration as one tree) plus
+# the diff -> matrix planner, which is what decides what CI runs.
+it-check:
+	python3 -m pytest -q $(IT) tools/ci/test_plan.py
 
-integration-es-load:
-	bash test/integration/scripts/run-es-load.sh
-
-integration-es-scale-normal:
-	bash test/integration/scripts/run-es-scale.sh normal
-
-# Stress profile: 10 source DBs + 50k rows/hotspot + 45s peak. Explicit opt-in.
-integration-es-scale-heavy:
-	bash test/integration/scripts/run-es-scale.sh heavy
-
-# Elasticsearch 7 (v7 client adapter): the Go-level sink IT needs only ES7.
-integration-es7-up:
-	bash test/integration/scripts/es7-up.sh
-
-integration-es7-down:
-	bash test/integration/scripts/es7-down.sh
-
-integration-es7-integration:
-	bash test/integration/scripts/run-es7-integration.sh
-
-# ES7 CDC e2e: the ES8 harness with sink.version=7, so it needs MySQL as well.
-# MYSQL_UP_SERVICES keeps the ES8 node and Kafka out of this run.
-integration-es7-e2e-up:
-	MYSQL_UP_SERVICES=mysql bash test/integration/scripts/mysql-up.sh
-	bash test/integration/scripts/es7-up.sh
-
-integration-es7-e2e:
-	bash test/integration/scripts/run-es7-e2e.sh
-
-# Elasticsearch 9 (v9 client adapter): the Go-level sink IT needs only ES9.
-integration-es9-up:
-	bash test/integration/scripts/es9-up.sh
-
-integration-es9-down:
-	bash test/integration/scripts/es9-down.sh
-
-integration-es9-integration:
-	bash test/integration/scripts/run-es9-integration.sh
-
-# ES9 CDC e2e: the same harness with sink.version=9, so it needs MySQL as well.
-# MYSQL_UP_SERVICES keeps the ES8 node and Kafka out of this run.
-integration-es9-e2e-up:
-	MYSQL_UP_SERVICES=mysql bash test/integration/scripts/mysql-up.sh
-	bash test/integration/scripts/es9-up.sh
-
-integration-es9-e2e:
-	bash test/integration/scripts/run-es9-e2e.sh
+# Print the matrix a change would produce, e.g.
+#   make it-plan PATHS="connector/sink/kafka/sink.go"
+it-plan:
+	python3 tools/ci/plan.py --paths $(PATHS) --profile $(PROFILE)
 
 clean:
 	$(GO) clean -i ./...

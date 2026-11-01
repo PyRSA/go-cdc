@@ -359,8 +359,8 @@ incompatibility is reported even if another table already validated.
 ## Tests
 
 Four layers, mirroring the MySQL sink suites. All of them live under
-`test/integration/` and share the harness conventions documented in
-[test/integration/README.md](../../test/integration/README.md).
+`tests/integration/` and share the harness conventions documented in
+[tests/integration/README.md](../../tests/integration/README.md).
 
 ```bash
 # 1. unit tests (fake client; no cluster required) - the default `go test` path
@@ -370,29 +370,29 @@ go test ./connector/sink/elasticsearch/... ./composer/ -count=1
 go test ./...
 
 # 2. Integration: Go sink/runner against a real ES8 (build tag `esintegration`)
-make integration-es-up              # compose: MySQL + Elasticsearch 8.15 (security off)
-make integration-es-integration     # go test -tags esintegration ./connector/sink/elasticsearch/
+make it-es              # compose: MySQL + Elasticsearch 8.15 (security off)
+make it-es     # go test -tags esintegration ./connector/sink/elasticsearch/
 
 # 2b. Integration of the v7 adapter against a real ES7.17 (same build tag)
-make integration-es7-up             # compose: Elasticsearch 7.17 on 127.0.0.1:19201
-make integration-es7-integration    # only TestElasticsearch7* (v7 client, no MySQL)
-make integration-es7-down
+make it-es7             # compose: Elasticsearch 7.17 on 127.0.0.1:19201
+make it-es7    # only TestElasticsearch7* (v7 client, no MySQL)
+make it-es7
 
 # 2c. Integration of the v9 adapter against a real ES9.5 (same build tag)
-make integration-es9-up             # compose: Elasticsearch 9.5 on 127.0.0.1:19202
-make integration-es9-integration    # only TestElasticsearch9* (v9 client, no MySQL)
-make integration-es9-down
+make it-es9             # compose: Elasticsearch 9.5 on 127.0.0.1:19202
+make it-es9    # only TestElasticsearch9* (v9 client, no MySQL)
+make it-es9
 
 # 3. E2E: MySQL binlog -> runner -> ES8 (snapshot, DML, route/transform,
 #    checkpoint restart, mapping conflict, consistency)
-make integration-es-e2e
+make it-es2e
 
 # 4. Load: seeded 50k rows/table, mixed DML, batch sweep, peak writers
-make integration-es-load
+make it-es PROFILE=heavy SUITES=func,load
 
 # 5. Scale: normal is CI-sized, heavy is an explicit stress run
-make integration-es-scale-normal
-make integration-es-scale-heavy     # 10 DBs / 50k rows per hotspot / 45s peak
+make it-es SUITES=go,func,scale
+make it-es PROFILE=heavy     # 10 DBs / 50k rows per hotspot / 45s peak
 ```
 
 What each layer proves:
@@ -408,7 +408,7 @@ What each layer proves:
 Notes:
 
 - Verification always reads documents back (`_search`/scroll/`_mget`/`_count`) and
-  compares them with an independent oracle (`harness/es_verify.py`); a bulk HTTP
+  compares them with an independent oracle (`sinks/elasticsearch/harness/es_verify.py`); a bulk HTTP
   200 is never treated as proof of content. `_count` is only used as a progress
   gate, and bulk/scaled checks paginate (scroll, 1000 docs/page), never the
   default 10k window.

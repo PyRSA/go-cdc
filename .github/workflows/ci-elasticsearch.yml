@@ -1,0 +1,85 @@
+# Reusable sink workflow: Elasticsearch.
+#
+# Three variants share one compose file; ES7 and ES9 sit behind compose
+# profiles, so the variant only decides which node starts and which Go test
+# build tag pattern runs.
+#
+#   profile  normal | heavy -> go,func,load,scale on es8 (es7/es9: go,func)
+#            The suite list is identical in both tiers; only the writer count
+#            and the timeouts follow the tier. es7/es9 are correctness nodes of
+#            the variant dimension, not a tier cut.
+#   variant  es8 | es7 | es9 -> ES_SINK_VERSION + host port (19200/1/2)
+name: CI / Integration
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: "Run tier: normal | heavy"
+        required: true
+        type: string
+      matrix:
+        description: 'Rows owned by this sink, e.g. {"include": [{"sink": "elasticsearch", "variant": "es8"}]}'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  run:
+    name: MySQL → Elasticsearch ${{ fromJSON('{"es7":"7","es8":"8","es9":"9"}')[matrix.variant || 'es8'] }}
+    runs-on: ubuntu-latest
+    # es8 runs its load and scale suites in every tier, so `normal` needs the
+    # same order of magnitude as `heavy`; the tier changes the writer count and
+    # the suite timeouts, not which suites run.
+    timeout-minutes: ${{ inputs.profile == 'heavy' && 300 || 240 }}
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.profile == 'heavy' && 2 || 6 }}
+      # An empty string means "no rows"; strategy.matrix still needs an object.
+      matrix: ${{ fromJSON(inputs.matrix || '{"include":[]}') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install client tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends mysql-client
+          python3 -m pip install -r tests/integration/common/requirements.txt
+
+      # Elasticsearch refuses to boot with the runner default (65530 mmap areas).
+      # setup.sh raises kernel limits only for Doris, so do it here.
+      - name: Raise vm.max_map_count
+        run: sudo sysctl -w vm.max_map_count=262144
+
+      # setup starts the variant's node behind its compose profile, run only
+      # executes the suites (IT_SKIP_SETUP=1), teardown always fires.
+      - name: Setup stack
+        run: bash tests/integration/scripts/setup.sh elasticsearch "${{ matrix.variant }}" "${{ inputs.profile }}"
+
+      - name: Run suites
+        env:
+          IT_SKIP_SETUP: "1"
+        run: |
+          set -euo pipefail
+          bash tests/integration/scripts/run.sh elasticsearch "${{ inputs.profile }}" "${{ matrix.variant }}"
+
+      # Teardown passes both profiles: the ES7/ES9 nodes are not stopped by a
+      # plain `down` and would keep holding their host port.
+      - name: Teardown
+        if: always()
+        run: bash tests/integration/scripts/teardown.sh elasticsearch "${{ matrix.variant }}"

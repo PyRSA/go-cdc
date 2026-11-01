@@ -1,0 +1,13 @@
+# Line endings: the repository is LF, and the working tree is kept LF too.
+#
+# Without this, a Windows clone with `core.autocrlf=true` checks text files out
+# with CRLF. gofmt / goimports then treat every line as modified, so `make lint`
+# and `make fmt-check` fail locally while CI (Linux, LF) stays green.
+#
+# `text=auto` lets Git detect text vs binary per file (binaries are left alone);
+# `eol=lf` pins the checkout form so the result is the same on every platform.
+* text=auto eol=lf
+
+# Shell scripts must never be CRLF: a CRLF shebang line, or a CRLF after a `\`
+# line continuation, breaks bash on Linux.
+*.sh text eol=lf

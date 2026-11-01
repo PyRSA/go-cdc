@@ -5,7 +5,7 @@
 ## 0. Overview
 
 - Run time: 2026-10-11 21:46:36
-- MySQL：`127.0.0.1:13306`（default-time-zone=UTC）
+- MySQL: `127.0.0.1:13306` (default-time-zone=UTC)
 - CDC `server-time-zone`: Asia/Shanghai; assert session: `+08:00`
 - Source: `db_tp_types_src.tpd01_types` → sink: `db_tp_types_snk.tpd01_types_out`
 - **Summary: pass 4 / fail 0 / total 4** → **all passed**

@@ -1,0 +1,455 @@
+#!/usr/bin/env bash
+# One entry point for a sink run: containers, build, seed, suites, report.
+#
+#   bash scripts/run.sh <sink> [profile] [variant] [suites] [test-point...]
+#
+#   sink       mysql | stdout | kafka | doris | elasticsearch | postgresql
+#   profile    normal | heavy      (default: normal)
+#   variant    57 | 80 | pg14..pg18 | es7|es8|es9 | 2.1.8   (default: sink default)
+#   suites     comma list that replaces the tier default, e.g. `func` or
+#              `func,scale`; `IT_SUITES` is the env spelling of the same thing
+#   test-point anything after that is forwarded to the suite (e.g. `E2E-03`)
+#
+# Pass an empty string for a positional you want to skip, so the next one keeps
+# its slot: `run.sh mysql normal '' func`.
+#
+# The version matrix is never dropped: the variant is mapped to MYSQL_TAG /
+# MYSQL_IMAGE, PG_IMAGE / PG_EXPECT_MAJOR, ES_SINK_VERSION or DORIS_VERSION by
+# `logger.sh: it_apply_variant`, called twice so it works across the process
+# boundary: once here, in this process (the suites below read ES_URL,
+# ES_SINK_VERSION and PG_EXPECT_MAJOR themselves), and once by setup.sh in its
+# own child process (it needs the image names to start the stack). There is no
+# second copy of that table - change it in logger.sh only.
+#
+# Profile tiers (what CI's `normal` / `heavy` mean):
+#
+#             suites                                    load / scale knobs
+#   normal    every suite of the sink (and variant)     100k rows, 50k hotspot, 60 s peak, 4 writers
+#   heavy     identical to normal                       100k rows, 50k hotspot, 60 s peak, 8 writers
+#
+# The tier never changes which suites run, only their size: the writer count and
+# the two timeouts. es7/es9 run `go,func` because they are adapter-compatibility
+# nodes - that is the variant dimension deciding, not the tier.
+#
+# The one tier asymmetry that is NOT a suite change: heavy widens the PostgreSQL
+# VERSION matrix (plan.py lists pg14..pg18 for heavy, just pg16 for normal) so the
+# compat majors run as parallel CI jobs. The `compat` suite below therefore
+# exercises only the version this row brings up rather than looping all five in
+# one process; normal keeps the single default major to hold down the PR gate.
+#
+# The seed volume, the peak duration and the hotspot burst are deliberately NOT
+# tiered: they are the shape of the measurement, not its cost, so a `normal`
+# report has to be readable against a `heavy` one. Only the peak writer count and
+# the two timeouts follow the profile (see the tier block below).
+#
+# Examples:
+#   bash scripts/run.sh mysql normal 57          # func + types + load + scale on MySQL 5.7
+#   bash scripts/run.sh postgresql normal pg14   # every PG suite against PostgreSQL 14
+#   bash scripts/run.sh elasticsearch heavy es8  # go + e2e + load + scale
+#   IT_SUITES=func bash scripts/run.sh kafka     # a single suite
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+IT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ROOT="$(cd "${IT}/../.." && pwd)"
+WORKDIR="${IT}/workdir"
+mkdir -p "${WORKDIR}" "${ROOT}/docs/test/reports"
+# shellcheck source=tests/integration/scripts/logger.sh
+source "${SCRIPT_DIR}/logger.sh"
+
+SINK="${1:-}"
+PROFILE="${2:-normal}"
+VARIANT="${3:-}"
+SUITES_ARG="${4:-}"
+if [ -z "${SINK}" ]; then
+  echo "usage: run.sh <sink> [profile] [variant] [suites] [test-point...]" >&2
+  exit 2
+fi
+# Anything past the fourth positional is handed to the suite (test-point ids).
+EXTRA=()
+if [ "$#" -gt 4 ]; then
+  EXTRA=("${@:5}")
+fi
+
+case "${PROFILE}" in
+  normal | heavy) ;;
+  *)
+    log "error: unknown profile '${PROFILE}' (use normal or heavy)" >&2
+    exit 2
+    ;;
+esac
+
+# ------------------------------------------------------------------- tier knobs
+# One table for both tiers so a report can be compared across runs: the numbers
+# are the same order of magnitude as the historical CI jobs, and every value is
+# still overridable from the environment.
+if [ "${PROFILE}" = "heavy" ]; then
+  TIER_PEAK_WORKERS=8
+  TIER_CATCHUP_BUDGET=5400
+  TIER_SCALE_TIMEOUT=7200
+else
+  TIER_PEAK_WORKERS=4
+  TIER_CATCHUP_BUDGET=1800
+  TIER_SCALE_TIMEOUT=2400
+fi
+# Identical in both tiers on purpose: these three are the shape of the measurement
+# (`LOAD_ROWS_PER_TABLE` seeds every suite, `peak seconds` is how long the writers
+# run, `SCALE_BURST_ROWS_PER_HOT` is the hotspot their burst creates), so a smaller
+# `normal` value silently produced a different experiment rather than a cheaper
+# one. Keep them out of the if/else above.
+TIER_ROWS=100000
+TIER_PEAK_SECONDS=60
+TIER_HOTSPOT_ROWS=50000
+
+# Which sink is under test: config.py reads this to pick sinks/<sink>/fixtures.
+export CDC_SINK="${SINK}"
+export IT_PROFILE="${PROFILE}"
+export IT_VARIANT="${VARIANT}"
+
+# The same variant table setup.sh uses. setup.sh is a child process, so its own
+# exports die with it; the suites here read ES_URL / ES_SINK_VERSION /
+# PG_EXPECT_MAJOR themselves, so resolve them in this process as well.
+it_apply_variant "${SINK}" "${VARIANT}"
+
+# Same child-process problem for the Doris FE address. In CI the stack is raised
+# by a separate workflow step, so whatever setup.sh exported while waiting for FE
+# is gone by the time the suites run here; the Go suite reads DORIS_HOST from the
+# environment and refuses to skip under CI, so resolve it in this process.
+if [ "${SINK}" = "doris" ]; then
+  it_doris_endpoint
+fi
+
+# ES7/ES9 keep their own report and checkpoints: locally the three variants run
+# back to back, so a shared file would let the last run overwrite the previous
+# result. CI does not need the separation (one runner and one artifact per
+# variant), but it costs nothing and keeps `make it-es7 && make it-es9` honest.
+case "${SINK}:${VARIANT:-es8}" in
+  elasticsearch:7 | elasticsearch:es7)
+    export REPORT_ES="${REPORT_ES:-${ROOT}/docs/test/reports/mysql-elasticsearch7.md}"
+    export CHECKPOINT_ES_DIR="${CHECKPOINT_ES_DIR:-${WORKDIR}/ckpts-es7}"
+    export CHECKPOINT_ES_RESTART_DIR="${CHECKPOINT_ES_RESTART_DIR:-${WORKDIR}/ckpts-es7-restart}"
+    ;;
+  elasticsearch:9 | elasticsearch:es9)
+    export REPORT_ES="${REPORT_ES:-${ROOT}/docs/test/reports/mysql-elasticsearch9.md}"
+    export CHECKPOINT_ES_DIR="${CHECKPOINT_ES_DIR:-${WORKDIR}/ckpts-es9}"
+    export CHECKPOINT_ES_RESTART_DIR="${CHECKPOINT_ES_RESTART_DIR:-${WORKDIR}/ckpts-es9-restart}"
+    ;;
+esac
+
+# `docker compose` calls made by a harness (pg_it restarts the server) resolve
+# the stack from the environment instead of a compose file in the cwd.
+export COMPOSE_PROJECT_NAME="$(it_project_name "${SINK}")"
+export COMPOSE_FILE="$(it_compose_file_list "${SINK}")"
+
+export MYSQL_HOST="${MYSQL_HOST:-127.0.0.1}"
+export MYSQL_PORT="${MYSQL_PORT:-13306}"
+# Anonymous principals (must match sources/mysql/init/01-databases.sql).
+export SRC_USER="${SRC_USER:-u_a7k9m2x4}"
+export SRC_PASSWORD="${SRC_PASSWORD:-P_w8q3n5v1r6}"
+export SINK_USER="${SINK_USER:-u_b3j6c8y1}"
+export SINK_PASSWORD="${SINK_PASSWORD:-P_z2h5t9k4m7}"
+export ROOT_USER="${ROOT_USER:-root}"
+export ROOT_PASSWORD="${ROOT_PASSWORD:-rootpass}"
+
+export GO_CDC="${GO_CDC:-${WORKDIR}/go-cdc}"
+if [ -n "${CDC_CLI:-}" ]; then
+  export GO_CDC="${CDC_CLI}"
+fi
+absolutize_go_cdc
+
+# Load knobs (mysql func/load, kafka, doris and the ES/PG load suites share them).
+# The peak duration is 60s in both tiers (see the tier table at the top): only the
+# writer count follows the profile.
+export LOAD_PROFILE="${LOAD_PROFILE:-${PROFILE}}"
+export LOAD_ROWS_PER_TABLE="${LOAD_ROWS_PER_TABLE:-${TIER_ROWS}}"
+export LOAD_LARGE_ROWS="${LOAD_LARGE_ROWS:-50}"
+export LOAD_LARGE_FIELD_BYTES="${LOAD_LARGE_FIELD_BYTES:-2097152}"
+export LOAD_PEAK_SECONDS="${LOAD_PEAK_SECONDS:-${TIER_PEAK_SECONDS}}"
+export LOAD_PEAK_WORKERS="${LOAD_PEAK_WORKERS:-${TIER_PEAK_WORKERS}}"
+export LOAD_PEAK_BATCH="${LOAD_PEAK_BATCH:-200}"
+export LOAD_PARALLELISM="${LOAD_PARALLELISM:-${LOAD_PEAK_WORKERS}}"
+
+# Scale knobs. PEAK_CATCHUP_BUDGET_S / SCALE_TOTAL_TIMEOUT are the "two-tier
+# timeout": a heavy run may wait twice as long on a slower runner. The hotspot
+# size itself does not follow the tier (see the tier table at the top).
+export SCALE_BURST_ROWS_PER_HOT="${SCALE_BURST_ROWS_PER_HOT:-${TIER_HOTSPOT_ROWS}}"
+export SCALE_PEAK_SECONDS="${SCALE_PEAK_SECONDS:-${TIER_PEAK_SECONDS}}"
+export SCALE_PEAK_WORKERS="${SCALE_PEAK_WORKERS:-${TIER_PEAK_WORKERS}}"
+export SCALE_PEAK_BATCH="${SCALE_PEAK_BATCH:-200}"
+export PEAK_CATCHUP_BUDGET_S="${PEAK_CATCHUP_BUDGET_S:-${TIER_CATCHUP_BUDGET}}"
+export SCALE_TOTAL_TIMEOUT="${SCALE_TOTAL_TIMEOUT:-${TIER_SCALE_TIMEOUT}}"
+
+# Checkpoint directories: absolute under tests/integration, wiped per run so a
+# stale ack offset can never turn a failure into a pass.
+export CHECKPOINT_DIR="${CHECKPOINT_DIR:-${WORKDIR}/ckpts}"
+export CHECKPOINT_STDOUT_DIR="${CHECKPOINT_STDOUT_DIR:-${WORKDIR}/ckpts-stdout}"
+export CHECKPOINT_TYPES_DIR="${CHECKPOINT_TYPES_DIR:-${WORKDIR}/ckpts-types}"
+export CHECKPOINT_LOAD_DIR="${CHECKPOINT_LOAD_DIR:-${WORKDIR}/ckpts-load}"
+export CHECKPOINT_KAFKA_DIR="${CHECKPOINT_KAFKA_DIR:-${WORKDIR}/ckpts-kafka}"
+export CHECKPOINT_KAFKA_LOAD_DIR="${CHECKPOINT_KAFKA_LOAD_DIR:-${WORKDIR}/ckpts-kafka-load}"
+export CHECKPOINT_DORIS_DIR="${CHECKPOINT_DORIS_DIR:-${WORKDIR}/ckpts-doris}"
+export CHECKPOINT_DORIS_LOAD_DIR="${CHECKPOINT_DORIS_LOAD_DIR:-${WORKDIR}/ckpts-doris-load}"
+export CHECKPOINT_ES_DIR="${CHECKPOINT_ES_DIR:-${WORKDIR}/ckpts-es}"
+export CHECKPOINT_ES_RESTART_DIR="${CHECKPOINT_ES_RESTART_DIR:-${WORKDIR}/ckpts-es-restart}"
+export CHECKPOINT_ES_LOAD_DIR="${CHECKPOINT_ES_LOAD_DIR:-${WORKDIR}/ckpts-es-load}"
+export CHECKPOINT_PG_DIR="${CHECKPOINT_PG_DIR:-${WORKDIR}/ckpts-pg}"
+export CHECKPOINT_PG_RESTART_DIR="${CHECKPOINT_PG_RESTART_DIR:-${WORKDIR}/ckpts-pg-restart}"
+export CHECKPOINT_PG_LOAD_DIR="${CHECKPOINT_PG_LOAD_DIR:-${WORKDIR}/ckpts-pg-load}"
+export CHECKPOINT_PG_SCALE_DIR="${CHECKPOINT_PG_SCALE_DIR:-${WORKDIR}/ckpts-pg-scale}"
+export CHECKPOINT_PG_BENCH_DIR="${CHECKPOINT_PG_BENCH_DIR:-${WORKDIR}/ckpts-pg-bench}"
+absolutize_checkpoint_dirs
+
+# ---------------------------------------------------------------------- suites
+# Both tiers emit the identical suite list per sink (and per ES variant): the
+# tier only resizes the load/scale knobs and the two timeouts (see the tier
+# table above). Each line stays explicit instead of "run everything and hope".
+default_suites() {
+  local es_variant="${VARIANT:-es8}"
+  case "${SINK}" in
+    mysql)
+      echo "func,types,load,scale"
+      ;;
+    stdout)
+      echo "func"
+      ;;
+    kafka)
+      # kafka_it already covers the load / peak test points; the tier only
+      # changes their size, so there is no separate load suite.
+      echo "func"
+      ;;
+    doris)
+      echo "go,func,scale"
+      ;;
+    elasticsearch)
+      case "${es_variant}" in
+        # The v7/v9 adapter nodes are correctness-only: no load, no scale.
+        es7 | 7 | es9 | 9) echo "go,func" ;;
+        # es8 carries the performance layer in both tiers: the tier changes the
+        # writer count and the timeouts, never which suites run.
+        *) echo "go,func,load,scale" ;;
+      esac
+      ;;
+    postgresql)
+      # `go` is the sink's own Go integration tests (tag postgres_integration),
+      # the correctness floor that talks to the pinned variant server directly.
+      # `compat` attests the core suite per major. Heavy spreads pg14..pg18 across
+      # parallel matrix rows, so compat runs only THIS row's version (see
+      # `pg_compat_suite`) instead of a serial five-container loop; it still runs
+      # last because a version-scoped setup swaps the stack behind it.
+      echo "go,func,load,bench,scale,compat"
+      ;;
+  esac
+}
+
+# Explicit list wins over the tier default; `IT_SUITES` stays supported because
+# the older docs and the harness internals still set it.
+EXPLICIT_SUITES="${IT_SUITES:-${SUITES_ARG}}"
+SUITES="${EXPLICIT_SUITES:-$(default_suites)}"
+SUITES="${SUITES// /}"
+
+# -------------------------------------------------------------------- preflight
+log "==> ${SINK}${VARIANT:+ variant=${VARIANT}} profile=${PROFILE} suites=${SUITES}"
+
+if [ -z "${IT_SKIP_SETUP:-}" ]; then
+  bash "${SCRIPT_DIR}/setup.sh" "${SINK}" "${VARIANT}" "${PROFILE}"
+else
+  log "==> skipping setup.sh (IT_SKIP_SETUP=${IT_SKIP_SETUP})"
+fi
+
+# Local runs own their teardown; CI keeps the containers until the workflow's
+# final `if: always()` step so the report upload never races a `down -v`.
+if [ -z "${CI:-}" ] && [ -z "${GITHUB_ACTIONS:-}" ] && [ -z "${IT_KEEP:-}" ]; then
+  cleanup() {
+    local status=$?
+    log "==> teardown (local run; IT_KEEP=1 keeps the containers)"
+    bash "${SCRIPT_DIR}/teardown.sh" "${SINK}" "${VARIANT}" || true
+    exit "${status}"
+  }
+  trap cleanup EXIT
+fi
+
+log "==> build go-cdc"
+(cd "${ROOT}" && go build -o "${GO_CDC}" ./cmd/go-cdc)
+
+log "==> install harness deps"
+resolve_python_bin
+log "    using ${PYTHON_BIN}"
+"${PYTHON_BIN}" -m pip install -q -r "${IT}/common/requirements.txt"
+
+# ------------------------------------------------------------------------ seed
+mysql_as() {
+  local user="$1" pass="$2"
+  shift 2
+  MYSQL_PWD="${pass}" mysql -h"${MYSQL_HOST}" -P"${MYSQL_PORT}" -u"${user}" \
+    --protocol=TCP "$@"
+}
+
+seed_sql() {
+  local file="$1"
+  [ -f "${file}" ] || return 0
+  log "==> seed ${file#"${IT}/"}"
+  mysql_as "${SRC_USER}" "${SRC_PASSWORD}" <"${file}"
+}
+
+reset_checkpoints() {
+  local name value
+  for name in CHECKPOINT_DIR CHECKPOINT_STDOUT_DIR CHECKPOINT_TYPES_DIR \
+    CHECKPOINT_LOAD_DIR CHECKPOINT_KAFKA_DIR CHECKPOINT_KAFKA_LOAD_DIR \
+    CHECKPOINT_DORIS_DIR CHECKPOINT_DORIS_LOAD_DIR CHECKPOINT_ES_DIR \
+    CHECKPOINT_ES_RESTART_DIR CHECKPOINT_ES_LOAD_DIR CHECKPOINT_PG_DIR \
+    CHECKPOINT_PG_RESTART_DIR CHECKPOINT_PG_LOAD_DIR CHECKPOINT_PG_SCALE_DIR \
+    CHECKPOINT_PG_BENCH_DIR; do
+    value="${!name:-}"
+    [ -n "${value}" ] || continue
+    rm -rf "${value}"
+    mkdir -p "${value}"
+  done
+}
+
+case "${SINK}" in
+  mysql | stdout)
+    # Both sinks share the fixtures under sinks/mysql/fixtures/: seed.sql lays
+    # down the func-suite tables, seed_types.sql the types-suite tables. The
+    # harnesses only read or append to those tables, they do not create them,
+    # so run.sh pipes them in here once before the suites start.
+    reset_checkpoints
+    seed_sql "${IT}/sinks/mysql/fixtures/seed.sql"
+    seed_sql "${IT}/sinks/mysql/fixtures/seed_types.sql"
+    ;;
+  kafka)
+    # The kafka harness expects its source tables to already exist with the
+    # shape the topic-projection test points assume, so seed_kafka.sql carries
+    # that schema/rows and is piped in here once before kafka_it runs.
+    reset_checkpoints
+    seed_sql "${IT}/sinks/kafka/fixtures/seed_kafka.sql"
+    ;;
+  doris)
+    # Same pattern as kafka: seed_doris.sql lays down the source tables the
+    # doris harness captures, and run.sh applies them once before doris_it
+    # runs. The sink-side databases are created by Doris's auto-create-table.
+    reset_checkpoints
+    seed_sql "${IT}/sinks/doris/fixtures/seed_doris.sql"
+    ;;
+  elasticsearch | postgresql)
+    # These suites create and seed their own source databases per test point.
+    reset_checkpoints
+    ;;
+esac
+
+# ------------------------------------------------------------------ dispatch
+cd "${IT}"
+
+go_es() {
+  local pattern="$1"
+  log "==> go: elasticsearch sink (${pattern})"
+  (cd "${ROOT}" && ES_URL="${ES_URL:-http://127.0.0.1:${ES_HOST_PORT:-19200}}" \
+    go test -tags esintegration -count=1 -timeout 20m -v \
+    -run "${pattern}" ./connector/sink/elasticsearch/)
+}
+
+go_doris() {
+  log "==> go: doris sink (doris_integration)"
+  # DORIS_* arrive from it_doris_endpoint above; without DORIS_HOST the suite
+  # fails on CI instead of skipping, which is what turned a missing export into
+  # a red job rather than a green one that never touched Doris.
+  (cd "${ROOT}" && go test -tags doris_integration -count=1 -timeout 20m -v \
+    ./tests/integration/sinks/doris/go/)
+}
+
+go_postgresql() {
+  log "==> go: postgresql sink (postgres_integration)"
+  # connector/sink/postgresql/sink_integration_test.go builds only under the
+  # postgres_integration tag, so `go test ./...` never runs it; without this the
+  # sink's own Go layer (DML, batch rollback, type fidelity, keyless insert, DB->
+  # schema routing, ...) would be silently uncovered. PG_IT_REQUIRED=1 turns a
+  # missing or unreachable server into a failure instead of a suite-wide skip, so
+  # a green run always touched a real PostgreSQL. The DSN matches
+  # sinks/postgresql/docker-compose.yml (cdc_it, created by POSTGRES_DB); each
+  # case builds its own ephemeral schema, so nothing is shared with the suites.
+  local pg_port="${PG_HOST_PORT:-${PG_PORT:-15432}}"
+  (cd "${ROOT}" && PG_IT_REQUIRED=1 \
+    PG_DSN="postgres://${PG_USER:-postgres}:${PG_PASSWORD:-postgres}@127.0.0.1:${pg_port}/${PG_DB:-cdc_it}?sslmode=disable" \
+    go test -tags postgres_integration -count=1 -timeout 10m -v \
+    ./connector/sink/postgresql/)
+}
+
+pg_compat_suite() {
+  # compat exists to attest the shared core suite on every PostgreSQL major.
+  # Heavy now fans pg14..pg18 out into parallel CI matrix rows, each bringing up
+  # exactly one server in the workflow's Setup step, so looping all five majors
+  # again inside this one process is pure duplicated work (and was the ~20m
+  # floor). When a concrete major is pinned as the variant, exercise only that
+  # version - pg_compat takes the major as a positional and runs a single row.
+  # A variant-less local run has no such row, so it keeps the full matrix loop
+  # for developer convenience.
+  local current=""
+  case "${VARIANT:-}" in
+    pg14) current=14 ;;
+    pg15) current=15 ;;
+    pg16) current=16 ;;
+    pg17) current=17 ;;
+    pg18) current=18 ;;
+  esac
+  if [ -n "${current}" ]; then
+    log "==> compat: PostgreSQL ${current} only (matrix row; the majors run in parallel)"
+    "${PYTHON_BIN}" -m sinks.postgresql.harness.pg_compat "${current}"
+  else
+    log "==> compat: full pg14..pg18 matrix (no pinned variant)"
+    "${PYTHON_BIN}" -m sinks.postgresql.harness.pg_compat ${EXTRA[@]+"${EXTRA[@]}"}
+  fi
+}
+
+run_suite() {
+  local suite="$1"
+  case "${SINK}:${suite}" in
+    mysql:func) "${PYTHON_BIN}" -m sinks.mysql.harness.run_it "${EXTRA[@]+"${EXTRA[@]}"}" ;;
+    mysql:types) "${PYTHON_BIN}" -m sinks.mysql.harness.types_it ;;
+    mysql:load) "${PYTHON_BIN}" -m sinks.mysql.harness.load_it ;;
+    mysql:scale) "${PYTHON_BIN}" -m common.scale_it "${PROFILE}" ;;
+    stdout:func) "${PYTHON_BIN}" -m sinks.stdout.harness.stdout_it ;;
+    kafka:func) "${PYTHON_BIN}" -m sinks.kafka.harness.kafka_it ;;
+    doris:go) go_doris ;;
+    doris:func) "${PYTHON_BIN}" -m sinks.doris.harness.doris_it ;;
+    doris:scale) "${PYTHON_BIN}" -m sinks.doris.scale.doris_scale_it "${PROFILE}" --until all ;;
+    elasticsearch:go)
+      case "${VARIANT:-es8}" in
+        es7 | 7) go_es 'TestElasticsearch7' ;;
+        es9 | 9) go_es 'TestElasticsearch9' ;;
+        *) go_es 'TestES' ;;
+      esac
+      ;;
+    elasticsearch:func) "${PYTHON_BIN}" -m sinks.elasticsearch.harness.es_it ;;
+    elasticsearch:load) "${PYTHON_BIN}" -m sinks.elasticsearch.harness.es_load_it ;;
+    elasticsearch:scale)
+      "${PYTHON_BIN}" -m sinks.elasticsearch.scale.es_scale_it "${PROFILE}"
+      ;;
+    postgresql:go) go_postgresql ;;
+    postgresql:func) "${PYTHON_BIN}" -m sinks.postgresql.harness.pg_it "${EXTRA[@]+"${EXTRA[@]}"}" ;;
+    postgresql:load) "${PYTHON_BIN}" -m sinks.postgresql.harness.pg_load_it "${EXTRA[@]+"${EXTRA[@]}"}" ;;
+    postgresql:bench) "${PYTHON_BIN}" -m sinks.postgresql.harness.pg_bench_it "${EXTRA[@]+"${EXTRA[@]}"}" ;;
+    postgresql:compat) pg_compat_suite ;;
+    postgresql:scale)
+      "${PYTHON_BIN}" -m sinks.postgresql.scale.pg_scale_it "${PROFILE}" --until all
+      ;;
+    *)
+      log "error: suite '${suite}' does not exist for sink '${SINK}'" >&2
+      return 2
+      ;;
+  esac
+}
+
+# Every suite runs even after an earlier one fails: the report is worth more
+# than the first non-zero exit, and the final status is still non-zero.
+status=0
+for suite in ${SUITES//,/ }; do
+  log "==> suite ${suite}"
+  if ! run_suite "${suite}"; then
+    status=1
+    log "suite ${suite} FAILED (continuing)"
+  fi
+done
+
+if [ "${status}" -ne 0 ]; then
+  log "==> ${SINK}${VARIANT:+ ${VARIANT}} FAILED"
+  exit "${status}"
+fi
+log "==> ${SINK}${VARIANT:+ ${VARIANT}} passed"

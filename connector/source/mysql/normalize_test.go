@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"database/sql"
+	"reflect"
 	"testing"
 )
 
@@ -78,23 +79,57 @@ func TestIsBinaryType(t *testing.T) {
 }
 
 // TestBothPathsClassifyBinaryColumnsAlike pins the invariant the shared
-// classifier exists for: a column type the snapshot hands over as []byte must
-// also reach the binlog path as []byte, and one the snapshot stringifies must
-// stay a string.
+// classifier exists for: whatever go-mysql hands the binlog path, a type the
+// snapshot sends as []byte must also arrive as []byte, and a type the snapshot
+// stringifies must be passed through untouched.
+//
+// The binlog shape per type is not uniform and the fixture has to say so:
+// go-mysql decodes BINARY/VARBINARY into a Go string, decodes BLOB *and* TEXT
+// into []byte because they share MYSQL_TYPE_BLOB, and leaves the rest as text.
+// Feeding a string to every type would make the TEXT half of this test a
+// tautology, since go-mysql never produces a string for it.
 func TestBothPathsClassifyBinaryColumnsAlike(t *testing.T) {
-	for _, mysqlType := range []string{
-		"binary(4)", "VARBINARY(16)", "blob", "tinyblob", "mediumblob", "longblob",
-		"text", "longtext", "varchar(64)", "char(8)", "json",
-	} {
+	shapes := map[string]any{
+		"binary(4)":     "xy",
+		"VARBINARY(16)": "xy",
+		"blob":          []byte("xy"),
+		"tinyblob":      []byte("xy"),
+		"mediumblob":    []byte("xy"),
+		"longblob":      []byte("xy"),
+		"text":          []byte("xy"),
+		"longtext":      []byte("xy"),
+		"varchar(64)":   "xy",
+		"char(8)":       "xy",
+		"json":          "xy",
+	}
+	for mysqlType, decoded := range shapes {
 		snapshot := typedValue(mysqlType, sql.RawBytes("xy"))
-		row, err := NormalizeRow([]string{"c"}, []any{"xy"}, []string{mysqlType})
+		row, err := NormalizeRow([]string{"c"}, []any{decoded}, []string{mysqlType})
 		if err != nil {
 			t.Fatalf("%s: %v", mysqlType, err)
 		}
 		_, snapshotBinary := snapshot.([]byte)
-		_, binlogBinary := row["c"].([]byte)
-		if snapshotBinary != binlogBinary {
-			t.Fatalf("%s: snapshot []byte=%v but binlog []byte=%v", mysqlType, snapshotBinary, binlogBinary)
+		if snapshotBinary != isBinaryType(mysqlType) {
+			t.Fatalf("%s: snapshot []byte=%v but isBinaryType=%v",
+				mysqlType, snapshotBinary, isBinaryType(mysqlType))
+		}
+		if isBinaryType(mysqlType) {
+			out, ok := row["c"].([]byte)
+			if !ok {
+				t.Fatalf("%s: a byte-carrying column must reach the sink as []byte, got %T",
+					mysqlType, row["c"])
+			}
+			if string(out) != "xy" {
+				t.Fatalf("%s: the bytes must survive the conversion, got %v", mysqlType, out)
+			}
+			continue
+		}
+		// BLOB and TEXT legitimately travel as []byte here and every sink accepts
+		// both shapes, so the contract for a non-binary column is identity: the
+		// classifier must not rewrite what the decoder already chose.
+		if !reflect.DeepEqual(row["c"], decoded) {
+			t.Fatalf("%s: a non-binary value must pass through untouched, got %T %v, want %T %v",
+				mysqlType, row["c"], row["c"], decoded, decoded)
 		}
 	}
 }

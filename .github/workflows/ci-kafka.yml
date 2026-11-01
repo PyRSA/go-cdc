@@ -1,0 +1,71 @@
+# Reusable sink workflow: Kafka (franz-go, at-least-once).
+#
+# kafka_it.py already contains the load and peak test points (they differ only
+# in size between tiers), so both tiers run the single `func` suite.
+#
+#   profile  normal | heavy -> func
+#   variant  empty -> single-node KRaft broker from sinks/kafka/docker-compose.yml
+name: CI / Integration
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: "Run tier: normal | heavy"
+        required: true
+        type: string
+      matrix:
+        description: 'Rows owned by this sink, e.g. {"include": [{"sink": "kafka", "variant": ""}]}'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  run:
+    name: MySQL → Kafka ${{ '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.profile == 'heavy' && 300 || 150 }}
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.profile == 'heavy' && 2 || 6 }}
+      # An empty string means "no rows"; strategy.matrix still needs an object.
+      matrix: ${{ fromJSON(inputs.matrix || '{"include":[]}') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install client tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends mysql-client
+          python3 -m pip install -r tests/integration/common/requirements.txt
+
+      # setup raises the stack and blocks (MySQL + Kafka), run only executes the
+      # suites (IT_SKIP_SETUP=1), teardown always fires.
+      - name: Setup stack
+        run: bash tests/integration/scripts/setup.sh kafka "${{ matrix.variant }}" "${{ inputs.profile }}"
+
+      - name: Run suites
+        env:
+          IT_SKIP_SETUP: "1"
+        run: |
+          set -euo pipefail
+          bash tests/integration/scripts/run.sh kafka "${{ inputs.profile }}" "${{ matrix.variant }}"
+
+      - name: Teardown
+        if: always()
+        run: bash tests/integration/scripts/teardown.sh kafka "${{ matrix.variant }}"

@@ -172,10 +172,10 @@ go-cdc 在 GitHub Actions 中跑自动化 MySQL 集成与规模测试，覆盖�
    - `make fmt-check`
    - `make lint`
    - `make test`
-   - 若改动同步链路，尽量跑集成测试：`make integration-up && make integration-test && make integration-down`
+   - 若改动同步链路，尽量跑集成测试：`make it-mysql && make it-down SINK=mysql`
 4. 在 PR 中说明问题与验证方式。
 
-集成测试说明：[test/integration/README.zh.md](test/integration/README.zh.md)。
+集成测试说明：[tests/integration/README.zh.md](tests/integration/README.zh.md)。
 
 ## 许可
 

@@ -46,7 +46,7 @@ func TestNormalizeIndexNameRewritesIllegalCharacters(t *testing.T) {
 		"_hidden":     "cdc_hidden-" + shortHash("_hidden"),
 		"-dash":       "cdc-dash-" + shortHash("-dash"),
 		"a*b?c":       "a_b_c-" + shortHash("a*b?c"),
-		"订单表":         "cdc" + strings.Repeat("_", len("订单表")) + "-" + shortHash("订单表"),
+		"таблица":     "cdc" + strings.Repeat("_", len("таблица")) + "-" + shortHash("таблица"),
 		"":            "cdc",
 	}
 	for raw, want := range cases {

@@ -1,10 +1,10 @@
 # Types / timezone test notes
 
-Harness: `test/integration/harness/types_it.py`  
-Seed: `test/integration/fixtures/seed_types.sql`  
-Pipeline: `test/integration/fixtures/pipeline.types.yaml.tpl`
+Harness: `tests/integration/sinks/mysql/harness/types_it.py`  
+Seed: `tests/integration/sinks/mysql/fixtures/seed_types.sql`  
+Pipeline: `tests/integration/sinks/mysql/fixtures/pipeline.types.yaml.tpl`
 
-中文版：[TYPES.zh.md](./TYPES.zh.md)
+Chinese: [TYPES.zh.md](./TYPES.zh.md)
 
 ## Why a separate suite
 
@@ -20,7 +20,7 @@ This suite targets those cases. Reports compare column-by-column; a ±8h shift f
 
 | Item | Value |
 |------|-------|
-| MySQL `default-time-zone` | `+00:00` (UTC; see `mysql/conf.d/my.cnf`) |
+| MySQL `default-time-zone` | `+00:00` (UTC; see `sources/mysql/conf.d/my.cnf`) |
 | CDC `source.server-time-zone` | `Asia/Shanghai` |
 | Seed / assert session | `SET time_zone='+08:00'` |
 
@@ -46,16 +46,12 @@ This suite targets those cases. Reports compare column-by-column; a ±8h shift f
 ## How to run
 
 ```bash
-bash test/integration/scripts/mysql-up.sh
-bash test/integration/scripts/run-e2e.sh   # also runs the types harness
+bash tests/integration/scripts/run.sh mysql          # func + types + load
 # Report: docs/test/reports/mysql-mysql-types.md
 ```
 
-Types suite only:
+Types suite only (stack already raised by `setup.sh`):
 
 ```bash
-# Requires seed + built go-cdc
-cd test/integration
-export GO_CDC=./workdir/go-cdc MYSQL_PORT=13306
-python3 -m harness.types_it
+bash tests/integration/scripts/run.sh mysql normal "" types
 ```

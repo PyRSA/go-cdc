@@ -2,14 +2,14 @@
 
 // Elasticsearch 9 integration suite for the v9 client adapter.
 //
-// It reuses the ES 8 harness in es_integration_test.go (same raw HTTP cluster
+// It reuses the ES 8 harness in es8_integration_test.go (same raw HTTP cluster
 // helpers, same production Sink); only the expected server version and the
 // configured sink.version differ. The test names start with "TestElasticsearch9"
 // on purpose: the ES 8 runner filters `-run TestES` and the ES 7 runner filters
 // `-run TestElasticsearch7`, so neither picks these up.
 //
-//	docker compose --profile es9 up -d --wait elasticsearch9   # test/integration
-//	bash test/integration/scripts/run-es9-integration.sh
+//	docker compose --profile es9 up -d --wait elasticsearch9   # tests/integration
+//	bash tests/integration/scripts/run.sh elasticsearch normal es9 go
 //
 // Verified server: Elasticsearch 9.5.x.
 package elasticsearch
