@@ -4,8 +4,8 @@
 # watches, vm.max_map_count); setup.sh raises them with passwordless sudo and
 # fails with an actionable message when it cannot.
 #
-#   profile  normal -> go,func
-#            heavy  -> go,func,scale
+#   profile  normal | heavy -> go,func,scale  (the suite list is identical in
+#            both tiers; only the writer count and the timeouts follow it)
 #   variant  empty | 2.1.x -> DORIS_VERSION (mapped by `logger.sh:
 #            it_apply_variant`, called by run.sh and setup.sh)
 name: CI / Integration

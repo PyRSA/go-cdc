@@ -99,8 +99,10 @@ IGNORE_FILES: frozenset[str] = frozenset(
 IGNORE_SUFFIXES: tuple[str, ...] = (".md",)
 
 # Which variants each sink is exercised on, per profile. The version matrix is
-# never dropped: `normal` covers every supported variant with the correctness
-# suites, `heavy` repeats them and adds the load/scale layer (see run.sh).
+# never dropped: both profiles list the same variants, because the tier does not
+# decide which suites run - that is static per sink in run.sh's default_suites
+# (the PG compat suite walks pg14..pg18 from inside its own run, so a single
+# pg16 row is enough); the tier only resizes writers and timeouts.
 VARIANTS: dict[str, dict[str, tuple[str, ...]]] = {
     "normal": {
         "mysql": ("57", "80"),

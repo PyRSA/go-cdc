@@ -24,14 +24,12 @@
 # Profile tiers (what CI's `normal` / `heavy` mean):
 #
 #             suites                                    load / scale knobs
-#   normal    correctness (+ es8 load/scale)            100k rows, 50k hotspot, 60 s peak, 4 writers
-#   heavy     correctness + load + scale (+ bench)      100k rows, 50k hotspot, 60 s peak, 8 writers
+#   normal    every suite of the sink (and variant)     100k rows, 50k hotspot, 60 s peak, 4 writers
+#   heavy     identical to normal                       100k rows, 50k hotspot, 60 s peak, 8 writers
 #
-# es8 is the one exception to "normal is correctness only": its load and scale
-# suites run in both tiers, because the ES write path has no other coverage and a
-# PR that changes it has to see the numbers. The tier still changes the writer
-# count and the two timeouts, so a normal report stays readable against a heavy
-# one. es7/es9 remain `go,func` - they are adapter-compatibility nodes.
+# The tier never changes which suites run, only their size: the writer count and
+# the two timeouts. es7/es9 run `go,func` because they are adapter-compatibility
+# nodes - that is the variant dimension deciding, not the tier.
 #
 # The seed volume, the peak duration and the hotspot burst are deliberately NOT
 # tiered: they are the shape of the measurement, not its cost, so a `normal`
@@ -39,8 +37,8 @@
 # the two timeouts follow the profile (see the tier block below).
 #
 # Examples:
-#   bash scripts/run.sh mysql normal 57          # func + types + load on MySQL 5.7
-#   bash scripts/run.sh postgresql normal pg14   # E2E suite against PostgreSQL 14
+#   bash scripts/run.sh mysql normal 57          # func + types + load + scale on MySQL 5.7
+#   bash scripts/run.sh postgresql normal pg14   # every PG suite against PostgreSQL 14
 #   bash scripts/run.sh elasticsearch heavy es8  # go + e2e + load + scale
 #   IT_SUITES=func bash scripts/run.sh kafka     # a single suite
 set -euo pipefail
@@ -195,15 +193,14 @@ export CHECKPOINT_PG_BENCH_DIR="${CHECKPOINT_PG_BENCH_DIR:-${WORKDIR}/ckpts-pg-b
 absolutize_checkpoint_dirs
 
 # ---------------------------------------------------------------------- suites
-# `normal` runs the correctness layer only, except es8, which carries its load and
-# scale suites in both tiers (see the tier table above); `heavy` adds the whole
-# performance layer for everything else. Both stay explicit instead of "run
-# everything and hope".
+# Both tiers emit the identical suite list per sink (and per ES variant): the
+# tier only resizes the load/scale knobs and the two timeouts (see the tier
+# table above). Each line stays explicit instead of "run everything and hope".
 default_suites() {
   local es_variant="${VARIANT:-es8}"
   case "${SINK}" in
     mysql)
-      [ "${PROFILE}" = "heavy" ] && echo "func,types,load,scale" || echo "func,types,load"
+      echo "func,types,load,scale"
       ;;
     stdout)
       echo "func"
@@ -214,7 +211,7 @@ default_suites() {
       echo "func"
       ;;
     doris)
-      [ "${PROFILE}" = "heavy" ] && echo "go,func,scale" || echo "go,func"
+      echo "go,func,scale"
       ;;
     elasticsearch)
       case "${es_variant}" in
@@ -226,13 +223,11 @@ default_suites() {
       esac
       ;;
     postgresql)
+      # `go` is the sink's own Go integration tests (tag postgres_integration),
+      # the correctness floor that talks to the pinned variant server directly.
       # `compat` replaces the stack once per major (pg14..pg18 via setup.sh), so
       # it runs last: whatever it leaves behind is then irrelevant to the run.
-      if [ "${PROFILE}" = "heavy" ]; then
-        echo "func,load,bench,scale,compat"
-      else
-        echo "func"
-      fi
+      echo "go,func,load,bench,scale,compat"
       ;;
   esac
 }
@@ -242,17 +237,6 @@ default_suites() {
 EXPLICIT_SUITES="${IT_SUITES:-${SUITES_ARG}}"
 SUITES="${EXPLICIT_SUITES:-$(default_suites)}"
 SUITES="${SUITES// /}"
-
-# MySQL 5.7 is correctness-only in every tier: the scale suite is pinned to the
-# default version so a heavy run does not duplicate the longest job. `5.7` /
-# `5.7.42` are accepted spellings of the same variant, so match all of them.
-case "${SINK}:${VARIANT:-80}" in
-  mysql:57 | mysql:5.7 | mysql:5.7.*)
-    if [ -z "${EXPLICIT_SUITES}" ]; then
-      SUITES="func,types,load"
-    fi
-    ;;
-esac
 
 # -------------------------------------------------------------------- preflight
 log "==> ${SINK}${VARIANT:+ variant=${VARIANT}} profile=${PROFILE} suites=${SUITES}"
@@ -353,6 +337,23 @@ go_doris() {
     ./tests/integration/sinks/doris/go/)
 }
 
+go_postgresql() {
+  log "==> go: postgresql sink (postgres_integration)"
+  # connector/sink/postgresql/sink_integration_test.go builds only under the
+  # postgres_integration tag, so `go test ./...` never runs it; without this the
+  # sink's own Go layer (DML, batch rollback, type fidelity, keyless insert, DB->
+  # schema routing, ...) would be silently uncovered. PG_IT_REQUIRED=1 turns a
+  # missing or unreachable server into a failure instead of a suite-wide skip, so
+  # a green run always touched a real PostgreSQL. The DSN matches
+  # sinks/postgresql/docker-compose.yml (cdc_it, created by POSTGRES_DB); each
+  # case builds its own ephemeral schema, so nothing is shared with the suites.
+  local pg_port="${PG_HOST_PORT:-${PG_PORT:-15432}}"
+  (cd "${ROOT}" && PG_IT_REQUIRED=1 \
+    PG_DSN="postgres://${PG_USER:-postgres}:${PG_PASSWORD:-postgres}@127.0.0.1:${pg_port}/${PG_DB:-cdc_it}?sslmode=disable" \
+    go test -tags postgres_integration -count=1 -timeout 10m -v \
+    ./connector/sink/postgresql/)
+}
+
 run_suite() {
   local suite="$1"
   case "${SINK}:${suite}" in
@@ -377,6 +378,7 @@ run_suite() {
     elasticsearch:scale)
       "${PYTHON_BIN}" -m sinks.elasticsearch.scale.es_scale_it "${PROFILE}"
       ;;
+    postgresql:go) go_postgresql ;;
     postgresql:func) "${PYTHON_BIN}" -m sinks.postgresql.harness.pg_it "${EXTRA[@]+"${EXTRA[@]}"}" ;;
     postgresql:load) "${PYTHON_BIN}" -m sinks.postgresql.harness.pg_load_it "${EXTRA[@]+"${EXTRA[@]}"}" ;;
     postgresql:bench) "${PYTHON_BIN}" -m sinks.postgresql.harness.pg_bench_it "${EXTRA[@]+"${EXTRA[@]}"}" ;;

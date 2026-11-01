@@ -4,8 +4,9 @@
 # runner, so the fixed host port in sources/mysql/docker-compose.yml (13306)
 # never collides between parallel rows.
 #
-#   profile  normal -> func,types,load
-#            heavy  -> func,types,load,scale   (5.7 stays correctness-only)
+#   profile  normal | heavy -> func,types,load,scale  (the suite list is
+#            identical in both tiers, on 5.7 and 8.0 alike; only the writer
+#            count and the timeouts follow the tier)
 #   variant  57 | 80 -> MYSQL_TAG / MYSQL_IMAGE, mapped by `logger.sh:
 #            it_apply_variant` (run.sh and setup.sh both call it)
 name: CI / Integration
@@ -33,7 +34,8 @@ jobs:
   run:
     name: MySQL → MySQL ${{ fromJSON('{"57":"5.7","80":"8.0"}')[matrix.variant] }}
     runs-on: ubuntu-latest
-    # Two-tier timeout: the heavy tier adds the scale suite on the same box.
+    # Two-tier timeout: both tiers run the same suites; heavy only raises the
+    # writer count and the suite timeouts.
     timeout-minutes: ${{ inputs.profile == 'heavy' && 300 || 150 }}
     strategy:
       fail-fast: false

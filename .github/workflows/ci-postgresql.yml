@@ -1,7 +1,8 @@
 # Reusable sink workflow: PostgreSQL.
 #
-#   profile  normal -> func                         (one major, from the variant)
-#            heavy  -> func,load,bench,scale,compat (compat loops pg14..pg18)
+#   profile  normal | heavy -> go,func,load,bench,scale,compat
+#            (the suite list is identical in both tiers; only the writer count
+#             and the timeouts follow the tier; compat loops pg14..pg18)
 #   variant  pg14..pg18 -> PG_IMAGE + PG_EXPECT_MAJOR
 #
 # `compat` runs last on purpose: it restarts the stack once per major through
@@ -31,7 +32,8 @@ jobs:
   run:
     name: MySQL → PostgreSQL ${{ fromJSON('{"pg14":"14","pg15":"15","pg16":"16","pg17":"17","pg18":"18"}')[matrix.variant || 'pg16'] }}
     runs-on: ubuntu-latest
-    # The heavy tier runs the five-major compat matrix, which alone needs ~20m.
+    # Both tiers run the five-major compat matrix, which alone needs ~20m; heavy
+    # additionally doubles the suite timeouts.
     timeout-minutes: ${{ inputs.profile == 'heavy' && 300 || 150 }}
     strategy:
       fail-fast: false

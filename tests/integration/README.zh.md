@@ -7,14 +7,14 @@
 bash tests/integration/scripts/run.sh <sink> [profile] [variant] [suites] [test-point...]
 ```
 
-| Sink | 套件（es8 两档都跑性能层；其他 sink 在 `heavy` 追加） |
+| Sink | 套件（所有 sink 两档都跑全量清单；`heavy` 仅放大峰值写并发与超时） |
 | --- | --- |
-| `mysql` | `func` TP-01..TP-13（`sinks/mysql/harness/run_it.py`）、`types` TP-D01..D04、`load` TP-L01..L04 → `scale` |
+| `mysql` | `func` TP-01..TP-13（`sinks/mysql/harness/run_it.py`）+ `types` TP-D01..D04 + `load` TP-L01..L04 + `scale` —— 四项两档全跑，5.7 与 8.0 一致 |
 | `stdout` | `func` — 共用的 CDC JSON 信封（`sinks/stdout/harness/stdout_it.py`） |
 | `kafka` | `func` TP-K01..TP-K08（`sinks/kafka/harness/kafka_it.py`）；负载/峰值测试点就在套件内部 |
-| `doris` | `go` sink 套件 + `func` TP-DR01..DR07 → `scale` |
-| `elasticsearch` | `go` sink 套件 + `func` + `load` + `scale` —— es8 两档都跑全部四项；es7/es9 仍为 `go`、`func` |
-| `postgresql` | `func` TP-P01..P20 → `load`、`bench`、`scale`、`compat`（PG 14..18） |
+| `doris` | `go` sink 套件 + `func` TP-DR01..DR07 + `scale` —— 三项两档全跑 |
+| `elasticsearch` | `go` sink 套件 + `func` + `load` + `scale` —— es8 两档都跑全部四项；es7/es9 仍为 `go`、`func`（由变体维度决定，不是档位裁剪） |
+| `postgresql` | `go` sink 套件 + `func` TP-P01..P20 + `load`、`bench`、`scale`、`compat`（PG 14..18）—— 六项两档全跑 |
 
 `profile` 决定**跑多少**，`variant` 决定**跑在哪个版本上**（`57`/`80`、`pg14`..`pg18`、`es7`/`es8`/`es9`、
 Doris 的 `2.1.x` tag）。两者都不从环境推断。映射表只有一处：`logger.sh: it_apply_variant`；
@@ -76,8 +76,8 @@ compose 文件是**叠加**的（`-f sources/mysql/… -f sinks/<sink>/…`）�
 ## 快速跑
 
 ```bash
-bash tests/integration/scripts/run.sh mysql             # 正确性档，MySQL 8.0
-bash tests/integration/scripts/run.sh mysql heavy       # + 负载/规模
+bash tests/integration/scripts/run.sh mysql             # 全量套件，MySQL 8.0
+bash tests/integration/scripts/run.sh mysql heavy       # 同一批套件，放大并发与超时
 bash tests/integration/scripts/run.sh mysql normal 57   # 同一批套件跑 5.7
 bash tests/integration/scripts/run.sh postgresql normal pg14
 ls docs/test/reports/
@@ -92,7 +92,7 @@ ls docs/test/reports/
 
 ## 规模套件
 
-`scale` 属于 `heavy` 档，唯一的例外是 es8 —— 它两档都跑。要单独跑就用第 4 个位置参数（或等价的 `IT_SUITES`）：
+`scale` 现在两档都跑，属于每个有规模层的 sink —— 档位只差写并发与超时。要单独跑就用第 4 个位置参数（或等价的 `IT_SUITES`）：
 
 ```bash
 bash tests/integration/scripts/run.sh mysql heavy            # func,types,load,scale
@@ -108,8 +108,8 @@ IT_SUITES=scale bash tests/integration/scripts/run.sh mysql normal
 同一套 profile、同样的表/行分配，目标换成 Doris：
 
 ```bash
-bash tests/integration/scripts/run.sh doris            # go + func
-bash tests/integration/scripts/run.sh doris heavy      # + scale
+bash tests/integration/scripts/run.sh doris            # go + func + scale
+bash tests/integration/scripts/run.sh doris heavy      # 同一批套件，放大并发与超时
 make it-doris PROFILE=heavy
 ```
 
@@ -162,8 +162,8 @@ decide  ->  plan  ->  go-check  ->  ci-<sink>.yml（每个受影响的 sink 一�
 
 | 档位 | 触发 | 跑什么 |
 | --- | --- | --- |
-| `normal` | PR opened / synchronized / reopened，以及推送到其他任一分支 | 每个受支持 variant 的正确性套件（MySQL 5.7 + 8.0、PG 16、ES 8/7/9、Kafka、Doris、stdout），外加 es8 的 load 与 scale 层 |
-| `heavy` | PR 上已打 `ci-heavy`（打完再 push）或 `gh workflow run ci.yml -f profile=heavy`；push 到 `master`/`main` | 同一批套件再加 load / scale / bench / PG 14–18 compat 矩阵（es8 两档都跑 load 与 scale，套件列表相同） |
+| `normal` | PR opened / synchronized / reopened，以及推送到其他任一分支 | 每个受支持 variant 的全量套件清单（MySQL 5.7 + 8.0 `func,types,load,scale`；PG 16 `go,func,load,bench,scale,compat`；Doris `go,func,scale`；ES 8 `go,func,load,scale`；ES 7/9 `go,func`；Kafka、stdout `func`） |
+| `heavy` | PR 上已打 `ci-heavy`（打完再 push）或 `gh workflow run ci.yml -f profile=heavy`；push 到 `master`/`main` | 与 normal 完全相同的套件清单；只有峰值写并发（4 → 8）与规模套件的二级超时（追平预算、总超时）随档位放大 |
 
 每一次 push 与每一个 PR 都是触发条件，`push` 不限定分支。当某次 push 已被一个 open PR 覆盖时，
 `decide` 会置 `run=false`，该次 push 不执行任何作业（`result` 仍报成功）—— 这个 commit 由 PR 的那次
@@ -240,7 +240,7 @@ bash tests/integration/scripts/run.sh doris heavy      # + scale
 | DR06 | 狂写追平：`LOAD_PEAK_*` 并发 INSERT 风暴；Doris 行数收敛到 1% 以内 |
 | DR07 | 批量负载下的类型抽检（int/bigint/decimal/varchar/date/datetime/json/bool） |
 
-负载阶段（DR05–DR07）复用与 mysql→mysql / kafka 负载套件相同的 `LOAD_*` 旋钮与 CI 分档。
+负载阶段（DR05–DR07）复用与 mysql→mysql / kafka 负载套件相同的 `LOAD_*` 旋钮；两档跑同一批套件，只有并发写与超时随档位放大。
 Doris v1 拒绝 BLOB/ENUM/BIT/SET/TIME，因此批量表放在 `db_tp_load_src.tpdl01_*`，只使用可映射类型；
 `tpl01_large` 的大字段用例没有 Doris 对应项。
 
@@ -252,7 +252,7 @@ Doris v1 拒绝 BLOB/ENUM/BIT/SET/TIME，因此批量表放在 `db_tp_load_src.t
 单元 / `httptest` 覆盖；"DDL 已生效但返回错误"也属于该范围。
 
 `sink-doris` job（[`ci-doris.yml`](../../.github/workflows/ci-doris.yml)）启动 MySQL + Doris `2.1.8`
-FE+BE、调高内核参数、执行套件（TP-DR01..DR04、sink Go 套件、`heavy` 档的 Doris 规模），
+FE+BE、调高内核参数、执行套件（TP-DR01..DR04、sink Go 套件、Doris 规模 —— 两档跑同一批套件），
 并上传 Markdown 报告与 `cdc-doris*.log`。
 
 ## Elasticsearch 8 sink 套件
@@ -262,15 +262,15 @@ ES8 sink 与 MySQL sink 对齐的四层测试。共用 MySQL compose、造数器
 `sinks/elasticsearch/harness/es_verify.py`（独立 oracle）。
 
 ```bash
-bash tests/integration/scripts/run.sh elasticsearch                  # es8：go + func
-bash tests/integration/scripts/run.sh elasticsearch heavy            # es8：+ load + scale
+bash tests/integration/scripts/run.sh elasticsearch                  # es8：go + func + load + scale
+bash tests/integration/scripts/run.sh elasticsearch heavy            # es8：同一批套件，放大并发与超时
 bash tests/integration/scripts/run.sh elasticsearch normal es7       # v7 适配器：go + func
 bash tests/integration/scripts/run.sh elasticsearch normal es9       # v9 适配器：go + func
 bash tests/integration/scripts/run.sh elasticsearch normal es8 go    # 只跑 Go IT
 grep -A2 'TP-E' docs/test/reports/mysql-elasticsearch.md
 ```
 
-对应 Make 目标：`make it-es`、`make it-es7`、`make it-es9` —— `make it-es PROFILE=heavy` 是压测档，
+对应 Make 目标：`make it-es`、`make it-es7`、`make it-es9` —— `make it-es PROFILE=heavy` 把写并发与超时放大到压测规模，
 `SUITES=go,func` 收窄范围。
 
 | 层级 | 入口 | 报告 |
@@ -290,7 +290,7 @@ grep -A2 'TP-E' docs/test/reports/mysql-elasticsearch.md
 - 批量参数扫描：TP-EL02 用 `ES_LOAD_BATCH_SIZE` / `ES_LOAD_BATCH_INTERVAL`（默认 `1000` / `500ms`），
   TP-EL03 重启用 `ES_LOAD_SMALL_BATCH` / `ES_LOAD_SMALL_INTERVAL`（默认 `100` / `100ms`）。
   `LOAD_*` 与 MySQL 负载套件共用。
-- 规模复用 `SCALE_TOTAL_ROWS` / `SCALE_WORKERS` / `SCALE_TOTAL_TIMEOUT` 与 `ES_SCALE_RESTART_ROWS`（默认 `100`）。
+- 规模复用 `SCALE_TOTAL_ROWS` / `SCALE_WORKERS` / `SCALE_TOTAL_TIMEOUT`（默认按档位 `1800` / `5400`）与 `ES_SCALE_RESTART_ROWS`（默认 `100`）。
 - `tpl01_typed.c_bit` 在造数后被删除：sink v1 拒绝 `BIT` 列。
 - `write-batch-size` / `write-batch-interval` 是 runner 级旋钮：每次 `Sink.Write` 一个 bulk，
   按大小、按间隔、以及任何 split / position / watermark / captured message 时刷写（`composer/runner.go`）。

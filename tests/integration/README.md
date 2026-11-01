@@ -6,14 +6,14 @@ Local runs and GitHub Actions both start a binlog-enabled MySQL via **Docker Com
 bash tests/integration/scripts/run.sh <sink> [profile] [variant] [suites] [test-point...]
 ```
 
-| Sink | Suites (es8 runs the performance layer in both tiers; the others add it in `heavy`) |
+| Sink | Suites (every sink runs its full list in **both** tiers; `heavy` only raises the writer count and the timeouts) |
 | --- | --- |
-| `mysql` | `func` TP-01..TP-13 (`sinks/mysql/harness/run_it.py`), `types` TP-D01..D04, `load` TP-L01..L04 → `scale` |
+| `mysql` | `func` TP-01..TP-13 (`sinks/mysql/harness/run_it.py`) + `types` TP-D01..D04 + `load` TP-L01..L04 + `scale` — all four in both tiers, on 5.7 and 8.0 alike |
 | `stdout` | `func` — the shared CDC JSON envelope (`sinks/stdout/harness/stdout_it.py`) |
 | `kafka` | `func` TP-K01..TP-K08 (`sinks/kafka/harness/kafka_it.py`); the load/peak points live inside the suite |
-| `doris` | `go` sink suite + `func` TP-DR01..DR07 → `scale` |
-| `elasticsearch` | `go` sink suite + `func` + `load` + `scale` — all four in **both** tiers on es8; es7/es9 stay `go`, `func` |
-| `postgresql` | `func` TP-P01..P20 → `load`, `bench`, `scale`, `compat` (PG 14..18) |
+| `doris` | `go` sink suite + `func` TP-DR01..DR07 + `scale` — all three in both tiers |
+| `elasticsearch` | `go` sink suite + `func` + `load` + `scale` — all four in **both** tiers on es8; es7/es9 stay `go`, `func` (a variant-dimension decision, not a tier cut) |
+| `postgresql` | `go` sink suite + `func` TP-P01..P20 + `load` + `bench` + `scale` + `compat` (PG 14..18) — all six in both tiers |
 
 `profile` decides *how much* runs, `variant` decides *what it runs against*
 (`57`/`80`, `pg14`..`pg18`, `es7`/`es8`/`es9`, a Doris `2.1.x` tag). Neither is
@@ -78,8 +78,8 @@ nothing else.
 ## Quick start
 
 ```bash
-bash tests/integration/scripts/run.sh mysql             # correctness, MySQL 8.0
-bash tests/integration/scripts/run.sh mysql heavy       # + load/scale
+bash tests/integration/scripts/run.sh mysql             # full suite list, MySQL 8.0
+bash tests/integration/scripts/run.sh mysql heavy       # same suites, larger writers + timeouts
 bash tests/integration/scripts/run.sh mysql normal 57   # same suites on 5.7
 bash tests/integration/scripts/run.sh postgresql normal pg14
 ls docs/test/reports/
@@ -98,9 +98,9 @@ upload, so an artifact can never race a `docker compose down`. Escape hatches:
 
 ## Scale suite
 
-`scale` is part of the `heavy` tier for every sink except es8, which runs it in
-both tiers. Ask for it explicitly with the 4th positional (`IT_SUITES` is the env
-spelling of the same thing):
+`scale` runs in **both** tiers for every sink now - the tiers differ only in the
+writer count and the timeouts. Ask for it alone with the 4th positional
+(`IT_SUITES` is the env spelling of the same thing):
 
 ```bash
 bash tests/integration/scripts/run.sh mysql heavy            # func,types,load,scale
@@ -115,8 +115,8 @@ Scale DBs (`db_tp_scale_src_NN` / `db_tp_scale_snk_NN`) are created at runtime b
 Same profiles, same table/row allocation, Doris as the sink:
 
 ```bash
-bash tests/integration/scripts/run.sh doris            # go + func
-bash tests/integration/scripts/run.sh doris heavy      # + scale
+bash tests/integration/scripts/run.sh doris            # go + func + scale
+bash tests/integration/scripts/run.sh doris heavy      # same suites, larger writers + timeouts
 make it-doris PROFILE=heavy
 ```
 
@@ -179,8 +179,8 @@ Tiers:
 
 | Tier | Trigger | What runs |
 | --- | --- | --- |
-| `normal` | PR opened / synchronized / reopened, and a push to any other branch | correctness suites on every supported variant (MySQL 5.7 + 8.0, PG 16, ES 8/7/9, Kafka, Doris, stdout), plus the es8 load and scale layers |
-| `heavy` | `ci-heavy` already on the PR (push after adding it) or `gh workflow run ci.yml -f profile=heavy`; a push to `master`/`main` | the same suites plus load / scale / bench / the PG 14–18 compat matrix (es8 runs load and scale in both tiers, so its suite list is identical) |
+| `normal` | PR opened / synchronized / reopened, and a push to any other branch | the full suite list of every sink on every supported variant (MySQL 5.7 + 8.0 `func,types,load,scale`; PG 16 `go,func,load,bench,scale,compat`; Doris `go,func,scale`; ES 8 `go,func,load,scale`; ES 7/9 `go,func`; Kafka, stdout `func`) |
+| `heavy` | `ci-heavy` already on the PR (push after adding it) or `gh workflow run ci.yml -f profile=heavy`; a push to `master`/`main` | the identical suite list; only the peak writer count (4 -> 8) and the scale timeouts (catch-up budget and total timeout) grow |
 
 Every push and every PR is a trigger; `push` has no branch filter. When a push is
 already covered by an open PR, `decide` sets `run=false` and the push run does no
@@ -247,8 +247,8 @@ raises them automatically in CI). The Go sink suite is skipped unless
 `DORIS_HOST` is set, so a plain `go test ./...` never starts Doris.
 
 ```bash
-bash tests/integration/scripts/run.sh doris            # go + func
-bash tests/integration/scripts/run.sh doris heavy      # + scale
+bash tests/integration/scripts/run.sh doris            # go + func + scale
+bash tests/integration/scripts/run.sh doris heavy      # same suites, larger writers + timeouts
 # report: docs/test/reports/mysql-doris.md
 # Go sink log: tests/integration/workdir/doris-integration.log
 ```
@@ -281,8 +281,8 @@ coverage, and so does a DDL that reports an error after taking effect.
 
 The `sink-doris` job ([`ci-doris.yml`](../../.github/workflows/ci-doris.yml)) starts
 MySQL + Doris `2.1.8` FE+BE, raises the kernel limits, runs the suites
-(TP-DR01..DR04, the sink Go suite, then the Doris scale profile on the `heavy`
-tier) and uploads the Markdown reports plus `cdc-doris*.log`.
+(TP-DR01..DR04, the sink Go suite, then the Doris scale profile - both tiers run
+the same three suites) and uploads the Markdown reports plus `cdc-doris*.log`.
 
 ## Elasticsearch 8 sink suites
 
@@ -292,8 +292,8 @@ compose service, the source generators (`sinks/mysql/harness/load_it.py`,
 (`sinks/elasticsearch/harness/es_client.py` for HTTP, `sinks/elasticsearch/harness/es_verify.py` for the oracle).
 
 ```bash
-bash tests/integration/scripts/run.sh elasticsearch                   # es8: go + func
-bash tests/integration/scripts/run.sh elasticsearch heavy             # es8: + load + scale
+bash tests/integration/scripts/run.sh elasticsearch                   # es8: go + func + load + scale
+bash tests/integration/scripts/run.sh elasticsearch heavy             # es8: same suites, larger writers + timeouts
 bash tests/integration/scripts/run.sh elasticsearch normal es7        # v7 adapter: go + func
 bash tests/integration/scripts/run.sh elasticsearch normal es9        # v9 adapter: go + func
 bash tests/integration/scripts/run.sh elasticsearch normal es8 go     # Go IT only
@@ -323,7 +323,7 @@ Isolation and knobs:
   `ES_LOAD_SMALL_INTERVAL` (default `100` / `100ms`) for the TP-EL03 restart.
   `LOAD_*` knobs are shared with the MySQL load suite.
 - Scale reuses `SCALE_TOTAL_ROWS` / `SCALE_WORKERS` / `SCALE_TOTAL_TIMEOUT`
-  (default `1800`) and `ES_SCALE_RESTART_ROWS` (default `100`).
+  (default `1800` / `5400` per tier) and `ES_SCALE_RESTART_ROWS` (default `100`).
 - `tpl01_typed.c_bit` is dropped after seeding: sink v1 rejects `BIT` columns.
 - `write-batch-size` / `write-batch-interval` are runner-level knobs: one bulk
   per `Sink.Write`, flushed on size, on interval, and on any split / position /

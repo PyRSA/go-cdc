@@ -4,9 +4,10 @@
 # profiles, so the variant only decides which node starts and which Go test
 # build tag pattern runs.
 #
-#   profile  normal -> go,func,load,scale on es8 (es7/es9: go,func)
-#            heavy  -> the same suites; only the writer count and the
-#                      timeouts follow the tier
+#   profile  normal | heavy -> go,func,load,scale on es8 (es7/es9: go,func)
+#            The suite list is identical in both tiers; only the writer count
+#            and the timeouts follow the tier. es7/es9 are correctness nodes of
+#            the variant dimension, not a tier cut.
 #   variant  es8 | es7 | es9 -> ES_SINK_VERSION + host port (19200/1/2)
 name: CI / Integration
 
@@ -33,9 +34,9 @@ jobs:
   run:
     name: MySQL → Elasticsearch ${{ fromJSON('{"es7":"7","es8":"8","es9":"9"}')[matrix.variant || 'es8'] }}
     runs-on: ubuntu-latest
-    # es8 runs its load and scale suites in both tiers, so `normal` needs the same
-    # order of magnitude as `heavy`; the tier changes the writer count and the
-    # suite timeouts, not which suites run.
+    # es8 runs its load and scale suites in every tier, so `normal` needs the
+    # same order of magnitude as `heavy`; the tier changes the writer count and
+    # the suite timeouts, not which suites run.
     timeout-minutes: ${{ inputs.profile == 'heavy' && 300 || 240 }}
     strategy:
       fail-fast: false
