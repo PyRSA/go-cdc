@@ -8,7 +8,7 @@
 #            heavy  -> the same suites; only the writer count and the
 #                      timeouts follow the tier
 #   variant  es8 | es7 | es9 -> ES_SINK_VERSION + host port (19200/1/2)
-name: CI / elasticsearch
+name: CI / Integration
 
 on:
   workflow_call:
@@ -31,7 +31,7 @@ defaults:
 
 jobs:
   run:
-    name: elasticsearch ${{ matrix.variant || 'es8' }}
+    name: MySQL → Elasticsearch ${{ fromJSON('{"es7":"7","es8":"8","es9":"9"}')[matrix.variant || 'es8'] }}
     runs-on: ubuntu-latest
     # es8 runs its load and scale suites in both tiers, so `normal` needs the same
     # order of magnitude as `heavy`; the tier changes the writer count and the
@@ -76,15 +76,6 @@ jobs:
         run: |
           set -euo pipefail
           bash tests/integration/scripts/run.sh elasticsearch "${{ inputs.profile }}" "${{ matrix.variant }}"
-
-      - name: Upload reports
-        if: always() && (inputs.profile == 'heavy' || failure())
-        uses: actions/upload-artifact@v4
-        with:
-          name: reports-elasticsearch-${{ matrix.variant || 'es8' }}-${{ inputs.profile }}
-          path: docs/test/reports/**
-          if-no-files-found: ignore
-          retention-days: 14
 
       # Teardown passes both profiles: the ES7/ES9 nodes are not stopped by a
       # plain `down` and would keep holding their host port.

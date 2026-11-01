@@ -7,7 +7,7 @@
 #   profile  normal | heavy -> func   (no load/scale layer: it writes to a file)
 #   variant  empty -> the default MySQL image (mapped by `logger.sh:
 #            it_apply_variant`, called by run.sh and setup.sh)
-name: CI / stdout
+name: CI / Integration
 
 on:
   workflow_call:
@@ -30,7 +30,7 @@ defaults:
 
 jobs:
   run:
-    name: stdout
+    name: MySQL → Stdout ${{ '' }}
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.profile == 'heavy' && 300 || 150 }}
     strategy:
@@ -67,15 +67,6 @@ jobs:
         run: |
           set -euo pipefail
           bash tests/integration/scripts/run.sh stdout "${{ inputs.profile }}" "${{ matrix.variant }}"
-
-      - name: Upload reports
-        if: always() && (inputs.profile == 'heavy' || failure())
-        uses: actions/upload-artifact@v4
-        with:
-          name: reports-stdout-${{ matrix.variant || 'default' }}-${{ inputs.profile }}
-          path: docs/test/reports/**
-          if-no-files-found: ignore
-          retention-days: 14
 
       - name: Teardown
         if: always()

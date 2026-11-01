@@ -8,7 +8,7 @@
 #            heavy  -> func,types,load,scale   (5.7 stays correctness-only)
 #   variant  57 | 80 -> MYSQL_TAG / MYSQL_IMAGE, mapped by `logger.sh:
 #            it_apply_variant` (run.sh and setup.sh both call it)
-name: CI / mysql
+name: CI / Integration
 
 on:
   workflow_call:
@@ -31,7 +31,7 @@ defaults:
 
 jobs:
   run:
-    name: mysql ${{ matrix.variant || 'default' }}
+    name: MySQL → MySQL ${{ fromJSON('{"57":"5.7","80":"8.0"}')[matrix.variant] }}
     runs-on: ubuntu-latest
     # Two-tier timeout: the heavy tier adds the scale suite on the same box.
     timeout-minutes: ${{ inputs.profile == 'heavy' && 300 || 150 }}
@@ -74,15 +74,6 @@ jobs:
         run: |
           set -euo pipefail
           bash tests/integration/scripts/run.sh mysql "${{ inputs.profile }}" "${{ matrix.variant }}"
-
-      - name: Upload reports
-        if: always() && (inputs.profile == 'heavy' || failure())
-        uses: actions/upload-artifact@v4
-        with:
-          name: reports-mysql-${{ matrix.variant || 'default' }}-${{ inputs.profile }}
-          path: docs/test/reports/**
-          if-no-files-found: ignore
-          retention-days: 14
 
       # Containers are torn down once, here, and only after the report upload.
       - name: Teardown

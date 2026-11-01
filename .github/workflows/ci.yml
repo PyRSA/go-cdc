@@ -4,8 +4,8 @@
 #   plan     git diff -> {"include": [{"sink": ..., "variant": ...}]}
 #   go-check fmt + lint + unit tests + build + offline Python tests (pytest)
 #   sink-*   one reusable workflow per sink, fed only the rows it owns
-#   result   aggregate; `skipped` (and an empty matrix) is a success, and each
-#            stage is reported with the wall clock it took
+#   result   aggregate; `skipped` (and an empty matrix) is a success, and every
+#            concrete job is reported on its own line with the clock it took
 #
 # Profile precedence (the only place it is computed):
 #   workflow_dispatch.input  >  `ci-heavy` label on the PR  >  push to master/main
@@ -140,7 +140,7 @@ jobs:
   # The diff -> matrix contract lives in tools/ci/plan.py (unit-tested there).
   # fetch-depth: 0 is what makes `git diff <base sha> HEAD` work on a PR.
   plan:
-    name: Plan
+    name: Plan / Select tests and validate CI
     needs: decide
     if: needs.decide.outputs.run == 'true'
     runs-on: ubuntu-latest
@@ -204,7 +204,7 @@ jobs:
   # Fast gate before the container jobs: formatting, lint, unit tests, build and
   # the offline Python suites (pytest walks tests/integration as one tree).
   go-check:
-    name: Build + lint + test
+    name: Build + Lint + Test
     needs: [decide, plan]
     if: needs.decide.outputs.run == 'true'
     runs-on: ubuntu-latest
@@ -258,7 +258,7 @@ jobs:
   # Kafka-only change never starts the PostgreSQL matrix. `skipped` means "not
   # affected" and the result job counts it as success.
   sink-mysql:
-    name: MySQL
+    name: Integration
     needs: [decide, plan]
     if: needs.decide.outputs.run == 'true' && needs.plan.outputs.count != '0' && contains(needs.plan.outputs.sinks, 'mysql')
     uses: ./.github/workflows/ci-mysql.yml
@@ -267,7 +267,7 @@ jobs:
       matrix: ${{ needs.plan.outputs.mysql }}
 
   sink-stdout:
-    name: stdout
+    name: Integration
     needs: [decide, plan]
     if: needs.decide.outputs.run == 'true' && needs.plan.outputs.count != '0' && contains(needs.plan.outputs.sinks, 'stdout')
     uses: ./.github/workflows/ci-stdout.yml
@@ -276,7 +276,7 @@ jobs:
       matrix: ${{ needs.plan.outputs.stdout }}
 
   sink-kafka:
-    name: Kafka
+    name: Integration
     needs: [decide, plan]
     if: needs.decide.outputs.run == 'true' && needs.plan.outputs.count != '0' && contains(needs.plan.outputs.sinks, 'kafka')
     uses: ./.github/workflows/ci-kafka.yml
@@ -285,7 +285,7 @@ jobs:
       matrix: ${{ needs.plan.outputs.kafka }}
 
   sink-doris:
-    name: Doris
+    name: Integration
     needs: [decide, plan]
     if: needs.decide.outputs.run == 'true' && needs.plan.outputs.count != '0' && contains(needs.plan.outputs.sinks, 'doris')
     uses: ./.github/workflows/ci-doris.yml
@@ -294,7 +294,7 @@ jobs:
       matrix: ${{ needs.plan.outputs.doris }}
 
   sink-elasticsearch:
-    name: Elasticsearch
+    name: Integration
     needs: [decide, plan]
     if: needs.decide.outputs.run == 'true' && needs.plan.outputs.count != '0' && contains(needs.plan.outputs.sinks, 'elasticsearch')
     uses: ./.github/workflows/ci-elasticsearch.yml
@@ -303,7 +303,7 @@ jobs:
       matrix: ${{ needs.plan.outputs.elasticsearch }}
 
   sink-postgresql:
-    name: PostgreSQL
+    name: Integration
     needs: [decide, plan]
     if: needs.decide.outputs.run == 'true' && needs.plan.outputs.count != '0' && contains(needs.plan.outputs.sinks, 'postgresql')
     uses: ./.github/workflows/ci-postgresql.yml
@@ -313,10 +313,11 @@ jobs:
 
   # Single required check: fail on any real failure, pass on skipped/no-op.
   #
-  # The durations come from the API, not from `needs`: that context carries a
-  # result and nothing else, and one `sink-*` entry expands into a matrix of
-  # jobs. A stage is therefore measured from its earliest instance's start to
-  # its latest instance's finish, which is what the run actually waited for.
+  # Every concrete job gets its own line, read from the API rather than `needs`
+  # (that context carries a result and nothing else, and one `sink-*` entry
+  # expands into a matrix). Status and wall clock come from each job, so MySQL
+  # 5.7/8.0 and ES 7/8/9 stay separate; `needs` is still what the check
+  # succeeds or fails on.
   result:
     name: Result
     if: always()
@@ -350,22 +351,48 @@ jobs:
           import sys
           from datetime import datetime
 
-          # Job display name -> the `needs` key it reports under. A reusable
-          # workflow prefixes its own job names with the caller's ("Doris /
-          # doris default"), so only the part before the slash matters. A stale
-          # entry costs one missing duration and never a red check: every
-          # timing below is optional.
-          ALIASES = {
-              "decide run": "decide",
-              "plan": "plan",
-              "build + lint + test": "go-check",
-              "mysql": "sink-mysql",
-              "stdout": "sink-stdout",
-              "kafka": "sink-kafka",
-              "doris": "sink-doris",
-              "elasticsearch": "sink-elasticsearch",
-              "postgresql": "sink-postgresql",
-          }
+          # Every job in this run reports on its own row. A reusable workflow
+          # gives a sink row the flat name "CI / Integration / MySQL -> Doris
+          # 2.1.x"; an entry job is its literal ci.yml name (e.g. "Decide run").
+          # The display strips the shared "CI / Integration / " and "CI / "
+          # prefixes, folds the three gate jobs to short labels, and keeps the
+          # full-width arrow the sink rows use. Status and clock come straight
+          # from the API, so nothing is merged: MySQL 5.7 and 8.0, and ES 7/8/9,
+          # stay separate. A job with no clock (skipped) still shows its status.
+          ORDER = (
+              "decide",
+              "plan",
+              "Build + Lint + Test",
+              "MySQL \u2192 MySQL 5.7",
+              "MySQL \u2192 MySQL 8.0",
+              "MySQL \u2192 Kafka",
+              "MySQL \u2192 Doris 2.1.x",
+              "MySQL \u2192 Elasticsearch 7",
+              "MySQL \u2192 Elasticsearch 8",
+              "MySQL \u2192 Elasticsearch 9",
+              "MySQL \u2192 PostgreSQL 16",
+              "MySQL \u2192 stdout",
+          )
+
+          GATE_LABELS = (
+              ("decide", "decide"),
+              ("plan", "plan"),
+              ("build + lint + test", "Build + Lint + Test"),
+          )
+
+
+          def display_name(raw: str) -> str:
+              """Strip the shared prefixes, then fold a gate job to its label."""
+              name = raw
+              for prefix in ("CI / Integration / ", "CI / "):
+                  if name.startswith(prefix):
+                      name = name[len(prefix):]
+                      break
+              low = name.lower()
+              for frag, label in GATE_LABELS:
+                  if low.startswith(frag):
+                      return label
+              return name
 
 
           def human(seconds: float) -> str:
@@ -382,39 +409,70 @@ jobs:
               return "".join(parts)
 
 
-          def stage_spans() -> dict:
-              """Earliest start to latest finish, per `needs` key."""
+          def job_rows():
+              """One (display, status, seconds) row per job, plus the whole span."""
               api = (f"repos/{os.environ['REPO']}/actions/runs/"
                      f"{os.environ['RUN_ID']}/jobs?per_page=100")
               try:
                   out = subprocess.run(
                       ["gh", "api", api, "--paginate", "--jq",
-                       ".jobs[] | [.name, .started_at, .completed_at] | @tsv"],
+                       ".jobs[] | [.name, .started_at, .completed_at, .conclusion]"
+                       " | @tsv"],
                       check=True, capture_output=True, text=True).stdout
               except (OSError, subprocess.CalledProcessError) as exc:
                   # A missing clock must never fail a required check.
                   detail = getattr(exc, "stderr", "") or exc
                   print(f"::warning::job timings unavailable: {detail}",
                         file=sys.stderr)
-                  return {}
+                  return [], (None, None)
 
-              spans = {}
-              for row in out.splitlines():
-                  name, started, done = (row.split("\t") + ["", ""])[:3]
-                  if not started or not done:
-                      continue  # skipped, or this job, which is still running
-                  key = ALIASES.get(name.split(" / ")[0].strip().lower())
-                  if key is None:
-                      continue
-                  first = datetime.fromisoformat(started.replace("Z", "+00:00"))
-                  last = datetime.fromisoformat(done.replace("Z", "+00:00"))
-                  begin, end = spans.get(key, (first, last))
-                  spans[key] = (min(begin, first), max(end, last))
-              return spans
+              rows = []
+              begin = end = None
+              for raw in out.splitlines():
+                  name, started, done, conclusion = (raw.split("\t") + ["", "", ""])[:4]
+                  if not conclusion:
+                      continue  # this job (still running), or never scheduled
+                  display = display_name(name)
+                  if display.lower() == "result":
+                      continue  # this very job, whatever the API calls it
+                  seconds = None
+                  if started and done:
+                      first = datetime.fromisoformat(started.replace("Z", "+00:00"))
+                      last = datetime.fromisoformat(done.replace("Z", "+00:00"))
+                      seconds = (last - first).total_seconds()
+                      begin = first if begin is None else min(begin, first)
+                      end = last if end is None else max(end, last)
+                  rows.append((display, conclusion, seconds))
+
+              rows.sort(key=lambda row: ORDER.index(row[0])
+                        if row[0] in ORDER else len(ORDER))
+              return rows, (begin, end)
 
 
           needs = json.loads(os.environ["NEEDS"])
-          spans = stage_spans()
+          rows, (begin, end) = job_rows()
+
+          # Pad the names so the colons line up, then finish with the total.
+          width = max((len(display) for display, _, _ in rows), default=0)
+          lines = []
+          for display, status, seconds in rows:
+              took = f" ({human(seconds)})" if seconds is not None else ""
+              lines.append(f"{display.ljust(width)}: {status}{took}")
+          if begin is not None and end is not None:
+              # Wall clock from the first job started to the last finished; it is
+              # shorter than the sum because concurrent jobs overlap.
+              lines.append(f"total: {human((end - begin).total_seconds())}")
+
+          text = "\n".join(lines)
+          if lines:
+              print(text)
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          if summary_path and lines:
+              # A fenced block keeps the alignment intact in the Step Summary.
+              with open(summary_path, "a", encoding="utf-8") as summary:
+                  summary.write("```\n" + text + "\n```\n")
+
           # "skipped" is expected: an unaffected sink, a deduped push, or a
           # docs-only diff (empty matrix) all land here. Only a real failure,
           # or a cancellation, may fail this check.
@@ -424,18 +482,7 @@ jobs:
               for name, job in needs.items()
               if job.get("result") not in allowed
           }
-          for name, job in needs.items():
-              span = spans.get(name)
-              took = f" ({human((span[1] - span[0]).total_seconds())})" if span else ""
-              print(f"{name}: {job.get('result')}{took}")
-          if spans:
-              # What the run cost from the first stage it started to the last it
-              # finished, which is shorter than the sum because they overlap.
-              begin = min(first for first, _ in spans.values())
-              end = max(last for _, last in spans.values())
-              print(f"total: {human((end - begin).total_seconds())}")
           if problems:
               print(f"::error::CI failed: {problems}", file=sys.stderr)
               sys.exit(1)
-          print("CI passed (failures: none)")
           PY

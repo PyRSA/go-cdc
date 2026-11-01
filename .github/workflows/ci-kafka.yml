@@ -5,7 +5,7 @@
 #
 #   profile  normal | heavy -> func
 #   variant  empty -> single-node KRaft broker from sinks/kafka/docker-compose.yml
-name: CI / kafka
+name: CI / Integration
 
 on:
   workflow_call:
@@ -28,7 +28,7 @@ defaults:
 
 jobs:
   run:
-    name: kafka
+    name: MySQL → Kafka ${{ '' }}
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.profile == 'heavy' && 300 || 150 }}
     strategy:
@@ -65,15 +65,6 @@ jobs:
         run: |
           set -euo pipefail
           bash tests/integration/scripts/run.sh kafka "${{ inputs.profile }}" "${{ matrix.variant }}"
-
-      - name: Upload reports
-        if: always() && (inputs.profile == 'heavy' || failure())
-        uses: actions/upload-artifact@v4
-        with:
-          name: reports-kafka-${{ matrix.variant || 'default' }}-${{ inputs.profile }}
-          path: docs/test/reports/**
-          if-no-files-found: ignore
-          retention-days: 14
 
       - name: Teardown
         if: always()

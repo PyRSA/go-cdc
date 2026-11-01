@@ -6,7 +6,7 @@
 #
 # `compat` runs last on purpose: it restarts the stack once per major through
 # setup.sh, so it is the only suite allowed to change what is running.
-name: CI / postgresql
+name: CI / Integration
 
 on:
   workflow_call:
@@ -29,7 +29,7 @@ defaults:
 
 jobs:
   run:
-    name: postgresql ${{ matrix.variant || 'pg16' }}
+    name: MySQL → PostgreSQL ${{ fromJSON('{"pg14":"14","pg15":"15","pg16":"16","pg17":"17","pg18":"18"}')[matrix.variant || 'pg16'] }}
     runs-on: ubuntu-latest
     # The heavy tier runs the five-major compat matrix, which alone needs ~20m.
     timeout-minutes: ${{ inputs.profile == 'heavy' && 300 || 150 }}
@@ -68,15 +68,6 @@ jobs:
         run: |
           set -euo pipefail
           bash tests/integration/scripts/run.sh postgresql "${{ inputs.profile }}" "${{ matrix.variant }}"
-
-      - name: Upload reports
-        if: always() && (inputs.profile == 'heavy' || failure())
-        uses: actions/upload-artifact@v4
-        with:
-          name: reports-postgresql-${{ matrix.variant || 'pg16' }}-${{ inputs.profile }}
-          path: docs/test/reports/**
-          if-no-files-found: ignore
-          retention-days: 14
 
       - name: Teardown
         if: always()

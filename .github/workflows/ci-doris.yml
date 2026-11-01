@@ -8,7 +8,7 @@
 #            heavy  -> go,func,scale
 #   variant  empty | 2.1.x -> DORIS_VERSION (mapped by `logger.sh:
 #            it_apply_variant`, called by run.sh and setup.sh)
-name: CI / doris
+name: CI / Integration
 
 on:
   workflow_call:
@@ -31,7 +31,7 @@ defaults:
 
 jobs:
   run:
-    name: doris ${{ matrix.variant || 'default' }}
+    name: MySQL → Doris ${{ matrix.variant || '2.1.x' }}
     runs-on: ubuntu-latest
     # Doris needs ~3 min just to register the BE before a suite starts.
     timeout-minutes: ${{ inputs.profile == 'heavy' && 300 || 150 }}
@@ -69,15 +69,6 @@ jobs:
         run: |
           set -euo pipefail
           bash tests/integration/scripts/run.sh doris "${{ inputs.profile }}" "${{ matrix.variant }}"
-
-      - name: Upload reports
-        if: always() && (inputs.profile == 'heavy' || failure())
-        uses: actions/upload-artifact@v4
-        with:
-          name: reports-doris-${{ matrix.variant || 'default' }}-${{ inputs.profile }}
-          path: docs/test/reports/**
-          if-no-files-found: ignore
-          retention-days: 14
 
       # Also removes workdir/doris (the FE meta image cannot be reused across
       # runs; setup.sh recreates the bind directories).
