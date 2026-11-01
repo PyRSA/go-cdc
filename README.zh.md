@@ -162,7 +162,7 @@ go-cdc 在 GitHub Actions 中跑自动化 MySQL 集成与规模测试，覆盖�
 取决于 CI 环境、MySQL 配置、负载与测试参数。
 
 完整工况、方法与 CI 明细见
-[性能压测：MySQL → MySQL（E2E）](docs/performance/mysql-to-mysql-e2e.md)。
+[性能压测](docs/performance/)。
 
 ## 如何贡献
 

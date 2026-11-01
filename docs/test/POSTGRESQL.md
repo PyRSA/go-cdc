@@ -361,7 +361,10 @@ bash tests/integration/scripts/run.sh postgresql normal pg16 scale
 PG_SCALE_HEAVY=1 bash tests/integration/scripts/run.sh postgresql heavy pg16 scale
 
 # compatibility matrix / benchmark
-bash tests/integration/scripts/run.sh postgresql heavy pg16 compat              # 14 15 16 17 18
+bash tests/integration/scripts/run.sh postgresql heavy pg16 compat              # PG 16 only (matrix row)
+# To run the full 14–18 matrix in one shot: omit the variant (empty string) and
+# call the harness directly — five serial versions, for local use only.
+# python3 -m sinks.postgresql.harness.pg_compat
 bash tests/integration/scripts/run.sh postgresql heavy pg16 bench --list        # the 6 cells, nothing runs
 bash tests/integration/scripts/run.sh postgresql heavy pg16 bench --dry-run     # report with 6 × NOT RUN
 bash tests/integration/scripts/run.sh postgresql heavy pg16 bench
@@ -405,7 +408,7 @@ decide  ->  plan  ->  go-check  ->  sink-postgresql  ->  result
 |---|---|---|
 | `decide` | every event | drops a push that an open PR already covers (`run=false`), and is the only place the tier is computed (`workflow_dispatch` input > `ci-heavy` on the PR > default-branch push > `normal`) |
 | `plan` | after `decide` | `tools/ci/plan.py`: a diff touching `connector/sink/postgresql/`, `tests/integration/sinks/postgresql/`, `configs/demo-postgresql.yaml` or `.github/workflows/ci-postgresql.yml` yields `{"include": [{"sink": "postgresql", "variant": "pg16"}]}` (a docs-only diff yields `{"include": []}`) |
-| `go-check` | `normal` + `heavy` | `gofmt`, `golangci-lint`, `make test` (includes the `postgres_integration`-tagged unit tests that need no server), build, `pytest tests/integration tools/ci/test_plan.py`, `bash -n` over every script |
+| `go-check` | `normal` + `heavy` | `gofmt`, `golangci-lint`, `make test` (includes the `postgres_integration`-tagged unit tests that need no server), build, `make it-check`, `bash -n` over every script |
 | `sink-postgresql` | re-runs `ci-postgresql.yml` with `profile` + matrix | `run.sh postgresql <profile> pg16` — see the tier table below |
 | `result` | always | the single required check; `skipped` and an empty matrix both count as success |
 
@@ -413,8 +416,8 @@ Tiers:
 
 | Tier | Trigger | Suites |
 |---|---|---|
-| `normal` | PR opened / synchronized / reopened, and a push to any other branch | `func` — TP-P01…TP-P20 on PostgreSQL 16 |
-| `heavy` | `ci-heavy` already on the PR (push after adding it) or `gh workflow run ci.yml -f profile=heavy`; push to `main`/`master` | `func,load,bench,scale,compat` — `compat` runs last because it replaces the stack once per major (14…18) |
+| `normal` | PR opened / synchronized / reopened, and a push to any other branch | the same suite list as `heavy` — `go,func,load,bench,scale,compat` — on PostgreSQL 16; only the writer count (4) and the scale timeouts are smaller |
+| `heavy` | `ci-heavy` already on the PR (push after adding it) or `gh workflow run ci.yml -f profile=heavy`; push to `main`/`master` | `go,func,load,bench,scale,compat`, fanned across pg14..pg18 as five parallel matrix rows; `compat` runs last because it replaces the stack for the matrix row's major |
 
 Layering rules the workflow enforces:
 
@@ -425,10 +428,12 @@ Layering rules the workflow enforces:
   so it cannot start by accident.
 - One compose project per sink (`gocdc-postgresql-mysql`, the source is always
   part of it), deliberately *not* per
-  variant: `compat` loops pg14…pg18 inside a single job and each iteration calls
-  `setup.sh`, which does `down -v` first — otherwise the previous major would keep
-  holding host port `13306`. Each job still owns its containers, volumes,
-  checkpoint directories and report files.
+  variant: in CI, `heavy` fans pg14..pg18 out into five parallel matrix rows, so
+  each row's `compat` suite exercises only its own major. A bare `compat`
+  invocation (no variant) loops all five serially and is meant for local use only;
+  each iteration calls `setup.sh`, which does `down -v` first — otherwise the
+  previous major would keep holding host port `13306`. Each job still owns its
+  containers, volumes, checkpoint directories and report files.
 - Each harness step maps the exit code to an annotation (`0` notice, `2` **ENV
   BLOCKED** error, anything else **FAIL** error) and then exits with the same
   status: an unusable environment is a red job.

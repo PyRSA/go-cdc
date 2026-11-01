@@ -370,22 +370,20 @@ go test ./connector/sink/elasticsearch/... ./composer/ -count=1
 go test ./...
 
 # 2. Integration: Go sink/runner against a real ES8 (build tag `esintegration`)
-make it-es              # compose: MySQL + Elasticsearch 8.15 (security off)
-make it-es     # go test -tags esintegration ./connector/sink/elasticsearch/
+# `make it-es` with no SUITES runs the full default list (go,func,load,scale)
+# against a compose stack of MySQL + Elasticsearch 8.15 (security off); pin
+# SUITES to trim it. `make it-es SUITES=go` runs only the Go IT.
+make it-es SUITES=go    # Go IT only (-tags esintegration), not func/load/scale
 
 # 2b. Integration of the v7 adapter against a real ES7.17 (same build tag)
-make it-es7             # compose: Elasticsearch 7.17 on 127.0.0.1:19201
-make it-es7    # only TestElasticsearch7* (v7 client, no MySQL)
-make it-es7
+make it-es7             # setup + go TestElasticsearch7* + teardown, in one shot
 
 # 2c. Integration of the v9 adapter against a real ES9.5 (same build tag)
-make it-es9             # compose: Elasticsearch 9.5 on 127.0.0.1:19202
-make it-es9    # only TestElasticsearch9* (v9 client, no MySQL)
-make it-es9
+make it-es9             # setup + go TestElasticsearch9* + teardown, in one shot
 
 # 3. E2E: MySQL binlog -> runner -> ES8 (snapshot, DML, route/transform,
 #    checkpoint restart, mapping conflict, consistency)
-make it-es2e
+make it-es SUITES=go,func   # Go IT + E2E func in one setup
 
 # 4. Load: seeded 50k rows/table, mixed DML, batch sweep, peak writers
 make it-es PROFILE=heavy SUITES=func,load
