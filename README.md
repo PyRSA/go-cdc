@@ -181,7 +181,7 @@ treated as vendor-grade benchmarks. Results depend on the CI environment,
 MySQL configuration, workload, and test parameters.
 
 For detailed workload definitions, test methodology, and CI results, see
-[Performance Stress Testing: MySQL → MySQL (E2E)](docs/performance/mysql-to-mysql-e2e.md).
+[Performance Stress Testing](docs/performance/).
 
 ## Contributing
 

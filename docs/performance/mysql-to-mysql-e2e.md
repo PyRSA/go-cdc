@@ -11,19 +11,16 @@ files under `docs/performance/` using the same `mysql-to-<sink>-e2e.md` naming.
 
 | Item | Value |
 | --- | --- |
-| Samples | Load: **10-run average** each for MySQL 5.7 / 8.0; Scale heavy: **10-run average** (8.0) |
-| CI dates | sample window 2026-09-30 · 2026-10-12 |
 | Workflow | `CI / Integration` (`.github/workflows/ci.yml`) |
 | Runner | GitHub Actions `ubuntu-latest` (shared VM) |
 | MySQL (load) | 5.7.42 and 8.0.36 via docker compose |
 | MySQL (scale) | 8.0.36 · `SCALE_PROFILE=heavy` only |
-| Profiles | `LOAD_PROFILE=full` (`LOAD_ROWS_PER_TABLE=100000`); heavy scale |
-| Peak knobs (load) | **Current CI:** 4 workers × 60s, batch 200 |
-| Scale knobs | 8 workers; hotspot burst 50k/table × 10; peak 45s |
 
 **How numbers and charts are built**
 
-- Phase timings in tables are **arithmetic means** across the listed runs.
+- All timings below are **arithmetic means across 10 CI runs** (load: each of
+  MySQL 5.7 / 8.0; scale heavy: MySQL 8.0). Sample window 2026-09-30 ·
+  2026-10-12.
 - Lag curves are **run-normalized averages**: each run’s catch-up time is mapped
   to \\([0,1]\\), lag is averaged at each fraction, then the X axis is scaled to
   the **mean** catch-up duration. This keeps shape comparable when runs finish
@@ -38,11 +35,15 @@ files under `docs/performance/` using the same `mysql-to-<sink>-e2e.md` naming.
 
 ### Load suite (func + types + load)
 
+Profile: `LOAD_PROFILE=full` (`LOAD_ROWS_PER_TABLE=100000`).
+Peak knobs: **current CI 4 workers × 60s, batch 200** (historical load means
+below used **4×90s** — see evidence notes).
+
 One source DB → one sink DB, six tables (`t1`–`t4`, `typed`, `large`):
 
 1. Seed **100k rows × 5** normal tables + **50 × 2 MiB** LONGBLOB/LONGTEXT rows.
 2. Snapshot catch-up (≤1% row lag).
-3. Peak: 4 concurrent writers × 60s INSERT into `tpl01_t1` + `tpl01_typed`.
+3. Peak: concurrent writers INSERT into `tpl01_t1` + `tpl01_typed`.
 4. Peak catch-up until both tables are within **≤1%** lag (harness budget 3600s).
 
 Functional (TP-01..13) and types (TP-D01..D04) ran in the same job before load.
@@ -56,6 +57,8 @@ The load lag chart has **two lines** because CI runs the same load suite on
 
 ### Scale suite (heavy)
 
+Scale knobs: 8 workers; hotspot burst 50k/table × 10; peak 45s.
+
 Ten source DBs → ten sink DBs, **50 tables**, planned seed **300k** rows:
 
 1. Snapshot + checksum verify (COUNT + SUM(id) + CRC).
@@ -64,9 +67,9 @@ Ten source DBs → ten sink DBs, **50 tables**, planned seed **300k** rows:
 4. **Hotspot peak**: 8 workers × 45s timed inserts across the same 10 tables.
 5. Hotspot catch-up to **≤1%** lag, then final checksum on all 50 tables.
 
-Scale is **MySQL 8.0 only** in CI, so it uses a **separate** single-series chart.
+Scale is **MySQL 8.0 only** in CI, so it uses a **separate** one-series chart.
 
-## Scale heavy (MySQL 8.0) — average of 10 runs
+## Scale heavy (MySQL 8.0) — average of 10 CI runs
 
 **Result: SUMMARY PASS** (10-run average)
 
@@ -83,7 +86,7 @@ Scale is **MySQL 8.0 only** in CI, so it uses a **separate** single-series chart
 
 Some runs drain nearly linearly (~577s); others show a mid-run apply stall
 (up to ~2027s). The 10-run averaged curve still reaches ≤1%, with less visual
-weight on flat segments than a single stalled run.
+weight on flat segments than an outlier stall.
 
 ### Scale heavy — hotspot catch-up lag curve
 
@@ -102,7 +105,7 @@ Y-axis: **mean** `delta%` across 10 hotspot tables, then averaged across runs
 | 1000 | 24.0 |
 | 1302 | ≤1 (PASS) |
 
-## Load suite — MySQL 5.7 (average of 10 runs)
+## Load suite — MySQL 5.7 (average of 10 CI runs)
 
 > Historical sample: peak knobs were **4×90s** (not current 4×60s).
 
@@ -143,7 +146,7 @@ close through mid catch-up; **5.7 finishes earlier on average** (~2035s) than
 | 2035 | ≤1 (PASS) | 10.1 |
 | 2280 | — | ≤1 (PASS) |
 
-## Load suite — MySQL 8.0 (average of 10 runs)
+## Load suite — MySQL 8.0 (average of 10 CI runs)
 
 > Historical sample: peak knobs were **4×90s** (not current 4×60s).
 
@@ -189,7 +192,7 @@ flood. Scale wall time is especially runner-sensitive.
 
 ## Limitations
 
-- Shared GitHub Actions runners; single-node docker MySQL.
+- Shared GitHub Actions runners; one docker MySQL instance per job.
 - No comparison to Flink CDC or other tools.
 - Averages are over **10** runs per scenario; outliers are smoothed but runner
   noise remains.

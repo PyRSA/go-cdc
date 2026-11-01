@@ -260,7 +260,10 @@ The Go test is the unit of the sink package. The end-to-end suites that drive th
 
 ```bash
 bash tests/integration/scripts/run.sh postgresql normal pg16     # functional E2E
-bash tests/integration/scripts/run.sh postgresql heavy pg16 compat  # PG 14 15 16 17 18
+bash tests/integration/scripts/run.sh postgresql heavy pg16 compat  # PG 16 only (this matrix row)
+# The full 14–18 matrix is covered by the five parallel `heavy` CI matrix rows
+# (one major each); to run all five versions locally in one shot, see
+# docs/test/POSTGRESQL.md §12.
 ```
 
 A run counts only when its report says so (`PASS` / `FAIL` / `SKIPPED` / `NOT RUN` / `ENV BLOCKED`); the vocabulary and the evidence each status needs are defined in that document, §9.
