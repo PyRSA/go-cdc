@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -194,22 +195,130 @@ def per_sink(sinks: list[str], profile: str) -> dict[str, dict]:
     return out
 
 
-def changed_files(base: str, head: str = "HEAD", repo: Path | str = ".") -> list[str]:
-    """Paths changed between ``base`` and ``head``.
+# The trunk a fallback merge-base is measured against, in order. One place to
+# answer "which remote ref is the default branch": a repo that lives on `main`
+# fails the `origin/master` probe silently and lands on the next candidate.
+DEFAULT_BRANCH_CANDIDATES: tuple[str, ...] = ("origin/master", "origin/main")
 
-    ``base`` empty or all-zero (a brand-new branch, a force push, the very first
-    push) means "unknown history": callers get an empty list, which is treated
-    as shared and therefore runs everything.
+# git quotes "unusual" path bytes by default (core.quotePath), so a Chinese file
+# name comes back as ``"docs/\351\234\200.md"``: the ``.md`` ignore rule then misses
+# the trailing quote and every sink runs. This is the only command that asks git
+# for paths, so the switch lives here. (``-z`` would also survive a newline in a
+# path; not worth the split while no such path exists.)
+QUOTE_PATH_OFF: tuple[str, ...] = ("-c", "core.quotePath=false")
+
+
+def _git(repo: Path | str, *args: str, quiet: bool = False) -> str | None:
+    """Run one git command; its stdout, or ``None`` when it fails. Never raises.
+
+    ``quiet`` exists for probing commands (a merge-base candidate that does not
+    exist is expected, not news); a real failure stays loud, because it is the
+    difference between a precise plan and a full run.
     """
-    if not base or set(base) <= {"0"}:
-        return []
-    args = ["git", "-C", str(repo), "diff", "--name-only", "--no-renames", base, head]
     try:
-        out = subprocess.run(args, check=True, capture_output=True, text=True).stdout
-    except subprocess.CalledProcessError as exc:  # missing base sha, shallow clone
-        print(f"plan: git diff {base}..{head} failed: {exc.stderr.strip()}", file=sys.stderr)
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as exc:  # bad sha, shallow clone
+        if not quiet:
+            detail = (getattr(exc, "stderr", "") or str(exc)).strip()
+            # The plumbing in front of the subcommand (``-C <repo>``, ``-c ...``)
+            # is noise in a CI log: say which git command failed, not how it was
+            # invoked.
+            display_args = [
+                a for a in args if not a.startswith("-") and a != "core.quotePath=false"
+            ]
+            print(f"plan: git {' '.join(display_args)} failed: {detail}", file=sys.stderr)
+        return None
+
+
+def _diff_names(base: str, head: str, repo: Path | str) -> list[str] | None:
+    """Changed paths between two commits, or ``None`` when git cannot tell.
+
+    An empty *successful* diff is ``[]``, not ``None``: both end up running
+    everything, but only ``None`` means "this question was unanswerable".
+    """
+    out = _git(
+        repo, *QUOTE_PATH_OFF, "diff", "--name-only", "--no-renames", base, head
+    )
+    if out is None:
+        return None
+    return [line for line in out.splitlines() if line]
+
+
+def _fork_point(head: str, repo: Path | str) -> str | None:
+    """Where ``head`` branched off the default branch, or ``None`` if unknown."""
+    for candidate in DEFAULT_BRANCH_CANDIDATES:
+        sha = _git(repo, "merge-base", candidate, head, quiet=True)
+        if sha and sha.strip():
+            return sha.strip()
+    return None
+
+
+def changed_files(base: str, head: str = "HEAD", repo: Path | str = ".") -> list[str]:
+    """Paths changed between ``base`` and ``head``, with a merge-base fallback.
+
+    Zero: a ``workflow_dispatch`` short-circuits to ``[]`` before git runs. A
+    dispatch is a person asking for a verdict, and it arrives with an empty
+    ``BASE`` while still sitting on a real branch - without this guard the
+    merge-base fallback below would answer it with a *selective* plan, i.e. a
+    manual promotion could silently skip sinks. Outside GitHub Actions the
+    variable is unset, so a local run is unaffected.
+
+    Three attempts otherwise, most precise first:
+
+    1. ``git diff <base> <head>`` - the normal path, where ``base`` is the PR
+       base sha or the previous push tip (``github.event.before``). Because both
+       ends are commit tips, the diff covers *every* commit the push carried.
+       This is why the fallback below is a fork point and never ``HEAD^``: the
+       parent only describes the last commit, so a multi-commit push would plan
+       one commit's paths and silently miss the rest.
+    2. ``git merge-base origin/<trunk> <head>``, then that diff - reached when
+       ``base`` is empty or all-zero (a brand-new branch: the push payload's
+       null SHA) or when the diff itself fails (a force push left the old tip
+       dangling, so a fresh ``fetch-depth: 0`` clone cannot resolve it). The
+       fork point against the default branch is still the branch's own change
+       set, however long the branch is.
+    3. ``[]`` - nothing usable (no base, no ``origin/master`` or ``origin/main``,
+       unrelated histories). Callers read ``[]`` as "unknown history" and run
+       everything, so this is the fail-open last resort, unchanged.
+
+    ``[]`` therefore never means "nothing changed": that case arrives as a
+    non-empty path list whose owners are all ``ignore``.
+    """
+    # GITHUB_EVENT_NAME is one of the default environment variables Actions
+    # exports, so no workflow change is needed to read the trigger here.
+    if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+        print(
+            "plan: workflow_dispatch; no diff to trust, running every sink",
+            file=sys.stderr,
+        )
         return []
-    return [line.strip() for line in out.splitlines() if line.strip()]
+
+    # A usable base is any non-empty value that is not exactly the null SHA. The
+    # comparison is equality, not ``set(base) > {"0"}``: that would be a *proper
+    # superset* test and reject every real sha as well.
+    if base and set(base) != {"0"}:
+        paths = _diff_names(base, head, repo)
+        if paths is not None:
+            return paths
+
+    fork_point = _fork_point(head, repo)
+    if fork_point is not None:
+        paths = _diff_names(fork_point, head, repo)
+        if paths is not None:
+            return paths
+
+    print(
+        "plan: no usable base and no merge-base with "
+        f"{'/'.join(DEFAULT_BRANCH_CANDIDATES)}; treating the change set as "
+        "unknown and running every sink",
+        file=sys.stderr,
+    )
+    return []
 
 
 def plan(paths: list[str], profile: str = "normal") -> dict:
