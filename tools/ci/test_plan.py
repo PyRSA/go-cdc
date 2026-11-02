@@ -194,12 +194,267 @@ def test_heavy_matches_normal_except_the_pg_compat_matrix() -> None:
     ]
 
 
-# ----------------------------------------------------------------------- docker
-def test_changed_files_returns_empty_without_a_base() -> None:
+# --------------------------------------------------------------- changed files
+BASE = "a" * 40
+FORK = "b" * 40
+DROPPED = "c" * 40  # a force-pushed-away tip: a fresh clone cannot resolve it
+
+
+class GitStub:
+    """Answers ``git -C <repo> ...`` from a ``{(args...): stdout | None}`` map.
+
+    ``None`` makes the call fail the way git does on a bad revision, so the
+    fallback chain is exercised without a repository and without depending on
+    whether the checkout running the suite happens to have commits.
+    """
+
+    def __init__(self, answers: dict[tuple[str, ...], str | None]) -> None:
+        self.answers = answers
+        self.calls: list[tuple[str, ...]] = []
+
+    def __call__(self, cmd, **kwargs) -> subprocess.CompletedProcess:
+        assert cmd[:2] == ["git", "-C"], cmd
+        args = tuple(cmd[3:])
+        self.calls.append(args)
+        if args not in self.answers:
+            raise AssertionError(f"unexpected git call: {args}")
+        stdout = self.answers[args]
+        if stdout is None:
+            raise subprocess.CalledProcessError(128, cmd, "", "fatal: bad object")
+        return subprocess.CompletedProcess(cmd, 0, stdout, "")
+
+
+def stub_git(
+    monkeypatch: pytest.MonkeyPatch,
+    answers: dict[tuple[str, ...], str | None],
+    event: str | None = None,
+) -> GitStub:
+    """Install the git stub and pin ``GITHUB_EVENT_NAME``.
+
+    Pinning matters in both directions: a suite that runs under a manual
+    ``workflow_dispatch`` would otherwise pick up the real event name and take
+    the full-run shortcut inside ``changed_files``, so these tests would stop
+    exercising the diff logic at all. ``event=None`` means "not on Actions".
+    """
+    if event is None:
+        monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+    else:
+        monkeypatch.setenv("GITHUB_EVENT_NAME", event)
+    stub = GitStub(answers)
+    monkeypatch.setattr(planner.subprocess, "run", stub)
+    return stub
+
+
+def diff_args(base: str, head: str = "HEAD") -> tuple[str, ...]:
+    """The exact `git diff` command plan.py is expected to issue.
+
+    ``-c core.quotePath=false`` is part of the contract: without it git quotes
+    non-ASCII path bytes and the routing table sees garbage (see
+    ``test_chinese_paths_are_not_quoted_by_git``).
+    """
+    return (
+        "-c",
+        "core.quotePath=false",
+        "diff",
+        "--name-only",
+        "--no-renames",
+        base,
+        head,
+    )
+
+
+def merge_base_args(candidate: str, head: str = "HEAD") -> tuple[str, ...]:
+    """The probe `_fork_point` is expected to issue for one trunk candidate."""
+    return ("merge-base", candidate, head)
+
+
+def test_changed_files_returns_empty_without_a_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # An unknown base is not "nothing changed": it must lead to a full run.
+    # No real git here on purpose. ``tmp_path`` is *not* safe: pytest's basetemp
+    # can land inside this repository (``.tmpsandbox/``), where ``git -C``
+    # resolves upward to the real checkout - the assertion would then ride on
+    # whatever the current branch happens to contain, i.e. green before the fix
+    # is committed and red after it.
+    stub = stub_git(
+        monkeypatch,
+        {merge_base_args("origin/master"): None, merge_base_args("origin/main"): None},
+    )
     assert planner.changed_files("") == []
+    assert stub.calls == [
+        merge_base_args("origin/master"),
+        merge_base_args("origin/main"),
+    ]
+    stub.calls.clear()
     assert planner.changed_files("0" * 40) == []
-    assert planner.plan(planner.changed_files(""))["count"] > 0
+    assert stub.calls == [
+        merge_base_args("origin/master"),
+        merge_base_args("origin/main"),
+    ]
+    assert planner.plan([])["count"] > 0
+
+
+def test_workflow_dispatch_forces_full_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A dispatch carries BASE="" but still sits on a real branch, so the
+    # merge-base fallback would answer it with a *selective* plan - a hand-started
+    # promotion could then silently skip sinks. It is a request for a full
+    # verdict, so git is never consulted: the stub has no answers at all, and any
+    # call would fail the test.
+    stub = stub_git(monkeypatch, {}, event="workflow_dispatch")
+    paths = planner.changed_files(BASE)
+    assert paths == []
+    assert stub.calls == []
+    assert planner.plan(paths)["count"] == len(
+        planner.rows_for(list(planner.SINKS), "normal")
+    )
+
+    # The same base under a normal event still asks git: the guard is about the
+    # trigger, not about the base.
+    pull = stub_git(
+        monkeypatch, {diff_args(BASE): "composer/runner.go\n"}, event="pull_request"
+    )
+    assert planner.changed_files(BASE) == ["composer/runner.go"]
+    assert pull.calls == [diff_args(BASE)]
+
+
+def test_usable_base_asks_git_exactly_one_question(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The normal path stays a single diff: no merge-base probe (a wasted process
+    # per run) and no chance of widening the change set behind the caller's back.
+    stub = stub_git(monkeypatch, {diff_args(BASE): "composer/runner.go\n"})
+    assert planner.changed_files(BASE) == ["composer/runner.go"]
+    assert stub.calls == [diff_args(BASE)]
+
+
+def test_new_branch_plans_every_pushed_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # before = 40 zeros (a brand-new branch). ``HEAD^`` would plan only the last
+    # commit and silently miss whatever the earlier ones touched; the fork point
+    # against the default branch covers the whole push.
+    stub = stub_git(
+        monkeypatch,
+        {
+            merge_base_args("origin/master"): FORK + "\n",
+            diff_args(FORK): (
+                "connector/sink/kafka/sink.go\n"
+                "connector/sink/doris/ddl.go\n"
+                "README.md\n"
+            ),
+        },
+    )
+    paths = planner.changed_files("0" * 40)
+    assert paths == [
+        "connector/sink/kafka/sink.go",
+        "connector/sink/doris/ddl.go",
+        "README.md",
+    ]
+    assert stub.calls == [merge_base_args("origin/master"), diff_args(FORK)]
+    # No single-parent shortcut anywhere: that is the silent-miss bug.
+    assert not any(
+        "HEAD^" in arg or "HEAD~" in arg for call in stub.calls for arg in call
+    )
+    # Two sinks plus a docs path: selective, not the whole matrix.
+    assert planner.plan(paths)["sinks"] == ["kafka", "doris"]
+
+
+def test_unresolvable_base_falls_back_to_the_fork_point(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A force push leaves the old tip dangling: git cannot resolve it, so the
+    # first diff raises and the fallback has to carry the run.
+    stub = stub_git(
+        monkeypatch,
+        {
+            diff_args(DROPPED): None,
+            merge_base_args("origin/master"): FORK,
+            diff_args(FORK): "connector/sink/mysql/sink.go\n",
+        },
+    )
+    assert planner.changed_files(DROPPED) == ["connector/sink/mysql/sink.go"]
+    assert stub.calls == [
+        diff_args(DROPPED),
+        merge_base_args("origin/master"),
+        diff_args(FORK),
+    ]
+
+
+def test_no_base_and_no_fork_point_still_runs_everything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Neither trunk candidate resolves (no remote yet, or a shallow clone): the
+    # contract is unchanged - an empty list means "unknown history, run all".
+    stub = stub_git(
+        monkeypatch,
+        {merge_base_args("origin/master"): None, merge_base_args("origin/main"): None},
+    )
+    paths = planner.changed_files("0" * 40)
+    assert paths == []
+    assert stub.calls == [
+        merge_base_args("origin/master"),
+        merge_base_args("origin/main"),
+    ]
+    assert planner.plan(paths)["count"] == len(
+        planner.rows_for(list(planner.SINKS), "normal")
+    )
+
+
+def test_repo_on_main_uses_the_second_trunk_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub = stub_git(
+        monkeypatch,
+        {
+            merge_base_args("origin/master"): None,
+            merge_base_args("origin/main"): FORK,
+            diff_args(FORK): "configs/demo-kafka.yaml\n",
+        },
+    )
+    paths = planner.changed_files("0" * 40)
+    assert paths == ["configs/demo-kafka.yaml"]
+    # origin/master is probed first and fails before origin/main answers: the
+    # candidate order is part of the contract, not an implementation detail.
+    assert stub.calls == [
+        merge_base_args("origin/master"),
+        merge_base_args("origin/main"),
+        diff_args(FORK),
+    ]
+    assert planner.plan(paths)["sinks"] == ["kafka"]
+
+
+def test_head_is_passed_through_to_merge_base(monkeypatch: pytest.MonkeyPatch) -> None:
+    # --head has to reach the probe: a literal "HEAD" there would diff against
+    # the wrong commit whenever the planner is pointed at another ref.
+    head = "d" * 40
+    stub = stub_git(
+        monkeypatch,
+        {
+            merge_base_args("origin/master", head): FORK,
+            diff_args(FORK, head): "connector/sink/doris/ddl.go\n",
+        },
+    )
+    assert planner.changed_files("0" * 40, head=head) == ["connector/sink/doris/ddl.go"]
+    assert stub.calls == [merge_base_args("origin/master", head), diff_args(FORK, head)]
+
+
+def test_chinese_paths_are_not_quoted_by_git(monkeypatch: pytest.MonkeyPatch) -> None:
+    # git's default core.quotePath turns docs/需求.md into
+    # '"docs/\351\234\200.md"': the ``.md`` suffix rule misses the trailing quote,
+    # owner_of falls through to "shared" and every sink runs. The switch has to
+    # be on the command line and the router has to see the raw path.
+    stub = stub_git(
+        monkeypatch,
+        {diff_args(BASE): "docs/需求.md\nconnector/sink/kafka/sink.go\n"},
+    )
+    paths = planner.changed_files(BASE)
+    assert paths == ["docs/需求.md", "connector/sink/kafka/sink.go"]
+    assert stub.calls == [diff_args(BASE)]
+    assert stub.calls[0][:2] == ("-c", "core.quotePath=false")
+    # Prose is ignored, the sink is not: a selective plan, not the whole matrix.
+    assert planner.owner_of(paths[0]) == "ignore"
+    assert planner.plan(paths)["sinks"] == ["kafka"]
 
 
 def test_cli_writes_step_outputs(tmp_path: Path) -> None:
