@@ -101,7 +101,9 @@ IGNORE_SUFFIXES: tuple[str, ...] = (".md",)
 
 # Which variants each sink is exercised on, per profile. The tier still never
 # decides which suites run - that is static per sink in run.sh's default_suites;
-# the tier only resizes writers and timeouts. The one deliberate asymmetry is the
+# the tier only resizes writers and timeouts. MySQL keeps 5.7 and 8.0 for
+# compatibility and adds 8.4 for the releases that removed SHOW MASTER STATUS;
+# the tier never trims a version. The one deliberate asymmetry is the
 # PostgreSQL VERSION matrix: `normal` pins the single default major (pg16) to keep
 # the PR gate cheap, while `heavy` fans the compat majors (pg14..pg18) out into
 # separate matrix rows so they run in parallel CI jobs instead of as one slow
@@ -109,7 +111,7 @@ IGNORE_SUFFIXES: tuple[str, ...] = (".md",)
 # just the version each row brings up).
 VARIANTS: dict[str, dict[str, tuple[str, ...]]] = {
     "normal": {
-        "mysql": ("57", "80"),
+        "mysql": ("57", "80", "84"),
         "stdout": ("",),
         "kafka": ("",),
         "doris": ("",),
@@ -117,7 +119,7 @@ VARIANTS: dict[str, dict[str, tuple[str, ...]]] = {
         "postgresql": ("pg16",),
     },
     "heavy": {
-        "mysql": ("57", "80"),
+        "mysql": ("57", "80", "84"),
         "stdout": ("",),
         "kafka": ("",),
         "doris": ("",),

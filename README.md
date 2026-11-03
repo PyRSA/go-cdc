@@ -20,7 +20,7 @@ Features in this release:
 | ---------------- | -------------------------------------------- |
 | OS               | Linux / macOS / Windows                      |
 | Go               | **1.25+** (see `go.mod`)                     |
-| Source / sink DB | MySQL **5.7** or **8.0**                     |
+| Source / sink DB | MySQL **5.7**, **8.0** or **8.4** (9.x experimental) |
 | Source binlog    | `binlog_format=ROW`, `binlog_row_image=FULL` |
 
 

@@ -456,9 +456,16 @@ func (c *Capture) binlogFrom(ctx context.Context, out chan<- source.Message, pos
 				schemaMsg = commit.Schema
 				if c.DB != nil {
 					described, err := c.DB.DescribeTable(ctx, commit.Schema.Database, commit.Schema.Table)
-					if err == nil {
+					switch {
+					case err == nil:
 						schemaMsg = cloneTable(described)
-					} else {
+					case errors.Is(err, ErrUnsupportedColumn):
+						// The binlog-derived schema carries a column the snapshot and
+						// binlog paths would type differently. Falling back to it would
+						// put values of two Go types on one column, so stop the job
+						// instead of emitting a schema no sink can honour.
+						return err
+					default:
 						// Binlog CREATE schema may omit defaults, comments, charset,
 						// and secondary indexes. Prefer JDBC DescribeTable; on failure
 						// keep the binlog schema and surface the fallback explicitly.

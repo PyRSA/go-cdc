@@ -22,11 +22,12 @@ import (
 
 // sqlDB reads snapshot chunks and catalog metadata. It does not dump binlog.
 type sqlDB struct {
-	db     *sql.DB
-	cfg    definition.Source
-	types  map[string]string
-	server uint32
-	warn   func(string, ...any) // optional; e.g. skipped functional indexes
+	db      *sql.DB
+	cfg     definition.Source
+	types   map[string]string
+	server  uint32
+	version serverVersion        // probed once in OpenDB; may be unknown
+	warn    func(string, ...any) // optional; e.g. skipped functional indexes
 }
 
 // SetWarn installs an optional warning callback used during catalog discovery.
@@ -57,18 +58,19 @@ func OpenDB(cfg definition.Source) (*sqlDB, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	version := detectServerVersion(ctx, db)
 	format, image, err := readBinlogMode(ctx, db)
 	if err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	if !strings.EqualFold(format, "ROW") || !strings.EqualFold(image, "FULL") {
+	if err := requireRowAndFull(format, image, version); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("binlog_format=%s binlog_row_image=%s; both must be ROW and FULL", format, image)
+		return nil, err
 	}
 	server := cfg.ServerID
 	if server == 0 {
-		used, err := listReplicaServerIDs(ctx, db)
+		used, err := listReplicaServerIDs(ctx, db, version)
 		if err != nil {
 			_ = db.Close()
 			return nil, err
@@ -79,12 +81,175 @@ func OpenDB(cfg definition.Source) (*sqlDB, error) {
 			return nil, err
 		}
 	}
-	handle := &sqlDB{db: db, cfg: cfg, types: map[string]string{}, server: server}
+	handle := &sqlDB{db: db, cfg: cfg, types: map[string]string{}, server: server, version: version}
 	return handle, nil
 }
 
 // ServerID is the replication id used for the binlog dump. The CREATE scan uses the next integer.
 func (d *sqlDB) ServerID() uint32 { return d.server }
+
+// ServerVersion is the release reported by SELECT VERSION(), or "unknown" when
+// the probe failed. Used for startup logging only.
+func (d *sqlDB) ServerVersion() string { return serverVersionLabel(d.version) }
+
+// detectServerVersion reads the release once per connection pool. A failed probe
+// is not fatal: an unknown release makes the position queries try the post-8.4
+// statements first and fall back to the legacy spelling on a syntax error.
+func detectServerVersion(ctx context.Context, db *sql.DB) serverVersion {
+	var raw string
+	if err := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&raw); err != nil {
+		return serverVersion{}
+	}
+	return parseServerVersion(raw)
+}
+
+// replicationTermVersion is the first MySQL release that removed the legacy
+// replication statements (SHOW MASTER STATUS, SHOW SLAVE HOSTS). go-mysql's
+// canal switches at the same threshold, so the position queries and the binlog
+// dump agree on the server's vocabulary.
+const replicationTermVersion = "8.4.0"
+
+const (
+	masterStatusLegacyQuery = "SHOW MASTER STATUS"
+	masterStatusModernQuery = "SHOW BINARY LOG STATUS"
+	replicasLegacyQuery     = "SHOW SLAVE HOSTS"
+	replicasModernQuery     = "SHOW REPLICAS"
+)
+
+const (
+	flavorMySQL   = "mysql"
+	flavorMariaDB = "mariadb"
+)
+
+// serverVersion is the release reported by SELECT VERSION(). raw keeps the
+// original string for logs and error messages; flavor keeps a MariaDB release
+// from being compared numerically against MySQL thresholds (10.11 > 8.4).
+type serverVersion struct {
+	raw    string
+	flavor string
+}
+
+func parseServerVersion(raw string) serverVersion {
+	value := serverVersion{raw: raw}
+	lower := strings.ToLower(raw)
+	switch {
+	case strings.Contains(lower, "mariadb"):
+		value.flavor = flavorMariaDB
+	case lower != "":
+		// A string the comparer cannot split stays unknown; guessing MySQL
+		// would silently pick statements the server may have removed.
+		if _, err := mysql.CompareServerVersions(raw, "0.0.0"); err == nil {
+			value.flavor = flavorMySQL
+		}
+	}
+	return value
+}
+
+// known reports whether the release can be trusted when choosing statements.
+func (v serverVersion) known() bool { return v.flavor != "" }
+
+func (v serverVersion) atLeast(threshold string) bool {
+	if v.flavor != flavorMySQL {
+		return false
+	}
+	cmp, err := mysql.CompareServerVersions(v.raw, threshold)
+	return err == nil && cmp >= 0
+}
+
+// newerReplicationTerms reports whether the server speaks SHOW BINARY LOG
+// STATUS / SHOW REPLICAS.
+func (v serverVersion) newerReplicationTerms() bool { return v.atLeast(replicationTermVersion) }
+
+func serverVersionLabel(v serverVersion) string {
+	if v.raw == "" {
+		return "unknown"
+	}
+	return v.raw
+}
+
+// positionQueries returns the statement to run first and, only when the release
+// could not be determined, the legacy statement to retry once after a syntax
+// error. A known release never falls back: a rejected new statement is a real
+// fault and must surface instead of degrading silently.
+func positionQueries(v serverVersion, modern, legacy string) (first, fallback string) {
+	switch {
+	case v.newerReplicationTerms():
+		return modern, ""
+	case v.known():
+		return legacy, ""
+	default:
+		return modern, legacy
+	}
+}
+
+func masterStatusQueries(v serverVersion) (first, fallback string) {
+	return positionQueries(v, masterStatusModernQuery, masterStatusLegacyQuery)
+}
+
+func replicasQueries(v serverVersion) (first, fallback string) {
+	return positionQueries(v, replicasModernQuery, replicasLegacyQuery)
+}
+
+// queryReplicationStatement runs first and retries fallback once after a syntax
+// error, which is the only failure that separates the two spellings. Both errors
+// are kept when the retry fails too: reporting only the legacy statement would
+// hide why the modern one was rejected.
+func queryReplicationStatement(ctx context.Context, db *sql.DB, first, fallback string) (*sql.Rows, string, error) {
+	rows, err := db.QueryContext(ctx, first)
+	if err == nil {
+		return rows, first, nil
+	}
+	if fallback == "" || !isSyntaxError(err) {
+		return nil, first, err
+	}
+	firstErr := err
+	rows, err = db.QueryContext(ctx, fallback)
+	if err != nil {
+		return nil, fallback, retryFailed(first, firstErr, fallback, err)
+	}
+	return rows, fallback, nil
+}
+
+// retryFailed reports both attempts when the legacy statement is rejected too.
+func retryFailed(first string, firstErr error, fallback string, fallbackErr error) error {
+	return fmt.Errorf("%s failed (%w); %s also failed: %w", first, firstErr, fallback, fallbackErr)
+}
+
+func isSyntaxError(err error) bool {
+	var myErr *mysqldriver.MySQLError
+	return errors.As(err, &myErr) && myErr.Number == 1064
+}
+
+// binlogModeVariables are the two variables the capture cannot run without.
+var binlogModeVariables = []string{"binlog_format", "binlog_row_image"}
+
+// binlogMode turns one SHOW VARIABLES result into the format/image pair. A
+// missing row is a failure, not a pass: binlog_format is deprecated since MySQL
+// 8.0.34 but still reported by 8.0, 8.4 and 9.x, so its absence points at the
+// query, the account or a proxy rewrite, never at a server that dropped it.
+// Defaulting to ROW would let a STATEMENT or MIXED source stream events this
+// capture cannot replay. queryErr carries the statement failure unchanged so a
+// privilege or connection error is never reported as a missing variable.
+func binlogMode(values map[string]string, queryErr error) (string, string, error) {
+	if queryErr != nil {
+		return "", "", fmt.Errorf("source.mysql: read binlog_format/binlog_row_image: %w", queryErr)
+	}
+	for _, name := range binlogModeVariables {
+		if _, ok := values[name]; !ok {
+			return "", "", fmt.Errorf("source.mysql: SHOW VARIABLES reported no %s; refusing to capture because binlog_format=ROW and binlog_row_image=FULL cannot be verified", name)
+		}
+	}
+	return values["binlog_format"], values["binlog_row_image"], nil
+}
+
+// requireRowAndFull keeps the historical ROW/FULL gate, with the release in the
+// message so a rejection can be told apart from a statement or privilege fault.
+func requireRowAndFull(format, image string, version serverVersion) error {
+	if strings.EqualFold(format, "ROW") && strings.EqualFold(image, "FULL") {
+		return nil
+	}
+	return fmt.Errorf("binlog_format=%s binlog_row_image=%s; both must be ROW and FULL (source server %s)", format, image, serverVersionLabel(version))
+}
 
 func pickServerID(used map[uint32]struct{}) (uint32, error) {
 	for id := uint32(5400); id < 6400; id++ {
@@ -99,10 +264,11 @@ func pickServerID(used map[uint32]struct{}) (uint32, error) {
 	return 0, fmt.Errorf("source.server-id: no free id in 5400-6400")
 }
 
-func listReplicaServerIDs(ctx context.Context, db *sql.DB) (map[uint32]struct{}, error) {
-	rows, err := db.QueryContext(ctx, "SHOW SLAVE HOSTS")
+func listReplicaServerIDs(ctx context.Context, db *sql.DB, version serverVersion) (map[uint32]struct{}, error) {
+	first, fallback := replicasQueries(version)
+	rows, query, err := queryReplicationStatement(ctx, db, first, fallback)
 	if err != nil {
-		return nil, fmt.Errorf("source.server-id: %w", err)
+		return nil, fmt.Errorf("source.server-id: %s: %w", query, err)
 	}
 	defer rows.Close()
 	cols, err := rows.Columns()
@@ -117,7 +283,7 @@ func listReplicaServerIDs(ctx context.Context, db *sql.DB) (map[uint32]struct{},
 		}
 	}
 	if index < 0 {
-		return nil, fmt.Errorf("source.server-id: SHOW SLAVE HOSTS has no Server_id column")
+		return nil, fmt.Errorf("source.server-id: %s has no Server_id column", query)
 	}
 	used := map[uint32]struct{}{}
 	for rows.Next() {
@@ -134,11 +300,14 @@ func listReplicaServerIDs(ctx context.Context, db *sql.DB) (map[uint32]struct{},
 		}
 		n, err := strconv.ParseUint(raw[index].String, 10, 32)
 		if err != nil {
-			return nil, fmt.Errorf("source.server-id: %w", err)
+			return nil, fmt.Errorf("source.server-id: %s: %w", query, err)
 		}
 		used[uint32(n)] = struct{}{}
 	}
-	return used, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("source.server-id: %s: %w", query, err)
+	}
+	return used, nil
 }
 
 func sinkDSN(cfg definition.Source) (string, error) {
@@ -210,32 +379,76 @@ func jdbcErr(cfg definition.Source, err error) error {
 func readBinlogMode(ctx context.Context, db *sql.DB) (string, string, error) {
 	rows, err := db.QueryContext(ctx, "SHOW VARIABLES WHERE Variable_name IN ('binlog_format', 'binlog_row_image')")
 	if err != nil {
-		return "", "", err
+		return binlogMode(nil, err)
 	}
 	defer rows.Close()
 	values := map[string]string{}
 	for rows.Next() {
 		var name, value string
 		if err := rows.Scan(&name, &value); err != nil {
-			return "", "", err
+			return binlogMode(nil, err)
 		}
 		values[strings.ToLower(name)] = value
 	}
-	return values["binlog_format"], values["binlog_row_image"], rows.Err()
+	return binlogMode(values, rows.Err())
+}
+
+// parseMasterStatus maps one SHOW MASTER STATUS / SHOW BINARY LOG STATUS row.
+// Both spellings expose File, Position and Executed_Gtid_Set, so the column
+// names are the only contract between them.
+func parseMasterStatus(cols []string, raw []sql.NullString) (checkpoint.Position, error) {
+	pos := checkpoint.Position{}
+	file, offset := false, false
+	for i, name := range cols {
+		if i >= len(raw) {
+			break
+		}
+		switch strings.ToLower(name) {
+		case "file":
+			file = true
+			pos.File = raw[i].String
+		case "position":
+			offset = true
+			n, err := strconv.ParseUint(raw[i].String, 10, 32)
+			if err != nil {
+				return checkpoint.Position{}, fmt.Errorf("position %q is not a binlog offset", raw[i].String)
+			}
+			pos.Pos = uint32(n)
+		case "executed_gtid_set":
+			pos.GTID = raw[i].String
+		}
+	}
+	switch {
+	case !file || !offset:
+		return checkpoint.Position{}, fmt.Errorf("result has no File/Position column")
+	case pos.File == "":
+		return checkpoint.Position{}, fmt.Errorf("result has an empty File column; is binary logging enabled?")
+	}
+	return pos, nil
+}
+
+// replicationErr adds the statement and the server release, which is what tells
+// a MySQL 8.4 failure apart from a privilege failure.
+func (d *sqlDB) replicationErr(query string, err error) error {
+	return fmt.Errorf("%s failed on source server %s: %w", query, serverVersionLabel(d.version), err)
 }
 
 func (d *sqlDB) MasterStatus(ctx context.Context) (checkpoint.Position, error) {
-	rows, err := d.db.QueryContext(ctx, "SHOW MASTER STATUS")
+	first, fallback := masterStatusQueries(d.version)
+	rows, query, err := queryReplicationStatement(ctx, d.db, first, fallback)
 	if err != nil {
-		return checkpoint.Position{}, err
+		return checkpoint.Position{}, d.replicationErr(query, err)
 	}
 	defer rows.Close()
 	cols, err := rows.Columns()
 	if err != nil {
-		return checkpoint.Position{}, err
+		return checkpoint.Position{}, d.replicationErr(query, err)
 	}
 	if !rows.Next() {
-		return checkpoint.Position{}, fmt.Errorf("SHOW MASTER STATUS returned no row")
+		if err := rows.Err(); err != nil {
+			return checkpoint.Position{}, d.replicationErr(query, err)
+		}
+		return checkpoint.Position{}, fmt.Errorf("%s returned no row; binary logging is disabled or the account cannot read it (source server %s)", query, serverVersionLabel(d.version))
 	}
 	raw := make([]sql.NullString, len(cols))
 	dest := make([]any, len(cols))
@@ -243,21 +456,16 @@ func (d *sqlDB) MasterStatus(ctx context.Context) (checkpoint.Position, error) {
 		dest[i] = &raw[i]
 	}
 	if err := rows.Scan(dest...); err != nil {
-		return checkpoint.Position{}, err
+		return checkpoint.Position{}, d.replicationErr(query, err)
 	}
-	pos := checkpoint.Position{}
-	for i, name := range cols {
-		switch strings.ToLower(name) {
-		case "file":
-			pos.File = raw[i].String
-		case "position":
-			n, _ := strconv.ParseUint(raw[i].String, 10, 32)
-			pos.Pos = uint32(n)
-		case "executed_gtid_set":
-			pos.GTID = raw[i].String
-		}
+	pos, err := parseMasterStatus(cols, raw)
+	if err != nil {
+		return checkpoint.Position{}, d.replicationErr(query, err)
 	}
-	return pos, rows.Err()
+	if err := rows.Err(); err != nil {
+		return checkpoint.Position{}, d.replicationErr(query, err)
+	}
+	return pos, nil
 }
 
 func (d *sqlDB) ListTables(ctx context.Context) ([]schema.Table, error) {
@@ -349,7 +557,48 @@ WHERE c.table_schema NOT IN ('mysql', 'information_schema', 'performance_schema'
 	if err := d.fillIndexes(ctx, tables, onlyDB, onlyTable); err != nil {
 		return nil, err
 	}
+	if err := d.rejectUnsupportedColumns(tables, onlyTable != ""); err != nil {
+		return nil, err
+	}
 	return tables, nil
+}
+
+// ErrUnsupportedColumn reports a catalogue type this capture cannot represent.
+// It exists so a caller that treats catalogue failures as recoverable can tell
+// this one apart: a table with such a column has no safe fallback schema, so the
+// job must stop instead of degrading to the binlog-derived one.
+var ErrUnsupportedColumn = errors.New("source.mysql: unsupported column type")
+
+// vectorType is the MySQL 9.0 column type this capture cannot represent. The
+// snapshot path would hand it back as a string and the binlog path as a byte
+// slice, so one column would reach a sink with two different Go types.
+const vectorType = "vector"
+
+// unsupportedColumnType reports a catalogue type with no capture semantics yet.
+// The check reads information_schema.COLUMN_TYPE through baseTypeName, the same
+// normalisation both capture paths already use, so it never guesses from values.
+func unsupportedColumnType(mysqlType string) bool {
+	return baseTypeName(mysqlType) == vectorType
+}
+
+// rejectUnsupportedColumns fails the table before any row is read instead of
+// streaming a column the two capture paths disagree on. explicit marks a
+// single-table describe, which only happens when that table is captured.
+// ListTables sees every non-system table, so it checks the captured ones only:
+// a VECTOR table outside source.tables must not stop the job.
+func (d *sqlDB) rejectUnsupportedColumns(tables []schema.Table, explicit bool) error {
+	for _, table := range tables {
+		if !explicit && (d.cfg.Tables == nil || !d.cfg.Tables.Match(table.Database, table.Table)) {
+			continue
+		}
+		for _, column := range table.Columns {
+			if unsupportedColumnType(column.Type) {
+				return fmt.Errorf("%w: %s.%s.%s has type %s, which is not captured because the snapshot and binlog paths would emit different Go types; exclude the table with source.tables.exclude",
+					ErrUnsupportedColumn, table.Database, table.Table, column.Name, column.Type)
+			}
+		}
+	}
+	return nil
 }
 
 func nullString(value sql.NullString) string {

@@ -46,12 +46,13 @@ ensure-golangci-lint:
 #   make it-mysql                        # correctness tier
 #   make it-mysql PROFILE=heavy          # + load/scale
 #   make it-mysql VARIANT=57             # the other side of the version matrix
+#   make it-mysql VARIANT=84             # the release that removed SHOW MASTER STATUS
 #   make it-es VARIANT=es9 SUITES=go,func
 #   make it-pg14 PROFILE=heavy
 #   make it-down SINK=postgresql         # tear one stack down
 #
 # PROFILE  normal (default) | heavy
-# VARIANT  57|80 · pg14..pg18 · es7|es8|es9 · 2.1.x   (empty = sink default)
+# VARIANT  57|80|84 · pg14..pg18 · es7|es8|es9 · 2.1.x   (empty = sink default)
 # SUITES   comma list that overrides the tier default (e.g. SUITES=func)
 #
 # The scripts live in tests/integration/scripts/ (setup.sh, wait.sh,

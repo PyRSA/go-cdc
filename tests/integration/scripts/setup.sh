@@ -9,7 +9,7 @@
 #
 # Variant -> image mapping (the version matrix this repo must never lose):
 #
-#   mysql / stdout / kafka   57 | 80                 -> MYSQL_TAG, MYSQL_IMAGE
+#   mysql / stdout / kafka   57 | 80 | 84             -> MYSQL_TAG, MYSQL_IMAGE
 #   postgresql               pg14..pg18 | 14..18     -> PG_IMAGE, PG_EXPECT_MAJOR
 #   elasticsearch            es7 | es8 | es9         -> ES_SINK_VERSION (+ port)
 #   doris                    2.1.8                   -> DORIS_VERSION

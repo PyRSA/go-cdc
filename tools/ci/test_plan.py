@@ -150,6 +150,7 @@ def test_mysql_matrix_covers_the_version_matrix() -> None:
         "include": [
             {"sink": "mysql", "variant": "57"},
             {"sink": "mysql", "variant": "80"},
+            {"sink": "mysql", "variant": "84"},
         ]
     }
 

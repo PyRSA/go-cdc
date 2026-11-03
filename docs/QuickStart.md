@@ -16,7 +16,7 @@ What you get today:
 | OS | Linux / macOS / Windows |
 | Go (build only) | **1.25+** (see `go.mod`) |
 | Runtime | The `go-cdc` binary only |
-| Databases | **MySQL 5.7** and **MySQL 8.0** (CI covers 5.7.42 / 8.0.36) |
+| Databases | **MySQL 5.7**, **8.0** and **8.4** (CI covers 5.7.42 / 8.0.36 / 8.4.11; 9.x is experimental) |
 | Source binlog | `binlog_format=ROW`, `binlog_row_image=FULL` |
 | Source privileges | At least `SELECT` on captured tables plus privileges to read the binlog |
 

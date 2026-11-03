@@ -105,6 +105,9 @@ func run(args []string) (code int) {
 	db.SetWarn(func(msg string, args ...any) {
 		logger.Warn(msg, args...)
 	})
+	// The release decides which replication statements the source may use; it is
+	// logged once so a MySQL 8.4 startup failure can be read without guessing.
+	logger.Info("source server", "version", db.ServerVersion())
 	// The PostgreSQL sink reads the current source definition to turn a column
 	// change that restates it into PostgreSQL DDL. It borrows the catalogue handle
 	// the capture already owns and never closes it.

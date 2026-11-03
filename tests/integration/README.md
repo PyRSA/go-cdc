@@ -16,7 +16,7 @@ bash tests/integration/scripts/run.sh <sink> [profile] [variant] [suites] [test-
 | `postgresql` | `go` sink suite + `func` TP-P01..P20 + `load` + `bench` + `scale` + `compat` — all six in both tiers (the suite list is identical; `compat`'s coverage follows the matrix row — `normal` attests pg16 only, `heavy` fans pg14..pg18 out into five parallel rows) |
 
 `profile` decides *how much* runs, `variant` decides *what it runs against*
-(`57`/`80`, `pg14`..`pg18`, `es7`/`es8`/`es9`, a Doris `2.1.x` tag). Neither is
+(`57`/`80`/`84`, `pg14`..`pg18`, `es7`/`es8`/`es9`, a Doris `2.1.x` tag). Neither is
 inferred from the environment. The variant table lives in exactly one place,
 `logger.sh: it_apply_variant`, and is applied twice because a child process cannot
 export back to its parent: `run.sh` calls it in its own process (the suites read
