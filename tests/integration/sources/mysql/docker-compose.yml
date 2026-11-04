@@ -24,7 +24,10 @@ services:
       - --binlog-row-image=FULL
       - --gtid-mode=ON
       - --enforce-gtid-consistency=ON
-      - --default-authentication-plugin=mysql_native_password
+      # No --default-authentication-plugin here: MySQL 8.4 removed that option
+      # (authentication_policy replaced it). Every release then keeps its own
+      # default plugin - native on 5.7, caching_sha2_password on 8.0 and later -
+      # which is the authentication path this matrix must exercise anyway.
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
       - --max-allowed-packet=67108864

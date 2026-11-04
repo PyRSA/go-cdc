@@ -5,7 +5,7 @@
 #
 #   sink       mysql | stdout | kafka | doris | elasticsearch | postgresql
 #   profile    normal | heavy      (default: normal)
-#   variant    57 | 80 | pg14..pg18 | es7|es8|es9 | 2.1.8   (default: sink default)
+#   variant    57 | 80 | 84 | pg14..pg18 | es7|es8|es9 | 2.1.8   (default: sink default)
 #   suites     comma list that replaces the tier default, e.g. `func` or
 #              `func,scale`; `IT_SUITES` is the env spelling of the same thing
 #   test-point anything after that is forwarded to the suite (e.g. `E2E-03`)

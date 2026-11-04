@@ -34,6 +34,10 @@ This suite targets those cases. Reports compare column-by-column; a ±8h shift f
 | Temporal | `DATE` / `TIME(3)` / `DATETIME(6)` / `TIMESTAMP(6)` |
 | Other | `JSON` / `ENUM` / `SET` / `BIT(8)` / `TINYINT(1)` / `BLOB` / `BINARY(4)` / `NULL` |
 
+## Not covered
+
+`VECTOR(n)` (MySQL 9.x) is not classified: the snapshot path would return it as text while the binlog path returns raw bytes. The source therefore rejects a captured table that has a vector column whenever it reads catalogue metadata for that table (discovery, runtime `CREATE TABLE`, and default checkpoint resume), naming the database, table and column, instead of streaming values whose type differs between the two paths. The suite does not seed one.
+
 ## Test points
 
 | ID | Assertion |

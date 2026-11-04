@@ -19,7 +19,7 @@ go-cdc 是一个用 YAML 描述同步作业的 CDC 工具：从 MySQL 捕获全�
 | --- | --- |
 | 操作系统 | Linux / macOS / Windows |
 | Go | **1.25+**（见 `go.mod`） |
-| 源 / 目标库 | MySQL **5.7** 或 **8.0** |
+| 源 / 目标库 | MySQL **5.7**、**8.0** 或 **8.4**（9.x 实验性） |
 | 源库 binlog | `binlog_format=ROW`，`binlog_row_image=FULL` |
 
 ### 使用 `install.sh` / `install.ps1` 安装

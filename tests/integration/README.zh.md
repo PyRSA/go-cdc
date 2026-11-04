@@ -16,7 +16,7 @@ bash tests/integration/scripts/run.sh <sink> [profile] [variant] [suites] [test-
 | `elasticsearch` | `go` sink 套件 + `func` + `load` + `scale` —— es8 两档都跑全部四项；es7/es9 仍为 `go`、`func`（由变体维度决定，不是档位裁剪） |
 | `postgresql` | `go` sink 套件 + `func` TP-P01..P20 + `load`、`bench`、`scale`、`compat` —— 六项两档全跑（套件清单两档一致；compat 的覆盖随矩阵行变化 —— normal 只验证 pg16，heavy 把 pg14..pg18 拆成 5 个并行行） |
 
-`profile` 决定**跑多少**，`variant` 决定**跑在哪个版本上**（`57`/`80`、`pg14`..`pg18`、`es7`/`es8`/`es9`、
+`profile` 决定**跑多少**，`variant` 决定**跑在哪个版本上**（`57`/`80`/`84`、`pg14`..`pg18`、`es7`/`es8`/`es9`、
 Doris 的 `2.1.x` tag）。两者都不从环境推断。映射表只有一处：`logger.sh: it_apply_variant`；
 它被调用两次，因为子进程的 export 无法回传给父进程 —— `run.sh` 在自己进程里调它（套件要读
 `ES_URL`、`ES_SINK_VERSION`、`PG_EXPECT_MAJOR`），`setup.sh` 在子进程里调它来选镜像

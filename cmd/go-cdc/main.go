@@ -105,6 +105,12 @@ func run(args []string) (code int) {
 	db.SetWarn(func(msg string, args ...any) {
 		logger.Warn(msg, args...)
 	})
+	// Captured tables stay in the binlog allow-list after the selector narrows;
+	// catalogue VECTOR checks must see the same set as LimitTables.
+	db.SetCapturedTables(state.CapturedTables)
+	// The release decides which replication statements the source may use; it is
+	// logged once so a MySQL 8.4 startup failure can be read without guessing.
+	logger.Info("source server", "version", db.ServerVersion())
 	// The PostgreSQL sink reads the current source definition to turn a column
 	// change that restates it into PostgreSQL DDL. It borrows the catalogue handle
 	// the capture already owns and never closes it.
@@ -163,8 +169,9 @@ func run(args []string) (code int) {
 		DB:          db,
 		Stream:      stream,
 		Spill:       spill,
-		// Only Doris revalidates the target from a fresh source catalogue on
-		// resume. MySQL / Kafka / stdout / Elasticsearch must not see an extra
+		// Only Doris re-emits Schema from a fresh source catalogue on resume so
+		// the sink can re-check the target. Other sinks still Describe captured
+		// tables on default resume (VECTOR rejection) but must not see an extra
 		// Schema batch.
 		ReemitCapturedSchemas: strings.EqualFold(pipe.Sink.Type, "doris"),
 		Warn: func(msg string, args ...any) {

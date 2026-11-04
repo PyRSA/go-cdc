@@ -84,11 +84,14 @@ func (c *Capture) resumeWithOptionalSnapshot(ctx context.Context, out chan<- sou
 
 	// Doris needs a source catalogue on resume so CreateTable can re-run the
 	// full compatibility check before the first write. Other sinks leave
-	// ReemitCapturedSchemas false and keep the previous resume behaviour.
+	// ReemitCapturedSchemas false; they still Describe captured tables so a
+	// VECTOR column cannot resume into binlog output without a Schema batch.
 	if c.ReemitCapturedSchemas {
 		if err := c.emitCapturedSchemas(ctx, out, live, snapshotting); err != nil {
 			return err
 		}
+	} else if err := c.validateCapturedCatalogue(ctx, live, snapshotting); err != nil {
+		return err
 	}
 
 	route := map[string]bool{}
@@ -128,6 +131,27 @@ func (c *Capture) resumeWithOptionalSnapshot(ctx context.Context, out chan<- sou
 	return nil
 }
 
+// validateCapturedCatalogue Describes each live captured table that is not
+// being snapshotted. Snapshot tables are covered by ListTables in
+// snapshotResumeTables. A dropped table is skipped with a warning; any other
+// catalogue error — including ErrUnsupportedColumn — fails the job before
+// binlog replay starts.
+func (c *Capture) validateCapturedCatalogue(ctx context.Context, live, snapshotting map[string]struct{}) error {
+	for _, id := range capturedIDs(live, snapshotting) {
+		parts := strings.SplitN(id, ".", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		if _, err := c.DB.DescribeTable(ctx, parts[0], parts[1]); err != nil {
+			if !errors.Is(err, ErrTableNotFound) {
+				return fmt.Errorf("source.mysql: resume catalogue for %s: %w", id, err)
+			}
+			c.warn("resume: captured table no longer exists; catalogue is not revalidated", "table", id)
+		}
+	}
+	return nil
+}
+
 // emitCapturedSchemas sends the current catalogue for captured tables that are
 // not being snapshotted (snapshotTable emits its own Schema). Called only when
 // ReemitCapturedSchemas is true. A table dropped at the source is skipped with a
@@ -136,18 +160,7 @@ func (c *Capture) resumeWithOptionalSnapshot(ctx context.Context, out chan<- sou
 // job, because skipping it would silently weaken the compatibility check this
 // feature exists to enforce.
 func (c *Capture) emitCapturedSchemas(ctx context.Context, out chan<- source.Message, live, snapshotting map[string]struct{}) error {
-	ids := make([]string, 0, len(live))
-	for id := range live {
-		if _, ok := snapshotting[id]; ok {
-			continue
-		}
-		ids = append(ids, id)
-	}
-	if len(ids) == 0 {
-		return nil
-	}
-	sort.Strings(ids)
-	for _, id := range ids {
+	for _, id := range capturedIDs(live, snapshotting) {
 		parts := strings.SplitN(id, ".", 2)
 		if len(parts) != 2 {
 			continue
@@ -165,6 +178,18 @@ func (c *Capture) emitCapturedSchemas(ctx context.Context, out chan<- source.Mes
 		}
 	}
 	return nil
+}
+
+func capturedIDs(live, snapshotting map[string]struct{}) []string {
+	ids := make([]string, 0, len(live))
+	for id := range live {
+		if _, ok := snapshotting[id]; ok {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 func (c *Capture) warn(msg string, args ...any) {

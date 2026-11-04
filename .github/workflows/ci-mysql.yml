@@ -1,13 +1,13 @@
-# Reusable sink workflow: MySQL (variants 57 and 80).
+# Reusable sink workflow: MySQL (variants 57, 80 and 84).
 #
 # ci.yml calls this with only the rows MySQL owns; every matrix row gets its own
 # runner, so the fixed host port in sources/mysql/docker-compose.yml (13306)
 # never collides between parallel rows.
 #
 #   profile  normal | heavy -> func,types,load,scale  (the suite list is
-#            identical in both tiers, on 5.7 and 8.0 alike; only the writer
+#            identical in both tiers, on 5.7, 8.0 and 8.4 alike; only the writer
 #            count and the timeouts follow the tier)
-#   variant  57 | 80 -> MYSQL_TAG / MYSQL_IMAGE, mapped by `logger.sh:
+#   variant  57 | 80 | 84 -> MYSQL_TAG / MYSQL_IMAGE, mapped by `logger.sh:
 #            it_apply_variant` (run.sh and setup.sh both call it)
 name: CI / Integration
 
@@ -32,7 +32,7 @@ defaults:
 
 jobs:
   run:
-    name: MySQL → MySQL ${{ fromJSON('{"57":"5.7","80":"8.0"}')[matrix.variant] }}
+    name: MySQL → MySQL ${{ fromJSON('{"57":"5.7","80":"8.0","84":"8.4"}')[matrix.variant] }}
     runs-on: ubuntu-latest
     # Two-tier timeout: both tiers run the same suites; heavy only raises the
     # writer count and the suite timeouts.

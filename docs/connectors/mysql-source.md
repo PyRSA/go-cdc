@@ -8,7 +8,8 @@ Reads an initial snapshot and binlog changes from MySQL, and emits a unified cha
 
 | Item | Support |
 | --- | --- |
-| Source MySQL | **5.7** and **8.0** (tested: 5.7.42 / 8.0.36) |
+| Source MySQL | **5.7**, **8.0** and **8.4** (CI matrix: 5.7.42 / 8.0.36 / 8.4.11) |
+| MySQL 9.x | Experimental: no CI row; the connector avoids the statements 8.4 removed, but 9.x is not verified |
 | Binlog | `binlog_format=ROW`, `binlog_row_image=FULL` |
 | Client libraries | `go-mysql` v1.16.0, `go-sql-driver/mysql` v1.7.1 (linked into `go-cdc`) |
 | Packaging | Shipped inside the `go-cdc` binary; no separate connector install |
@@ -82,6 +83,25 @@ source:
 | `latest` | Skip snapshot; read from current position |
 | `specific-offset` | Start from file/pos or GTID |
 | `timestamp` | Start from `scan.startup.timestamp-millis` |
+
+## Version Compatibility
+
+The server release is read once per connection (`SELECT VERSION()`) and decides which replication statements the source sends:
+
+| Purpose | MySQL 5.7 / 8.0 | MySQL 8.4+ |
+| --- | --- | --- |
+| Position for `latest`, `timestamp` and the snapshot low watermark | `SHOW MASTER STATUS` | `SHOW BINARY LOG STATUS` |
+| Replica ids used by automatic `server-id` | `SHOW SLAVE HOSTS` | `SHOW REPLICAS` |
+
+- A release string that cannot be parsed (connection proxies, forks) tries the 8.4 spelling first and retries the legacy one once after `ER_PARSE_ERROR` (1064). A parsed release never falls back: a rejected statement is a real failure and is reported with the statement name and the server version.
+- MariaDB is recognised by name and always uses the legacy spelling; its `10.x` numbers are never compared against MySQL thresholds.
+- An explicit `server-id` skips the replica query entirely.
+- `caching_sha2_password` — the 8.4 default — works without TLS: both linked drivers request the server RSA public key for the full-authentication handshake. Keep `caching_sha2_password_auto_generate_rsa_keys` enabled, or pass `jdbc.properties.tls: "true"`.
+- `binlog_format` is deprecated (8.0.34+) but still reported by 5.7, 8.0, 8.4 and 9.x. Both `binlog_format=ROW` and `binlog_row_image=FULL` are required. A variable the server does not report, or a failed `SHOW VARIABLES`, fails startup instead of being assumed to be ROW: a STATEMENT or MIXED source would otherwise stream events this capture cannot replay.
+- `VECTOR(n)` columns (MySQL 9.x) are not captured. The snapshot and binlog paths would emit different Go types for the same column, so the source rejects the table and names the database, table and column whenever catalogue metadata is read for a table in the capture set (current `source.tables` match **or** checkpoint `captured_tables`, so a narrowed selector cannot leave a previously captured VECTOR table unchecked):
+  - catalogue discovery (`ListTables` on snapshot / newly-added resume);
+  - runtime `CREATE TABLE` (`DescribeTable`; a VECTOR column stops the job instead of falling back to the binlog-derived schema);
+  - default resume with `acked_offset` (`DescribeTable` on each already-captured table before binlog replay). Non-Doris sinks only validate here and do not emit an extra Schema batch; Doris still re-emits Schema so the sink can re-check the target.
 
 ## Related Docs
 

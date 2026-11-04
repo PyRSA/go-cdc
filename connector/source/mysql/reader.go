@@ -58,7 +58,8 @@ type Capture struct {
 	// ReemitCapturedSchemas reloads the source catalogue for captured tables on
 	// resume and sends Schema messages before binlog replay. Set only for sinks
 	// that need a full source↔target compatibility check on restart (Doris).
-	// MySQL / Kafka / stdout leave this false so resume stays unchanged.
+	// Other sinks leave this false: default resume still Describes captured
+	// tables (VECTOR rejection) but does not emit an extra Schema batch.
 	ReemitCapturedSchemas bool
 }
 
@@ -456,9 +457,16 @@ func (c *Capture) binlogFrom(ctx context.Context, out chan<- source.Message, pos
 				schemaMsg = commit.Schema
 				if c.DB != nil {
 					described, err := c.DB.DescribeTable(ctx, commit.Schema.Database, commit.Schema.Table)
-					if err == nil {
+					switch {
+					case err == nil:
 						schemaMsg = cloneTable(described)
-					} else {
+					case errors.Is(err, ErrUnsupportedColumn):
+						// The binlog-derived schema carries a column the snapshot and
+						// binlog paths would type differently. Falling back to it would
+						// put values of two Go types on one column, so stop the job
+						// instead of emitting a schema no sink can honour.
+						return err
+					default:
 						// Binlog CREATE schema may omit defaults, comments, charset,
 						// and secondary indexes. Prefer JDBC DescribeTable; on failure
 						// keep the binlog schema and surface the fallback explicitly.

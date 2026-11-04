@@ -363,7 +363,7 @@ jobs:
           # The display strips the shared "CI / Integration / " and "CI / "
           # prefixes, folds the three gate jobs to short labels, and keeps the
           # full-width arrow the sink rows use. Status and clock come straight
-          # from the API, so nothing is merged: MySQL 5.7 and 8.0, and ES 7/8/9,
+          # from the API, so nothing is merged: MySQL 5.7/8.0/8.4, and ES 7/8/9,
           # stay separate. A job with no clock (skipped) still shows its status.
           ORDER = (
               "decide",
@@ -371,6 +371,7 @@ jobs:
               "Build + Lint + Test",
               "MySQL \u2192 MySQL 5.7",
               "MySQL \u2192 MySQL 8.0",
+              "MySQL \u2192 MySQL 8.4",
               "MySQL \u2192 Kafka",
               "MySQL \u2192 Doris 2.1.x",
               "MySQL \u2192 Elasticsearch 7",

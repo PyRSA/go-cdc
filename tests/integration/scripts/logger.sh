@@ -130,7 +130,7 @@ it_compose_files() {
 # ---------------------------------------------------------------- variant table
 # Variant -> image mapping (the version matrix this repo must never lose):
 #
-#   mysql / stdout / kafka   57 | 80              -> MYSQL_TAG, MYSQL_IMAGE
+#   mysql / stdout / kafka   57 | 80 | 84         -> MYSQL_TAG, MYSQL_IMAGE
 #   postgresql               pg14..pg18 | 14..18  -> PG_IMAGE, PG_EXPECT_MAJOR
 #   elasticsearch            es7 | es8 | es9      -> ES_SINK_VERSION (+ URL)
 #   doris                    2.1.8                -> DORIS_VERSION
@@ -163,8 +163,15 @@ it_apply_variant() {
           export MYSQL_TAG="57"
           export MYSQL_IMAGE="${MYSQL_IMAGE:-mysql:5.7.42}"
           ;;
+        84 | 8.4 | 8.4.*)
+          # 8.4 is the first LTS: it removed SHOW MASTER STATUS and the
+          # --default-authentication-plugin option, which is exactly what this
+          # row exists to prove.
+          export MYSQL_TAG="84"
+          export MYSQL_IMAGE="${MYSQL_IMAGE:-mysql:8.4.11}"
+          ;;
         *)
-          log "error: unknown mysql variant '${variant}' (use 57 or 80)" >&2
+          log "error: unknown mysql variant '${variant}' (use 57, 80 or 84)" >&2
           return 2
           ;;
       esac
