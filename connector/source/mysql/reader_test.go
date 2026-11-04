@@ -699,9 +699,10 @@ func TestDescribeTableFailureFallsBackWithWarning(t *testing.T) {
 			StartupMode: definition.StartupInitial, Tables: sel,
 			NewlyAddedTable: false, BinlogNewlyAddedTable: true, SchemaChange: true,
 		},
+		// No captured tables: resume catalogue validation would otherwise treat
+		// describeErr as a job failure before the CREATE fallback under test.
 		State: checkpoint.State{
-			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
-			CapturedTables: []string{"db.user"},
+			AckedOffset: &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
 		},
 		DB: db, Stream: stream, Spill: OpenSpill(t.TempDir()),
 		Warn: func(msg string, _ ...any) { warns = append(warns, msg) },
@@ -785,6 +786,44 @@ func TestDescribeTableSuccessReplacesBinlogSchema(t *testing.T) {
 		}
 	}
 	t.Fatal("missing schema message")
+}
+
+func TestDefaultResumeRejectsCapturedUnsupportedColumn(t *testing.T) {
+	// Default resume (no Schema reemit) must still Describe captured tables so a
+	// VECTOR column left in the checkpoint cannot resume into binlog output.
+	db := newMemDB(nil)
+	db.describeErr = fmt.Errorf("%w: db.user.embedding has type vector(1536)", ErrUnsupportedColumn)
+	stream := &memStream{events: []Commit{
+		{Event: &event.Event{Op: event.OpCreate, Database: "db", Table: "user", SourceDatabase: "db", SourceTable: "user", After: map[string]any{"id": "1"}}},
+		{Position: &checkpoint.Position{File: "mysql-bin.000001", Pos: 500}},
+	}}
+	cap := &Capture{
+		Config: definition.Source{StartupMode: definition.StartupInitial, Tables: mustSelector(t)},
+		State: checkpoint.State{
+			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
+			CapturedTables: []string{"db.user"},
+		},
+		DB: db, Stream: stream, Spill: OpenSpill(t.TempDir()),
+	}
+	var got error
+	for _, msg := range collect(t, cap) {
+		if msg.Err != nil {
+			got = msg.Err
+			break
+		}
+		if msg.Event != nil {
+			t.Fatal("VECTOR rejection must stop before any binlog event is emitted")
+		}
+	}
+	if !errors.Is(got, ErrUnsupportedColumn) {
+		t.Fatalf("got %v, want ErrUnsupportedColumn", got)
+	}
+	if !strings.Contains(got.Error(), "db.user") {
+		t.Fatalf("error must name the captured table, got %v", got)
+	}
+	if stream.got.Pos != 0 {
+		t.Fatalf("binlog must not start after a VECTOR rejection, ReadFrom got pos %d", stream.got.Pos)
+	}
 }
 
 func TestResumeReemitsCapturedTableSchema(t *testing.T) {

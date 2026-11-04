@@ -98,7 +98,10 @@ The server release is read once per connection (`SELECT VERSION()`) and decides 
 - An explicit `server-id` skips the replica query entirely.
 - `caching_sha2_password` — the 8.4 default — works without TLS: both linked drivers request the server RSA public key for the full-authentication handshake. Keep `caching_sha2_password_auto_generate_rsa_keys` enabled, or pass `jdbc.properties.tls: "true"`.
 - `binlog_format` is deprecated (8.0.34+) but still reported by 5.7, 8.0, 8.4 and 9.x. Both `binlog_format=ROW` and `binlog_row_image=FULL` are required. A variable the server does not report, or a failed `SHOW VARIABLES`, fails startup instead of being assumed to be ROW: a STATEMENT or MIXED source would otherwise stream events this capture cannot replay.
-- `VECTOR(n)` columns (MySQL 9.x) are not captured. A captured table that has one is rejected during catalogue discovery, and the error names the database, table and column, because the snapshot and binlog paths would emit different Go types for it. A runtime `CREATE TABLE` that brings such a column fails the same way: the source describes the new table through `DescribeTable`, and a `VECTOR` column stops the job instead of falling back to the binlog schema and carrying on.
+- `VECTOR(n)` columns (MySQL 9.x) are not captured. The snapshot and binlog paths would emit different Go types for the same column, so the source rejects the table and names the database, table and column whenever catalogue metadata is read for a table in the capture set (current `source.tables` match **or** checkpoint `captured_tables`, so a narrowed selector cannot leave a previously captured VECTOR table unchecked):
+  - catalogue discovery (`ListTables` on snapshot / newly-added resume);
+  - runtime `CREATE TABLE` (`DescribeTable`; a VECTOR column stops the job instead of falling back to the binlog-derived schema);
+  - default resume with `acked_offset` (`DescribeTable` on each already-captured table before binlog replay). Non-Doris sinks only validate here and do not emit an extra Schema batch; Doris still re-emits Schema so the sink can re-check the target.
 
 ## Related Docs
 

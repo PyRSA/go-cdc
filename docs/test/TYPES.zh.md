@@ -37,7 +37,7 @@ CDC 最容易翻车的是：
 
 ## 未覆盖
 
-`VECTOR(n)`（MySQL 9.x）尚未分类：快照路径返回文本，binlog 路径返回原始字节。因此 source 在 catalog 发现阶段直接拒绝采集含向量列的表，错误信息给出 database、table 和 column，而不是把两条路径类型不一致的值继续往下游送。套件不埋这类列。
+`VECTOR(n)`（MySQL 9.x）尚未分类：快照路径返回文本，binlog 路径返回原始字节。因此 source 在读取该表 catalogue 元数据时直接拒绝采集（发现阶段、运行中 `CREATE TABLE`、以及默认 checkpoint 恢复），错误信息给出 database、table 和 column，而不是把两条路径类型不一致的值继续往下游送。套件不埋这类列。
 
 ## 测试点
 

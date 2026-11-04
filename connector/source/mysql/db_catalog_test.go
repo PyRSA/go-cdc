@@ -102,6 +102,19 @@ func TestRejectUnsupportedColumns(t *testing.T) {
 		}
 	})
 
+	t.Run("vector table retained in captured state is still checked", func(t *testing.T) {
+		// Binlog resume keeps previously captured tables even after the selector
+		// narrows; ListTables must reject VECTOR on those tables too.
+		db.SetCapturedTables([]string{"shop.archive_items"})
+		err := db.rejectUnsupportedColumns([]schema.Table{archived}, false)
+		if err == nil {
+			t.Fatal("a previously captured VECTOR table must be rejected even when excluded by the selector")
+		}
+		if !strings.Contains(err.Error(), "shop.archive_items.embedding") {
+			t.Fatalf("error %q does not name the captured table", err)
+		}
+	})
+
 	t.Run("explicit describe rejects excluded table", func(t *testing.T) {
 		// DescribeTable only runs for a table that is being captured (binlog
 		// CREATE refresh, resume revalidation), so the selector no longer

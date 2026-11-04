@@ -58,7 +58,8 @@ type Capture struct {
 	// ReemitCapturedSchemas reloads the source catalogue for captured tables on
 	// resume and sends Schema messages before binlog replay. Set only for sinks
 	// that need a full source↔target compatibility check on restart (Doris).
-	// MySQL / Kafka / stdout leave this false so resume stays unchanged.
+	// Other sinks leave this false: default resume still Describes captured
+	// tables (VECTOR rejection) but does not emit an extra Schema batch.
 	ReemitCapturedSchemas bool
 }
 

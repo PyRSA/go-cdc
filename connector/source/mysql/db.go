@@ -22,17 +22,34 @@ import (
 
 // sqlDB reads snapshot chunks and catalog metadata. It does not dump binlog.
 type sqlDB struct {
-	db      *sql.DB
-	cfg     definition.Source
-	types   map[string]string
-	server  uint32
-	version serverVersion        // probed once in OpenDB; may be unknown
-	warn    func(string, ...any) // optional; e.g. skipped functional indexes
+	db       *sql.DB
+	cfg      definition.Source
+	types    map[string]string
+	server   uint32
+	version  serverVersion        // probed once in OpenDB; may be unknown
+	warn     func(string, ...any) // optional; e.g. skipped functional indexes
+	captured map[string]struct{}  // checkpoint captured_tables; resume may keep them outside the selector
 }
 
 // SetWarn installs an optional warning callback used during catalog discovery.
 func (d *sqlDB) SetWarn(fn func(string, ...any)) {
 	d.warn = fn
+}
+
+// SetCapturedTables records checkpoint captured_tables so ListTables VECTOR
+// checks cover tables that binlog resume still consumes after the selector narrows.
+func (d *sqlDB) SetCapturedTables(ids []string) {
+	if len(ids) == 0 {
+		d.captured = nil
+		return
+	}
+	d.captured = make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		d.captured[id] = struct{}{}
+	}
 }
 
 // OpenDB opens the JDBC-style connection used for snapshot reads and checks ROW/FULL.
@@ -584,11 +601,13 @@ func unsupportedColumnType(mysqlType string) bool {
 // rejectUnsupportedColumns fails the table before any row is read instead of
 // streaming a column the two capture paths disagree on. explicit marks a
 // single-table describe, which only happens when that table is captured.
-// ListTables sees every non-system table, so it checks the captured ones only:
-// a VECTOR table outside source.tables must not stop the job.
+// ListTables sees every non-system table, so it checks the capture set only:
+// tables matching source.tables, plus checkpoint captured_tables that binlog
+// resume still consumes after the selector narrows. A VECTOR table in neither
+// set must not stop the job.
 func (d *sqlDB) rejectUnsupportedColumns(tables []schema.Table, explicit bool) error {
 	for _, table := range tables {
-		if !explicit && (d.cfg.Tables == nil || !d.cfg.Tables.Match(table.Database, table.Table)) {
+		if !explicit && !d.inCaptureScope(table) {
 			continue
 		}
 		for _, column := range table.Columns {
@@ -599,6 +618,16 @@ func (d *sqlDB) rejectUnsupportedColumns(tables []schema.Table, explicit bool) e
 		}
 	}
 	return nil
+}
+
+// inCaptureScope reports whether ListTables should apply unsupported-column
+// checks to table: current selector match, or retained in captured_tables.
+func (d *sqlDB) inCaptureScope(table schema.Table) bool {
+	id := table.Database + "." + table.Table
+	if _, ok := d.captured[id]; ok {
+		return true
+	}
+	return d.cfg.Tables != nil && d.cfg.Tables.Match(table.Database, table.Table)
 }
 
 func nullString(value sql.NullString) string {
