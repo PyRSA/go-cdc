@@ -134,7 +134,7 @@ func writeValue(b *strings.Builder, value slog.Value) {
 	case slog.KindString:
 		s := value.String()
 		if strings.IndexFunc(s, func(r rune) bool { return r == ' ' || r == '"' || r == '=' }) >= 0 {
-			b.WriteString(fmt.Sprintf("%q", s))
+			fmt.Fprintf(b, "%q", s)
 		} else {
 			b.WriteString(s)
 		}
