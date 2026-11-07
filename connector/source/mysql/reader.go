@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/PyRSA/go-cdc/common/event"
+	"github.com/PyRSA/go-cdc/common/logfmt"
 	"github.com/PyRSA/go-cdc/common/schema"
 	"github.com/PyRSA/go-cdc/composer/definition"
 	"github.com/PyRSA/go-cdc/connector/source"
@@ -104,11 +105,16 @@ func (c *Capture) Read(ctx context.Context) (<-chan event.Event, error) {
 // Open implements source.Source. Connections are opened by the caller-supplied DB.
 func (c *Capture) Open(context.Context) error { return nil }
 
-// Close closes the snapshot database and the binlog stream.
+// Close closes the spill handles, binlog stream, and snapshot database.
 func (c *Capture) Close() error {
 	var err error
+	if c.Spill != nil {
+		err = c.Spill.Close()
+	}
 	if c.Stream != nil {
-		err = c.Stream.Close()
+		if streamErr := c.Stream.Close(); err == nil {
+			err = streamErr
+		}
 	}
 	if c.DB != nil {
 		if dbErr := c.DB.Close(); err == nil {
@@ -436,6 +442,8 @@ func (c *Capture) binlogFrom(ctx context.Context, out chan<- source.Message, pos
 	if c.Stream == nil {
 		return fmt.Errorf("source.mysql: binlog stream is not open")
 	}
+	logfmt.Module("source").Info("Starting binlog synchronization",
+		"position", formatBinlogStartPosition(pos))
 	commits, err := c.Stream.ReadFrom(ctx, pos)
 	if err != nil {
 		return err
@@ -639,6 +647,20 @@ func projectedColumns(table schema.Table) []string {
 		out[i] = column.Name
 	}
 	return out
+}
+
+func formatBinlogStartPosition(pos checkpoint.Position) string {
+	if pos.File != "" || pos.Pos != 0 {
+		out := fmt.Sprintf("%s:%d", pos.File, pos.Pos)
+		if pos.GTID != "" {
+			return out + " gtid=" + pos.GTID
+		}
+		return out
+	}
+	if pos.GTID != "" {
+		return "gtid=" + pos.GTID
+	}
+	return "none"
 }
 
 // ChunkKeyAllowed reports whether a MySQL type may be a snapshot chunk key.

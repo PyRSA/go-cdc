@@ -9,9 +9,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/PyRSA/go-cdc/common/event"
 	"github.com/PyRSA/go-cdc/runtime/checkpoint"
@@ -38,9 +40,10 @@ var ErrSpillCorrupt = errors.New("spill corrupt")
 //     sink+checkpoint durability then PersistReplay (or Remove after Captured).
 //     A crash before PersistReplay/Remove re-delivers spill events (duplicates).
 type Spill struct {
-	dir string
-	mu  sync.Mutex
-	tab map[string]*spillTable
+	dir    string
+	mu     sync.Mutex
+	tab    map[string]*spillTable
+	closed bool
 }
 
 type spillTable struct {
@@ -64,8 +67,42 @@ type spillLine struct {
 }
 
 // OpenSpill prepares a spill directory. Existing files are opened lazily per table.
+// Callers must Close the Spill (or Remove each table) so OS file handles are
+// released — required on Windows before the directory can be deleted.
 func OpenSpill(dir string) *Spill {
 	return &Spill{dir: dir, tab: map[string]*spillTable{}}
+}
+
+// Close releases every open table file handle. Idempotent. After Close, further
+// AppendBatch/Drain/PersistReplay/LastPosition return ErrSpillClosed; callers
+// that need a live queue must OpenSpill again.
+func (s *Spill) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	var first error
+	for id, tab := range s.tab {
+		tab.mu.Lock()
+		tab.closed = true
+		if err := tab.closeFileLocked(); err != nil && first == nil {
+			first = fmt.Errorf("spill: close %s: %w", id, err)
+		}
+		tab.mu.Unlock()
+	}
+	return first
+}
+
+// closeFileLocked closes the table's OS handle. Caller must hold t.mu.
+func (t *spillTable) closeFileLocked() error {
+	if t.f == nil {
+		return nil
+	}
+	err := t.f.Close()
+	t.f = nil
+	if err != nil && !errors.Is(err, os.ErrClosed) {
+		return err
+	}
+	return nil
 }
 
 func spillPaths(dir, id string) (binlog, off string) {
@@ -76,6 +113,9 @@ func spillPaths(dir, id string) (binlog, off string) {
 func (s *Spill) table(id string) (*spillTable, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return nil, ErrSpillClosed
+	}
 	if tab, ok := s.tab[id]; ok {
 		return tab, nil
 	}
@@ -410,6 +450,14 @@ func (s *Spill) Drain(id string, fn func(event.Event) error) error {
 		if len(batch) == 0 {
 			tab.mu.Lock()
 			corrupt := tab.corrupt
+			if !corrupt {
+				// Successful EOF: release the handle so Remove / TempDir cleanup
+				// can delete the file on Windows (sharing deny-delete while open).
+				if err := tab.closeFileLocked(); err != nil {
+					tab.mu.Unlock()
+					return fmt.Errorf("spill: close after drain %s: %w", id, err)
+				}
+			}
 			tab.mu.Unlock()
 			if corrupt {
 				rollbackReplay()
@@ -560,13 +608,34 @@ func (s *Spill) Remove(id string) error {
 		if path == "" {
 			continue
 		}
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := removeSpillPath(path); err != nil {
 			if first == nil {
 				first = fmt.Errorf("spill: remove %s: %w", path, err)
 			}
 		}
 	}
 	return first
+}
+
+// removeSpillPath deletes path. On Windows, briefly retries when another process
+// (AV/indexer) holds a transient non-sharing lock after our own handle is closed.
+// Failures are returned; callers must not ignore them.
+func removeSpillPath(path string) error {
+	err := os.Remove(path)
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if runtime.GOOS != "windows" {
+		return err
+	}
+	for i := 0; i < 5; i++ {
+		time.Sleep(time.Duration(10*(i+1)) * time.Millisecond)
+		err = os.Remove(path)
+		if err == nil || errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+	}
+	return err
 }
 
 func xidAlreadySpilled(last checkpoint.Position, hasLast bool, pos checkpoint.Position) bool {

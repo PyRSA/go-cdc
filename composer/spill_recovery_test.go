@@ -26,6 +26,7 @@ import (
 func TestSpillCrashBeforePersistReplayStillReachesSinkAfterRestart(t *testing.T) {
 	dir := t.TempDir()
 	spill := mysqlsrc.OpenSpill(dir)
+	t.Cleanup(func() { _ = spill.Close() })
 	tableID := "db.t"
 	pos := checkpoint.Position{File: "mysql-bin.000001", Pos: 100}
 	ev1 := event.Event{
@@ -87,8 +88,12 @@ func TestSpillCrashBeforePersistReplayStillReachesSinkAfterRestart(t *testing.T)
 		t.Fatalf("phase1 sink missing id=1: %#v", sk.ids())
 	}
 
-	// Phase 2: process restart — new Spill handle, no PersistReplay was written.
+	// Phase 2: process restart — release phase-1 handles, then reopen (no PersistReplay).
+	if err := spill.Close(); err != nil {
+		t.Fatal(err)
+	}
 	spill2 := mysqlsrc.OpenSpill(dir)
+	t.Cleanup(func() { _ = spill2.Close() })
 	sk2 := &recordingRowSink{}
 	ckpt2 := filepath.Join(t.TempDir(), "ckpt2.json")
 	msgs2 := make(chan source.Message, 8)
@@ -130,6 +135,7 @@ func TestSpillCrashBeforePersistReplayStillReachesSinkAfterRestart(t *testing.T)
 func TestIncompleteMultiEventSpillBatchReachesSinkAfterRedelivery(t *testing.T) {
 	dir := t.TempDir()
 	spill := mysqlsrc.OpenSpill(dir)
+	t.Cleanup(func() { _ = spill.Close() })
 	tableID := "db.t"
 	posOK := checkpoint.Position{File: "mysql-bin.000001", Pos: 100}
 	ev1 := event.Event{
@@ -175,7 +181,12 @@ func TestIncompleteMultiEventSpillBatchReachesSinkAfterRedelivery(t *testing.T) 
 	}
 	_ = f.Close()
 
+	// Restart: prior Spill must release its handle before a new OpenSpill / Remove.
+	if err := spill.Close(); err != nil {
+		t.Fatal(err)
+	}
 	spill2 := mysqlsrc.OpenSpill(dir)
+	t.Cleanup(func() { _ = spill2.Close() })
 	last, ok, err := spill2.LastPosition(tableID)
 	if err != nil {
 		t.Fatal(err)
