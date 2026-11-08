@@ -1,5 +1,7 @@
 # go-cdc
 
+<img src="logo.svg" alt="go-cdc logo" width="160">
+
 [Chinese](README.zh.md)
 
 ## Introduction
