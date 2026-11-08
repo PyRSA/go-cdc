@@ -80,7 +80,7 @@ COMMON_FILES: frozenset[str] = frozenset(
     {"go.mod", "go.sum", "Makefile", ".golangci.yml", ".gitignore"}
 )
 
-# Never a reason to run anything: prose, editor state, the generated
+# Never a reason to run anything: prose, images, editor state, the generated
 # report/checkpoint workdir, configs that are not a sink's demo, and the two
 # standalone workflows (release / repo hygiene) that are not part of the
 # routing matrix.
@@ -97,7 +97,17 @@ IGNORE_PREFIXES: tuple[str, ...] = (
 IGNORE_FILES: frozenset[str] = frozenset(
     {".github/workflows/release.yml", ".github/workflows/repo-checks.yml"}
 )
-IGNORE_SUFFIXES: tuple[str, ...] = (".md",)
+IGNORE_SUFFIXES: tuple[str, ...] = (
+    ".md",
+    ".svg",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".icns",
+)
 
 # Which variants each sink is exercised on, per profile. The tier still never
 # decides which suites run - that is static per sink in run.sh's default_suites;
