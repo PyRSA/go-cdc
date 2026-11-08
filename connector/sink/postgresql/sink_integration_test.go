@@ -563,11 +563,18 @@ func TestPostgresSinkCreatesTableFromSourceDefinition(t *testing.T) {
 	if err := env.sink.CreateTable(itUsersTable()); err != nil {
 		t.Fatalf("create again: %v", err)
 	}
-	// The same definition with a column the target does not have is refused.
+	// A replayed CREATE can carry a later ADD COLUMN the target has not seen
+	// yet. Missing columns are accepted so the job can reach that ADD and close
+	// the gap; a type that cannot store the source value is still refused.
 	wider := itUsersTable()
 	wider.Columns = append(wider.Columns, schema.Column{Name: "gone", Type: "text", Nullable: true})
-	if err := env.sink.CreateTable(wider); err == nil {
-		t.Fatal("a target that cannot hold the rows was accepted")
+	if err := env.sink.CreateTable(wider); err != nil {
+		t.Fatalf("a source-ahead definition must be accepted on replay: %v", err)
+	}
+	mismatched := itUsersTable()
+	mismatched.Columns[0].Type = "text"
+	if err := env.sink.CreateTable(mismatched); err == nil {
+		t.Fatal("a target column of another type must still be refused")
 	}
 }
 
