@@ -246,7 +246,11 @@ func (s *Sink) dropColumn(ctx context.Context, target Target, change schema.Chan
 		return err
 	}
 	if !exists {
-		return fmt.Errorf("sink.postgresql: cannot drop column %q: table %s does not exist", name, target)
+		// A replay can arrive after a later DROP TABLE already removed the table.
+		// There is no column left to drop and nothing to verify.
+		s.logger().Warn("postgresql: drop column skipped, the table is already gone",
+			"table", target.String(), "column", name)
+		return nil
 	}
 	live, ok := state.columnFold(name)
 	if !ok {
@@ -289,7 +293,10 @@ func (s *Sink) alterColumn(ctx context.Context, target Target, change schema.Cha
 		return err
 	}
 	if !exists {
-		return fmt.Errorf("sink.postgresql: cannot alter column %q: table %s does not exist", oldName, target)
+		// A replay can arrive after a later DROP TABLE already removed the table.
+		s.logger().Warn("postgresql: alter column skipped, the table is already gone",
+			"table", target.String(), "column", change.Column)
+		return nil
 	}
 	_, hasOld := state.columnFold(oldName)
 	_, hasNew := state.columnFold(newName)
@@ -437,16 +444,19 @@ func (s *Sink) dropTable(ctx context.Context, target Target) error {
 	return nil
 }
 
-// truncate empties the target table. An absent table is an error rather than a
-// silent success: TRUNCATE carries no IF EXISTS, and a pipeline whose target is
-// missing is out of sync in a way the operator has to see.
+// truncate empties the target table. An absent table is a no-op: a replay can
+// arrive after a later DROP TABLE already removed the table, and an absent
+// table already holds no rows. The skip is logged so the operator can see it.
 func (s *Sink) truncate(ctx context.Context, target Target) error {
 	_, exists, err := s.meta.refresh(ctx, target)
 	if err != nil {
 		return err
 	}
 	if !exists {
-		return fmt.Errorf("sink.postgresql: cannot truncate %s: the table does not exist", target)
+		// A replay can arrive after a later DROP TABLE already removed the table.
+		// An absent table holds no rows, so there is nothing to truncate.
+		s.logger().Warn("postgresql: truncate skipped, the table is already gone", "table", target.String())
+		return nil
 	}
 	return s.execDDL(ctx, "TRUNCATE TABLE "+target.quote())
 }

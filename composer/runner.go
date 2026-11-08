@@ -153,12 +153,14 @@ func Run(ctx context.Context, pipe *definition.Pipeline, msgs <-chan source.Mess
 					stats.rows++
 				}
 			}
-			if msg.Schema != nil || (pipe.Sink.Type == "postgresql" && msg.Event != nil && msg.Event.Op == event.OpDDL) {
-				// A schema change must not overtake the rows that came before it: the
-				// PostgreSQL sink applies DDL in its own transaction, so an unflushed
-				// batch would be written against the shape the statement is changing.
-				// Only PostgreSQL is drained here; the other sinks keep the ordering
-				// they had before this sink existed.
+			if msg.Schema != nil || (msg.Event != nil && msg.Event.Op == event.OpDDL) {
+				// A schema change must not overtake the rows that came before it.
+				// Every sink gets this drain, not only PostgreSQL: an ALTER can add
+				// a NOT NULL column that the pending rows do not carry, and writing
+				// those rows after the ALTER fails them with "field doesn't have a
+				// default value". PostgreSQL needs it for a second reason: it applies
+				// DDL in its own transaction, so an unflushed batch would be written
+				// against the shape the statement is changing.
 				if err := flush(); err != nil {
 					return err
 				}

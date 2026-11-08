@@ -388,24 +388,57 @@ func (m *metadata) boolQuery(ctx context.Context, statement string, arg string) 
 // that exists under the right name can still miss a column, hold it with
 // another type, or refuse the NULLs the source sends.
 func validateTargetTable(table schema.Table, state tableState) error {
-	var problems []string
+	problems, err := targetTableProblems(table, state)
+	if err != nil {
+		return err
+	}
+	all := append(append([]string(nil), problems.missing...), problems.other...)
+	if len(all) > 0 {
+		return incompatibleTarget(state, all)
+	}
+	return nil
+}
+
+// incompatibleTarget renders the problem list of one target table.
+func incompatibleTarget(state tableState, problems []string) error {
+	return fmt.Errorf("sink.postgresql: table %s.%s is not compatible with the source definition: %s",
+		state.Schema, state.Name, strings.Join(problems, "; "))
+}
+
+// targetProblems is one difference between the source definition and the live
+// target, kept structured so the caller can decide whether it is fatal.
+type targetProblems struct {
+	// missing are columns the source definition announces and the target does
+	// not have yet. A replay of a CREATE TABLE can arrive before the ALTER that
+	// adds them, so they are not fatal for an existing target.
+	missing []string
+	// other are differences that make a write fail.
+	other []string
+}
+
+func (p targetProblems) fatal() []string { return p.other }
+
+// targetTableProblems lists every way the live target differs from the source
+// definition, split into columns that are not there yet and everything else.
+func targetTableProblems(table schema.Table, state tableState) (targetProblems, error) {
+	var out targetProblems
 	for _, column := range table.Columns {
 		pgType, err := mapColumnType(column.Type)
 		if err != nil {
-			return fmt.Errorf("sink.postgresql: table %s column %s: %w",
+			return targetProblems{}, fmt.Errorf("sink.postgresql: table %s column %s: %w",
 				schema.Qualified(table.Database, table.Table), column.Name, err)
 		}
 		live, ok := state.column(column.Name)
 		if !ok {
-			problems = append(problems, fmt.Sprintf("column %q is missing", column.Name))
+			out.missing = append(out.missing, fmt.Sprintf("column %q is missing", column.Name))
 			continue
 		}
 		if !samePGType(pgType, live.Type) {
-			problems = append(problems, fmt.Sprintf("column %q is %s, the source %s maps to %s",
+			out.other = append(out.other, fmt.Sprintf("column %q is %s, the source %s maps to %s",
 				column.Name, live.Type, column.Type, pgType))
 		}
 		if live.NotNull && column.Nullable {
-			problems = append(problems, fmt.Sprintf("column %q is NOT NULL while the source column is nullable", column.Name))
+			out.other = append(out.other, fmt.Sprintf("column %q is NOT NULL while the source column is nullable", column.Name))
 		}
 	}
 	// A column the source definition does not project still has to accept a row,
@@ -415,18 +448,31 @@ func validateTargetTable(table schema.Table, state tableState) error {
 			continue
 		}
 		if live.NotNull && !live.HasDefault {
-			problems = append(problems, fmt.Sprintf("column %q is not in the source definition and is NOT NULL without a default", live.Name))
+			out.other = append(out.other, fmt.Sprintf("column %q is not in the source definition and is NOT NULL without a default", live.Name))
 		}
 	}
 	if len(table.PrimaryKeys) > 0 {
 		if !containsKey(state.keys(), table.PrimaryKeys) {
-			problems = append(problems, fmt.Sprintf("no primary key or unique constraint covers the source key (%s)",
+			out.other = append(out.other, fmt.Sprintf("no primary key or unique constraint covers the source key (%s)",
 				strings.Join(table.PrimaryKeys, ", ")))
 		}
 	}
-	if len(problems) > 0 {
-		return fmt.Errorf("sink.postgresql: table %s.%s is not compatible with the source definition: %s",
-			state.Schema, state.Name, strings.Join(problems, "; "))
+	return out, nil
+}
+
+// validateExistingTarget accepts an existing table that is missing columns the
+// source definition announces, because a replay of the CREATE TABLE can arrive
+// before the ALTER that adds them. Everything that would make a write fail is
+// still refused: a column of another type, a column NOT NULL where the source
+// is nullable, a target-only column NOT NULL without a default, or a missing
+// conflict target.
+func validateExistingTarget(table schema.Table, state tableState) error {
+	problems, err := targetTableProblems(table, state)
+	if err != nil {
+		return err
+	}
+	if fatal := problems.fatal(); len(fatal) > 0 {
+		return incompatibleTarget(state, fatal)
 	}
 	return nil
 }

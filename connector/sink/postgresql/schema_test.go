@@ -560,15 +560,60 @@ func TestDestructiveChangeNeedsItsOwnSwitch(t *testing.T) {
 	}
 }
 
-// TestTruncateRefusesMissingTable covers the difference from DROP TABLE: TRUNCATE
-// carries no IF EXISTS, so an absent target is a pipeline that is out of sync.
-func TestTruncateRefusesMissingTable(t *testing.T) {
+// TestTruncateOnMissingTableIsNoop covers the replay case: a TRUNCATE can be
+// replayed after a later DROP TABLE already removed the table, and an absent
+// table holds no rows, so there is nothing left to truncate.
+func TestTruncateOnMissingTableIsNoop(t *testing.T) {
 	sink := ddlSink(&fakePool{}, &fakeQuerier{})
 	sink.cfg.SchemaChange = true
 	sink.cfg.DropTruncate = true
 	err := sink.ApplySchema(schema.Change{Action: schema.ActionTruncate, Database: "public", Table: "users", DDL: "TRUNCATE TABLE users"})
-	if err == nil || !strings.Contains(err.Error(), "does not exist") {
-		t.Fatalf("err %v", err)
+	if err != nil {
+		t.Fatalf("a missing table must be a no-op on replay: %v", err)
+	}
+}
+
+// TestUnsupportedActionsStillFailOnAMissingTable guards the scope of the two
+// no-op paths: the absent-object case is relaxed only for the statements whose
+// target state is already reached. Everything the sink cannot reproduce keeps
+// its error, whether or not the table exists.
+func TestUnsupportedActionsStillFailOnAMissingTable(t *testing.T) {
+	cases := []struct {
+		name   string
+		action schema.Action
+	}{
+		{"rename table", schema.ActionRenameTable},
+		{"unclassified", schema.ActionOther},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sink := ddlSink(&fakePool{}, &fakeQuerier{})
+			sink.cfg.SchemaChange = true
+			sink.cfg.DropTruncate = true
+			err := sink.ApplySchema(schema.Change{
+				Action: tc.action, Database: "public", Table: "users",
+				DDL: "RENAME TABLE users TO users_old",
+			})
+			if err == nil {
+				t.Fatal("an unsupported change must not become a silent success on a missing table")
+			}
+			if !strings.Contains(err.Error(), "not supported") {
+				t.Fatalf("the error must say the change is unsupported: %v", err)
+			}
+		})
+	}
+}
+
+// TestTruncateWithoutTheSwitchIsStillRefused proves the no-op path does not run
+// before the policy check: a TRUNCATE the operator did not authorise is refused
+// even when the table happens to be gone.
+func TestTruncateWithoutTheSwitchIsStillRefused(t *testing.T) {
+	sink := ddlSink(&fakePool{}, &fakeQuerier{})
+	sink.cfg.SchemaChange = true
+	sink.cfg.DropTruncate = false
+	err := sink.ApplySchema(schema.Change{Action: schema.ActionTruncate, Database: "public", Table: "users", DDL: "TRUNCATE TABLE users"})
+	if err == nil || !strings.Contains(err.Error(), "drop-truncate.enabled") {
+		t.Fatalf("an unauthorised TRUNCATE must be refused: %v", err)
 	}
 }
 
@@ -1171,12 +1216,61 @@ func TestDropColumnAllowsHarmlessDependency(t *testing.T) {
 	}
 }
 
-func TestDropColumnOnMissingTableFails(t *testing.T) {
+// TestDropColumnOnMissingTableIsNoop covers the replay case: a DROP COLUMN can
+// be replayed after a later DROP TABLE already removed the table, so there is
+// no column left to drop and nothing to verify.
+func TestDropColumnOnMissingTableIsNoop(t *testing.T) {
 	sink := ddlSink(&fakePool{}, &fakeQuerier{})
 	change := schema.Change{Action: schema.ActionDropColumn, Database: "public", Table: "users", Column: "note"}
-	err := sink.ApplySchema(change)
-	if err == nil || !strings.Contains(err.Error(), "does not exist") {
-		t.Fatalf("err %v", err)
+	if err := sink.ApplySchema(change); err != nil {
+		t.Fatalf("a missing table must be a no-op on replay: %v", err)
+	}
+}
+
+// TestAlterColumnOnMissingTableIsNoop covers the same replay case for RENAME,
+// CHANGE and MODIFY: a later DROP TABLE can remove the table before the column
+// change is replayed, and there is then nothing left to rename or retype.
+func TestAlterColumnOnMissingTableIsNoop(t *testing.T) {
+	cases := []struct {
+		name   string
+		change schema.Change
+	}{
+		{
+			name: "rename",
+			change: schema.Change{
+				Action: schema.ActionRenameColumn, Database: "public", Table: "users",
+				Column: "name", NewName: "label",
+				DDL: "ALTER TABLE users RENAME COLUMN name TO label",
+			},
+		},
+		{
+			name: "change",
+			change: schema.Change{
+				Action: schema.ActionRenameColumn, Database: "public", Table: "users",
+				Column: "name", NewName: "label", SourceDatabase: "app", SourceTable: "users",
+				DDL: "ALTER TABLE users CHANGE name label varchar(64) NOT NULL",
+			},
+		},
+		{
+			name: "modify",
+			change: schema.Change{
+				Action: schema.ActionModifyColumn, Database: "public", Table: "users",
+				Column: "name", SourceDatabase: "app", SourceTable: "users",
+				DDL: "ALTER TABLE users MODIFY name varchar(64)",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &fakePool{}
+			sink := ddlSink(p, &fakeQuerier{})
+			if err := sink.ApplySchema(tc.change); err != nil {
+				t.Fatalf("a missing table must be a no-op on replay: %v", err)
+			}
+			if p.begins != 0 {
+				t.Fatalf("no DDL must run against a missing table: begins=%d", p.begins)
+			}
+		})
 	}
 }
 

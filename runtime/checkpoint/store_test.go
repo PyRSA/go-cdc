@@ -3,6 +3,8 @@ package checkpoint
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"syscall"
 	"testing"
 )
 
@@ -87,5 +89,47 @@ func TestTempFileIsNotTheCheckpoint(t *testing.T) {
 	}
 	if state.LowWatermark != nil {
 		t.Fatal("temp file was loaded")
+	}
+}
+
+func TestDirSyncUnsupported(t *testing.T) {
+	if !dirSyncUnsupported(&os.PathError{Op: "sync", Path: "dir", Err: syscall.ENOTSUP}) {
+		t.Fatal("ENOTSUP must not fail the save")
+	}
+	denied := &os.PathError{Op: "sync", Path: "dir", Err: syscall.Errno(5)}
+	if runtime.GOOS == "windows" {
+		if !dirSyncUnsupported(denied) {
+			t.Fatal("Windows directory sync access denied is not a failed save")
+		}
+		return
+	}
+	if dirSyncUnsupported(denied) {
+		t.Fatal("Unix EIO must fail the save")
+	}
+}
+
+// TestSaveFlushesCheckpointDirectory proves the successful Save path waits for
+// the parent directory flush after rename. Without that call, a power loss can
+// still show the previous checkpoint entry.
+func TestSaveFlushesCheckpointDirectory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "checkpoint.ckpt")
+	var flushed string
+	orig := flushCheckpointDir
+	t.Cleanup(func() { flushCheckpointDir = orig })
+	flushCheckpointDir = func(got string) error {
+		flushed = got
+		return syncDir(got)
+	}
+	if err := (Store{Path: path}).Save(State{
+		AckedOffset: &Position{File: "mysql-bin.000001", Pos: 100},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if flushed != dir {
+		t.Fatalf("Save must flush the checkpoint directory after rename: got %q want %q", flushed, dir)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("checkpoint must still be durable: %v", err)
 	}
 }

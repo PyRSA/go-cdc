@@ -1095,9 +1095,10 @@ func TestPostgresFlushFailureDoesNotRunDDL(t *testing.T) {
 	}
 }
 
-// TestPostgresOtherSinksKeepTheirOwnOrdering guards the flush rule above: only
-// PostgreSQL is drained ahead of a DDL event.
-func TestPostgresOtherSinksKeepTheirOwnOrdering(t *testing.T) {
+// TestEverySinkDrainsPendingRowsBeforeDDL guards the ordering rule: an ALTER
+// can add a NOT NULL column the pending rows do not carry, so every sink gets
+// the drain, not only PostgreSQL.
+func TestEverySinkDrainsPendingRowsBeforeDDL(t *testing.T) {
 	for _, sinkType := range []string{"mysql", "stdout", "kafka", "doris"} {
 		sk := &postgresRunnerSink{}
 		msgs := make(chan source.Message, 2)
@@ -1125,10 +1126,22 @@ func TestPostgresOtherSinksKeepTheirOwnOrdering(t *testing.T) {
 		if err := Run(context.Background(), pipeline, msgs, sk, checkpoint.Store{Path: path}, checkpoint.State{}, nil); err != nil {
 			t.Fatalf("%s: %v", sinkType, err)
 		}
-		// The pending batch reaches the sink only through the shutdown flush, so a
-		// sink other than PostgreSQL sees the statement first.
-		if len(sk.order) == 0 || sk.order[0] != "ddl" {
-			t.Fatalf("%s: the batch was drained before DDL: %#v", sinkType, sk.order)
+		// The pending row must reach the sink before the statement runs.
+		write, ddl := -1, -1
+		for i, step := range sk.order {
+			switch step {
+			case "write":
+				if write < 0 {
+					write = i
+				}
+			case "ddl":
+				if ddl < 0 {
+					ddl = i
+				}
+			}
+		}
+		if write < 0 || ddl < 0 || write >= ddl {
+			t.Fatalf("%s: expected write before ddl, got %#v", sinkType, sk.order)
 		}
 	}
 }

@@ -130,11 +130,13 @@ DDL comes from the source when `source.schema-change.enabled` is `true` (default
 | Location | Option | Default | Description |
 | --- | --- | --- | --- |
 | `source` | `schema-change.enabled` | `true` | Capture DDL when `true` |
-| `sink` | `schema.change.drop-truncate.enabled` | `false` | Allow DROP TABLE / TRUNCATE on MySQL sink when `true`; rejected for Doris and PostgreSQL |
-| `sink` | `schema.change.enabled` | `false` | **Doris only** (rejected for mysql / kafka / stdout / postgresql): apply whitelisted `ADD COLUMN` when `true` |
-| `sink` | `schema.change.include` | `["add.column"]` | **Doris only** (rejected for mysql / kafka / stdout / postgresql): v1 accepts only `add.column` |
+| `sink` | `schema.change.drop-truncate.enabled` | `false` | Allow DROP TABLE / TRUNCATE on MySQL and PostgreSQL when `true`; rejected for Doris |
+| `sink` | `schema.change.enabled` | `false` | **Doris and PostgreSQL** (rejected for mysql / kafka / stdout / elasticsearch). When `true`, the sink applies the changes its include list allows |
+| `sink` | `schema.change.include` | Doris: `["add.column"]`; PostgreSQL: unset (every kind the other switches allow) | **Doris and PostgreSQL** (rejected for mysql / kafka / stdout / elasticsearch). Doris accepts only `add.column`. PostgreSQL accepts `add.column`, `drop.column`, `rename.column`, `modify.column`, `drop.table`, `truncate` |
 
 ### Behavior summary
+
+Before any `Schema` announcement or `OpDDL` event is applied, the runner flushes every sink's pending rows. That ordering is the same for stdout, MySQL, Kafka, Doris, Elasticsearch, and PostgreSQL: an `ALTER` that adds a `NOT NULL` column must not overtake the rows that still lack it, and sinks that apply DDL in their own transaction must not write an unflushed batch against the shape the statement is changing.
 
 **MySQL sink** honors `schemaevol.Decide` (`Execute`) and `schema.change.drop-truncate.enabled`:
 
@@ -163,7 +165,7 @@ DDL comes from the source when `source.schema-change.enabled` is `true` (default
 | CREATE TABLE | Applied through `auto-create-table` / the inferred schema, then validated |
 | Other / unprojected columns | Ignored when no Doris action is required |
 
-**PostgreSQL** applies column changes from the source definition, in its own dialect, and only when the switches say so. Rows still held by the runner are flushed before any DDL runs, and every applied change is re-read from `pg_catalog` before the checkpoint moves past it:
+**PostgreSQL** applies column changes from the source definition, in its own dialect, and only when the switches say so. Like every other sink, rows still held by the runner are flushed before any DDL runs; every applied change is then re-read from `pg_catalog` before the checkpoint moves past it:
 
 | DDL kind | PostgreSQL sink |
 | --- | --- |

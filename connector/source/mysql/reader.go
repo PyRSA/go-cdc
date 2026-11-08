@@ -541,6 +541,14 @@ func (c *Capture) binlogFrom(ctx context.Context, out chan<- source.Message, pos
 			}
 			if commit.Position != nil {
 				xid := *commit.Position
+				// The buffered rows are spooled before this position is published,
+				// whichever kind of position it is. A DDL statement end is not an
+				// XID: the same-transaction rows of that DDL are not pending
+				// (MySQL commits implicitly and the XID comes first), but rows
+				// from other tables can still sit in this buffer and are then
+				// recorded under the DDL position. Spooling unconditionally is
+				// the safe order: a row is never left only in memory at the
+				// moment a position that covers it may be saved.
 				for id, items := range pending {
 					if len(items) == 0 {
 						continue

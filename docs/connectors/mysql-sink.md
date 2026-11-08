@@ -44,8 +44,24 @@ See [`configs/demo-mysql.yaml`](../../configs/demo-mysql.yaml). Target table nam
 | `auto-create-table` | no | `true` | Boolean | Create database/table from inferred schema when missing (columns after projection/route, plus comments, charset/collation, defaults, secondary/unique indexes; no FK/ENGINE/partition; `AUTO_INCREMENT` starts at 1) |
 | `write-batch-size` | no | `1000` | Integer | Flush when the batch reaches this many events (≥ 1) |
 | `write-batch-interval` | no | `1s` | Duration | Time-based flush; `0` disables the timer |
-| `max-retries` | no | `3` | Integer | Extra write attempts after failure (≥ 0) |
+| `max-retries` | no | `3` | Integer | Extra attempts after a statement error that was rolled back (≥ 0). A failed `COMMIT` is not retried |
 | `schema.change.drop-truncate.enabled` | no | `false` | Boolean | Whether DROP / TRUNCATE DDL is applied to the target; see [Schema Evolution](../pipeline.md#schema-evolution) |
+
+## Delivery semantics (at-least-once)
+
+`Write` applies one batch in one transaction. The runner then saves the checkpoint as a separate file. A crash after `COMMIT` and before that file is replaced replays the batch. This is not exactly-once.
+
+Rows with a primary or unique key converge (`INSERT ... ON DUPLICATE KEY UPDATE`). A table with no such key inserts another row on replay.
+
+`max-retries` repeats a batch whose statements failed and were rolled back. A failed `COMMIT` is not retried: the server may already have committed.
+
+`ApplySchema` runs DDL before the checkpoint moves past the statement. A replay of a column change is resolved by the statement's own effect:
+
+- a replayed `ADD COLUMN` that finds the column already there (`ER_DUP_FIELDNAME`, 1060) is accepted only when the target column has the same type and nullability as the definition the change carries. The target column is read back from `information_schema.columns` for that comparison; a different type, a different width, or a different nullability stops the job with an error naming both definitions, because the target would not store what the source sends. A change without a structured definition, or a multi-column `ADD`, cannot be proven and is refused;
+- a replayed `DROP COLUMN` that finds the column already gone (`ER_CANT_DROP_FIELD_OR_KEY`, 1091) is a success with no extra query;
+- a replayed `TRUNCATE` against a table that no longer exists (`ER_NO_SUCH_TABLE`, 1146) or whose database is gone (`ER_BAD_DB_ERROR`, 1049) is a success: the table holds no rows, which is what the statement asked for. A permission refusal is not this case and keeps its error.
+
+Other DDL errors still stop the job.
 
 ## Behavior Notes
 

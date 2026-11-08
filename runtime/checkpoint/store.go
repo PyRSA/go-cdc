@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"syscall"
 )
 
 // Store is an atomic checkpoint file. A half-written temporary file is ignored.
@@ -58,5 +60,52 @@ func (s Store) Save(state State) error {
 	if err := os.Rename(tmp, s.Path); err != nil {
 		return fmt.Errorf("checkpoint: rename: %w", err)
 	}
+	// The temp file was synced. The directory entry that rename replaced is a
+	// separate write; without this, a power loss can still show the previous
+	// checkpoint and the job replays one more batch.
+	if err := flushCheckpointDir(filepath.Dir(s.Path)); err != nil {
+		return fmt.Errorf("checkpoint: sync dir: %w", err)
+	}
 	return nil
+}
+
+// flushCheckpointDir is syncDir in production. Tests replace it to prove Save
+// waits for the directory flush after rename.
+var flushCheckpointDir = syncDir
+
+// syncDir flushes the directory so the renamed checkpoint is the entry a
+// restart observes. Windows directory handles reject FlushFileBuffers; that
+// platform has no equivalent, and the error is not a failed save.
+func syncDir(dir string) error {
+	file, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = file.Sync()
+	closeErr := file.Close()
+	if err != nil {
+		if dirSyncUnsupported(err) {
+			return nil
+		}
+		return err
+	}
+	return closeErr
+}
+
+// dirSyncUnsupported reports whether errno says the platform cannot flush a
+// directory. ENOTSUP and EOPNOTSUPP are the same constant on Linux, so they are
+// compared rather than listed as switch cases: two case labels that are equal
+// do not compile.
+func dirSyncUnsupported(err error) bool {
+	var errno syscall.Errno
+	if !errors.As(err, &errno) {
+		return false
+	}
+	if errno == syscall.ENOTSUP || errno == syscall.EOPNOTSUPP || errno == syscall.EINVAL {
+		return true
+	}
+	// FlushFileBuffers on a Windows directory returns ERROR_INVALID_FUNCTION (1)
+	// or ERROR_ACCESS_DENIED (5). Unix uses 1 for EPERM and 5 for EIO, so those
+	// stay failures there.
+	return runtime.GOOS == "windows" && (errno == 1 || errno == 5)
 }
