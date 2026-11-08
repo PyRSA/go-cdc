@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/PyRSA/go-cdc/common/event"
+	"github.com/PyRSA/go-cdc/common/logfmt"
 	"github.com/PyRSA/go-cdc/common/schema"
 	"github.com/PyRSA/go-cdc/composer/definition"
 	"github.com/PyRSA/go-cdc/connector/sink"
@@ -41,6 +42,8 @@ func Run(ctx context.Context, pipe *definition.Pipeline, msgs <-chan source.Mess
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	statusTicker := time.NewTicker(statusInterval)
+	defer statusTicker.Stop()
 	var batchTick <-chan time.Time
 	if pipe.Sink.WriteBatchEvery > 0 {
 		batchTicker := time.NewTicker(pipe.Sink.WriteBatchEvery)
@@ -48,23 +51,70 @@ func Run(ctx context.Context, pipe *definition.Pipeline, msgs <-chan source.Mess
 		batchTick = batchTicker.C
 	}
 
+	pipelineLog := logfmt.Module("pipeline")
+	checkpointLog := logfmt.Module("checkpoint")
+	sinkLog := logfmt.Module("sink")
+	stats := &runStats{startedAt: time.Now(), prevAt: time.Now()}
+	stats.noteProcessed(clonePosition(state.AckedOffset))
+	if state.AckedOffset != nil {
+		// Treat the loaded file as the last known durable position until the first save.
+		stats.checkpointPos = clonePosition(state.AckedOffset)
+	}
+
+	pipelineLog.Info("Pipeline started", "name", pipe.Runtime.Name, "sink", pipe.Sink.Type)
+
 	var batch []event.Event
 	flush := func() error {
 		// Always Flush so out-of-band sink writes (e.g. Kafka ApplySchema DDL)
 		// are acknowledged before checkpoint, even when the DML batch is empty.
+		pendingRows := countRowEvents(batch)
 		if len(batch) > 0 {
 			if err := sk.Write(batch); err != nil {
+				stats.sinkErrors++
+				stats.sinkFailedBatches++
+				sinkLog.Error("Failed to write batch",
+					"sink", pipe.Sink.Type, "rows", pendingRows, "error", err)
 				return err
 			}
 			batch = batch[:0]
 		}
-		return sk.Flush()
+		started := time.Now()
+		if err := sk.Flush(); err != nil {
+			stats.sinkErrors++
+			stats.sinkFailedBatches++
+			stats.lastFlushDuration = time.Since(started)
+			sinkLog.Error("Failed to flush sink",
+				"sink", pipe.Sink.Type, "rows", pendingRows, "error", err)
+			return err
+		}
+		stats.lastFlushDuration = time.Since(started)
+		// Count only after Flush succeeds. A Write that later fails in Flush is
+		// not durable yet, so it must not appear as a flushed row.
+		stats.sinkRows += int64(pendingRows)
+		return nil
 	}
 	save := func() error {
 		if err := flush(); err != nil {
 			return err
 		}
-		return store.Save(state)
+		snapshot := clonePosition(state.AckedOffset)
+		started := time.Now()
+		if err := store.Save(state); err != nil {
+			stats.noteCheckpointFailure()
+			checkpointLog.Error("Failed to save checkpoint",
+				"position", formatPosition(snapshot), "error", err)
+			return err
+		}
+		elapsed := time.Since(started)
+		stats.noteCheckpointSuccess(snapshot, time.Now(), elapsed)
+		checkpointLog.Debug("Checkpoint saved successfully",
+			"position", formatPosition(snapshot), "elapsed", elapsed.String())
+		return nil
+	}
+	emitStatus := func() {
+		now := time.Now()
+		pipelineLog.Info(stats.statusMessage(pipe.Runtime.Name), "name", pipe.Runtime.Name)
+		stats.markStatusEmitted(now)
 	}
 
 	for {
@@ -75,6 +125,8 @@ func Run(ctx context.Context, pipe *definition.Pipeline, msgs <-chan source.Mess
 			if err := save(); err != nil {
 				return err
 			}
+		case <-statusTicker.C:
+			emitStatus()
 		case <-batchTick:
 			if err := flush(); err != nil {
 				return err
@@ -84,10 +136,22 @@ func Run(ctx context.Context, pipe *definition.Pipeline, msgs <-chan source.Mess
 				return save()
 			}
 			if msg.Err != nil {
+				stats.sourceErrors++
+				logfmt.Module("source").Error("Source capture failed", "error", msg.Err)
 				if err := save(); err != nil {
 					return err
 				}
 				return msg.Err
+			}
+			stats.events++
+			if msg.Event != nil {
+				stats.lastEventAt = time.Now()
+				switch msg.Event.Op {
+				case event.OpDDL:
+					stats.ddl++
+				case event.OpRead, event.OpCreate, event.OpUpdate, event.OpDelete:
+					stats.rows++
+				}
 			}
 			if msg.Schema != nil || (pipe.Sink.Type == "postgresql" && msg.Event != nil && msg.Event.Op == event.OpDDL) {
 				// A schema change must not overtake the rows that came before it: the
@@ -100,7 +164,13 @@ func Run(ctx context.Context, pipe *definition.Pipeline, msgs <-chan source.Mess
 				}
 			}
 			if err := applyMessage(pipe, rules, routes, sk, &state, &batch, msg, save, spill); err != nil {
+				pipelineLog.Error("Failed to apply message", "error", err)
 				return err
+			}
+			if msg.Position != nil {
+				stats.noteProcessed(&checkpoint.Position{
+					File: msg.Position.File, Pos: msg.Position.Pos, GTID: msg.Position.GTID,
+				})
 			}
 			if msg.Split != nil || msg.Position != nil || msg.Watermark != nil || msg.Captured != "" || msg.SnapshotTable != "" || (pipe.Sink.WriteBatchSize > 0 && len(batch) >= pipe.Sink.WriteBatchSize) {
 				if err := flush(); err != nil {

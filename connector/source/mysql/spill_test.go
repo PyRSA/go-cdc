@@ -11,9 +11,19 @@ import (
 	"github.com/PyRSA/go-cdc/runtime/checkpoint"
 )
 
+func openTestSpill(t *testing.T, dir string) *Spill {
+	t.Helper()
+	if dir == "" {
+		dir = t.TempDir()
+	}
+	spill := OpenSpill(dir)
+	t.Cleanup(func() { _ = spill.Close() })
+	return spill
+}
+
 func TestSpillReplayKeepsOrderAndPosition(t *testing.T) {
 	dir := t.TempDir()
-	spill := OpenSpill(dir)
+	spill := openTestSpill(t, dir)
 	first := event.Event{Op: event.OpCreate, Database: "db", Table: "order", After: map[string]any{"id": "1"}}
 	second := event.Event{Op: event.OpUpdate, Database: "db", Table: "order", After: map[string]any{"id": "1"}}
 	if err := spill.AppendBatch("db.order", checkpoint.Position{File: "mysql-bin.000001", Pos: 100}, []event.Event{first}); err != nil {
@@ -39,7 +49,7 @@ func TestSpillReplayKeepsOrderAndPosition(t *testing.T) {
 }
 
 func TestDrainClosesAndRejectsLaterAppend(t *testing.T) {
-	spill := OpenSpill(t.TempDir())
+	spill := openTestSpill(t, "")
 	if err := spill.AppendBatch("db.order", checkpoint.Position{File: "mysql-bin.000001", Pos: 100}, []event.Event{
 		{Op: event.OpCreate, Database: "db", Table: "order"},
 	}); err != nil {
@@ -72,7 +82,7 @@ func TestDrainClosesAndRejectsLaterAppend(t *testing.T) {
 }
 
 func TestRemoveLeavesTombstoneRejectsAppend(t *testing.T) {
-	spill := OpenSpill(t.TempDir())
+	spill := openTestSpill(t, "")
 	if err := spill.AppendBatch("db.order", checkpoint.Position{File: "mysql-bin.000001", Pos: 100}, []event.Event{
 		{Op: event.OpCreate, Database: "db", Table: "order"},
 	}); err != nil {
@@ -121,7 +131,7 @@ func TestXIDAlreadySpilledGTIDOnly(t *testing.T) {
 
 func TestDrainCrashBeforePersistReplayRedelivers(t *testing.T) {
 	dir := t.TempDir()
-	spill := OpenSpill(dir)
+	spill := openTestSpill(t, dir)
 	ev1 := event.Event{Op: event.OpCreate, Database: "db", Table: "t", After: map[string]any{"id": "1"}}
 	ev2 := event.Event{Op: event.OpCreate, Database: "db", Table: "t", After: map[string]any{"id": "2"}}
 	if err := spill.AppendBatch("db.t", checkpoint.Position{File: "mysql-bin.000001", Pos: 100}, []event.Event{ev1, ev2}); err != nil {
@@ -138,8 +148,11 @@ func TestDrainCrashBeforePersistReplayRedelivers(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected injected error")
 	}
-	// Simulate process restart: new Spill handle, no PersistReplay was called.
-	spill2 := OpenSpill(dir)
+	// Simulate process restart: release this process's handles, then reopen.
+	if err := spill.Close(); err != nil {
+		t.Fatal(err)
+	}
+	spill2 := openTestSpill(t, dir)
 	var ids []string
 	if err := spill2.Drain("db.t", func(item event.Event) error {
 		ids = append(ids, item.After["id"].(string))
@@ -154,7 +167,7 @@ func TestDrainCrashBeforePersistReplayRedelivers(t *testing.T) {
 
 func TestDrainSameInstanceRetryAfterCallbackError(t *testing.T) {
 	dir := t.TempDir()
-	spill := OpenSpill(dir)
+	spill := openTestSpill(t, dir)
 	id := "db.t"
 	ev1 := event.Event{Op: event.OpCreate, Database: "db", Table: "t", After: map[string]any{"id": "1"}}
 	ev2 := event.Event{Op: event.OpCreate, Database: "db", Table: "t", After: map[string]any{"id": "2"}}
@@ -187,7 +200,7 @@ func TestDrainSameInstanceRetryAfterCallbackError(t *testing.T) {
 
 func TestAppendBatchRejectedWhenCorrupt(t *testing.T) {
 	dir := t.TempDir()
-	spill := OpenSpill(dir)
+	spill := openTestSpill(t, dir)
 	id := "db.t"
 	if err := spill.AppendBatch(id, checkpoint.Position{File: "mysql-bin.000001", Pos: 100}, []event.Event{
 		{Op: event.OpCreate, Database: "db", Table: "t", After: map[string]any{"id": "1"}},
@@ -232,7 +245,7 @@ func TestDrainFailsIfCorruptMidFlight(t *testing.T) {
 	// Approximates mid-Drain corrupt (as if AppendBatch rollback failed
 	// concurrently): corrupt must not look like a successful empty Drain.
 	dir := t.TempDir()
-	spill := OpenSpill(dir)
+	spill := openTestSpill(t, dir)
 	id := "db.t"
 	if err := spill.AppendBatch(id, checkpoint.Position{File: "mysql-bin.000001", Pos: 100}, []event.Event{
 		{Op: event.OpCreate, Database: "db", Table: "t", After: map[string]any{"id": "1"}},
@@ -267,7 +280,7 @@ func TestDrainFailsIfCorruptMidFlight(t *testing.T) {
 
 func TestPersistReplaySkipsAlreadyDurableEvents(t *testing.T) {
 	dir := t.TempDir()
-	spill := OpenSpill(dir)
+	spill := openTestSpill(t, dir)
 	ev := event.Event{Op: event.OpCreate, Database: "db", Table: "t", After: map[string]any{"id": "1"}}
 	if err := spill.AppendBatch("db.t", checkpoint.Position{File: "mysql-bin.000001", Pos: 100}, []event.Event{ev}); err != nil {
 		t.Fatal(err)
@@ -278,7 +291,10 @@ func TestPersistReplaySkipsAlreadyDurableEvents(t *testing.T) {
 	if err := spill.PersistReplay("db.t"); err != nil {
 		t.Fatal(err)
 	}
-	spill2 := OpenSpill(dir)
+	if err := spill.Close(); err != nil {
+		t.Fatal(err)
+	}
+	spill2 := openTestSpill(t, dir)
 	var n int
 	if err := spill2.Drain("db.t", func(event.Event) error {
 		n++
@@ -293,7 +309,7 @@ func TestPersistReplaySkipsAlreadyDurableEvents(t *testing.T) {
 
 func TestAppendBatchPartialCrashDoesNotAdvanceLastPosition(t *testing.T) {
 	dir := t.TempDir()
-	spill := OpenSpill(dir)
+	spill := openTestSpill(t, dir)
 	id := "db.t"
 	posOK := checkpoint.Position{File: "mysql-bin.000001", Pos: 100}
 	if err := spill.AppendBatch(id, posOK, []event.Event{
@@ -326,7 +342,10 @@ func TestAppendBatchPartialCrashDoesNotAdvanceLastPosition(t *testing.T) {
 	}
 	_ = f.Close()
 
-	spill2 := OpenSpill(dir)
+	if err := spill.Close(); err != nil {
+		t.Fatal(err)
+	}
+	spill2 := openTestSpill(t, dir)
 	last, ok, err := spill2.LastPosition(id)
 	if err != nil {
 		t.Fatal(err)
@@ -386,7 +405,7 @@ func TestAppendBatchFirstCrashWithoutFenceDoesNotAdvanceLastPosition(t *testing.
 	}
 	_ = f.Close()
 
-	spill := OpenSpill(dir)
+	spill := openTestSpill(t, dir)
 	last, ok, err := spill.LastPosition(id)
 	if err != nil {
 		t.Fatal(err)
@@ -418,7 +437,7 @@ func TestAppendBatchFirstCrashWithoutFenceDoesNotAdvanceLastPosition(t *testing.
 func TestRemoveDeletesHexSpillFiles(t *testing.T) {
 	dir := t.TempDir()
 	id := "a_b.c"
-	spill := OpenSpill(dir)
+	spill := openTestSpill(t, dir)
 	if err := spill.AppendBatch(id, checkpoint.Position{File: "mysql-bin.000001", Pos: 1}, []event.Event{
 		{Op: event.OpCreate, Database: "a_b", Table: "c", After: map[string]any{"id": "1"}},
 	}); err != nil {
@@ -438,7 +457,7 @@ func TestRemoveDeletesHexSpillFiles(t *testing.T) {
 
 func TestAppendBatchIncompleteTrailingLineTruncated(t *testing.T) {
 	dir := t.TempDir()
-	spill := OpenSpill(dir)
+	spill := openTestSpill(t, dir)
 	id := "db.t"
 	if err := spill.AppendBatch(id, checkpoint.Position{File: "mysql-bin.000001", Pos: 100}, []event.Event{
 		{Op: event.OpCreate, Database: "db", Table: "t", After: map[string]any{"id": "1"}},
@@ -446,10 +465,13 @@ func TestAppendBatchIncompleteTrailingLineTruncated(t *testing.T) {
 		t.Fatal(err)
 	}
 	path, _ := spillPaths(dir, id)
+	if err := spill.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(path, append(mustRead(t, path), []byte(`{"pos":{"File":"mysql-bin.000001","Pos":200},"event":`)...), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	spill2 := OpenSpill(dir)
+	spill2 := openTestSpill(t, dir)
 	last, ok, err := spill2.LastPosition(id)
 	if err != nil || !ok || last.Pos != 100 {
 		t.Fatalf("last %#v ok %v err %v", last, ok, err)
@@ -465,7 +487,7 @@ func TestAppendBatchIncompleteTrailingLineTruncated(t *testing.T) {
 
 func TestSpillPathsDistinctForDotUnderscoreCollision(t *testing.T) {
 	dir := t.TempDir()
-	spill := OpenSpill(dir)
+	spill := openTestSpill(t, dir)
 	a := "a_b.c"
 	b := "a.b_c"
 	if err := spill.AppendBatch(a, checkpoint.Position{File: "mysql-bin.000001", Pos: 10}, []event.Event{
@@ -502,7 +524,7 @@ func TestSpillPathsDistinctForDotUnderscoreCollision(t *testing.T) {
 }
 
 func TestRemoveIdempotentMissingFiles(t *testing.T) {
-	spill := OpenSpill(t.TempDir())
+	spill := openTestSpill(t, "")
 	if err := spill.Remove("db.missing"); err != nil {
 		t.Fatal(err)
 	}
@@ -513,7 +535,7 @@ func TestRemoveIdempotentMissingFiles(t *testing.T) {
 
 func TestRemoveReportsUnexpectedFailure(t *testing.T) {
 	dir := t.TempDir()
-	spill := OpenSpill(dir)
+	spill := openTestSpill(t, dir)
 	id := "db.t"
 	if err := spill.AppendBatch(id, checkpoint.Position{File: "mysql-bin.000001", Pos: 1}, []event.Event{
 		{Op: event.OpCreate, Database: "db", Table: "t", After: map[string]any{"id": "1"}},
@@ -542,6 +564,100 @@ func TestRemoveReportsUnexpectedFailure(t *testing.T) {
 	}
 	if err := spill.Remove(id); err == nil {
 		t.Fatal("expected Remove to fail when binlog path is a non-empty directory")
+	}
+}
+
+func TestSpillCloseIdempotent(t *testing.T) {
+	spill := OpenSpill(t.TempDir())
+	if err := spill.AppendBatch("db.a", checkpoint.Position{File: "mysql-bin.000001", Pos: 1}, []event.Event{
+		{Op: event.OpCreate, Database: "db", Table: "a"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := spill.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := spill.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+func TestSpillOpsAfterClose(t *testing.T) {
+	spill := OpenSpill(t.TempDir())
+	if err := spill.AppendBatch("db.a", checkpoint.Position{File: "mysql-bin.000001", Pos: 1}, []event.Event{
+		{Op: event.OpCreate, Database: "db", Table: "a"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := spill.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := spill.AppendBatch("db.a", checkpoint.Position{File: "mysql-bin.000001", Pos: 2}, []event.Event{
+		{Op: event.OpUpdate, Database: "db", Table: "a"},
+	}); !errors.Is(err, ErrSpillClosed) {
+		t.Fatalf("AppendBatch after Close: %v", err)
+	}
+	if err := spill.Drain("db.a", func(event.Event) error { return nil }); !errors.Is(err, ErrSpillClosed) {
+		t.Fatalf("Drain after Close: %v", err)
+	}
+	if err := spill.PersistReplay("db.a"); !errors.Is(err, ErrSpillClosed) {
+		t.Fatalf("PersistReplay after Close: %v", err)
+	}
+	if _, _, err := spill.LastPosition("db.a"); !errors.Is(err, ErrSpillClosed) {
+		t.Fatalf("LastPosition after Close: %v", err)
+	}
+}
+
+func TestDrainEOFThenRemove(t *testing.T) {
+	dir := t.TempDir()
+	spill := openTestSpill(t, dir)
+	id := "db.order"
+	if err := spill.AppendBatch(id, checkpoint.Position{File: "mysql-bin.000001", Pos: 10}, []event.Event{
+		{Op: event.OpCreate, Database: "db", Table: "order", After: map[string]any{"id": "1"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	binlogPath, offPath := spillPaths(dir, id)
+	if err := spill.Drain(id, func(event.Event) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := spill.PersistReplay(id); err != nil {
+		t.Fatal(err)
+	}
+	if err := spill.Remove(id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(binlogPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("binlog still present: %v", err)
+	}
+	if _, err := os.Stat(offPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("off still present: %v", err)
+	}
+	if err := spill.AppendBatch(id, checkpoint.Position{File: "mysql-bin.000001", Pos: 20}, []event.Event{
+		{Op: event.OpCreate, Database: "db", Table: "order"},
+	}); !errors.Is(err, ErrSpillClosed) {
+		t.Fatalf("tombstone after Drain+Remove: %v", err)
+	}
+}
+
+func TestCloseReleasesMultipleTableHandles(t *testing.T) {
+	dir := t.TempDir()
+	spill := OpenSpill(dir)
+	for _, id := range []string{"db.a", "db.b", "db.c"} {
+		if err := spill.AppendBatch(id, checkpoint.Position{File: "mysql-bin.000001", Pos: 1}, []event.Event{
+			{Op: event.OpCreate, Database: "db", Table: id},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := spill.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"db.a", "db.b", "db.c"} {
+		path, _ := spillPaths(dir, id)
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("handle still open for %s: %v", id, err)
+		}
 	}
 }
 

@@ -484,7 +484,7 @@ func TestBinlogStartsWhileNewTableSnapshotIsBlocked(t *testing.T) {
 			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
 			CapturedTables: []string{"db.user"},
 		},
-		DB: db, Stream: stream, Spill: OpenSpill(t.TempDir()),
+		DB: db, Stream: stream, Spill: openTestSpill(t, ""),
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -586,7 +586,7 @@ func TestNewlyAddedSnapshotsTablesSerially(t *testing.T) {
 			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
 			CapturedTables: []string{"db.user"},
 		},
-		DB: db, Stream: stream, Spill: OpenSpill(t.TempDir()),
+		DB: db, Stream: stream, Spill: openTestSpill(t, ""),
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -704,7 +704,7 @@ func TestDescribeTableFailureFallsBackWithWarning(t *testing.T) {
 		State: checkpoint.State{
 			AckedOffset: &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
 		},
-		DB: db, Stream: stream, Spill: OpenSpill(t.TempDir()),
+		DB: db, Stream: stream, Spill: openTestSpill(t, ""),
 		Warn: func(msg string, _ ...any) { warns = append(warns, msg) },
 	}
 	msgs := collect(t, cap)
@@ -774,7 +774,7 @@ func TestDescribeTableSuccessReplacesBinlogSchema(t *testing.T) {
 			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
 			CapturedTables: []string{"db.user"},
 		},
-		DB: db, Stream: stream, Spill: OpenSpill(t.TempDir()),
+		DB: db, Stream: stream, Spill: openTestSpill(t, ""),
 	}
 	msgs := collect(t, cap)
 	for _, msg := range msgs {
@@ -803,7 +803,7 @@ func TestDefaultResumeRejectsCapturedUnsupportedColumn(t *testing.T) {
 			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
 			CapturedTables: []string{"db.user"},
 		},
-		DB: db, Stream: stream, Spill: OpenSpill(t.TempDir()),
+		DB: db, Stream: stream, Spill: openTestSpill(t, ""),
 	}
 	var got error
 	for _, msg := range collect(t, cap) {
@@ -851,7 +851,7 @@ func TestResumeReemitsCapturedTableSchema(t *testing.T) {
 			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
 			CapturedTables: []string{"db.user"},
 		},
-		DB: db, Stream: stream, Spill: OpenSpill(t.TempDir()),
+		DB: db, Stream: stream, Spill: openTestSpill(t, ""),
 		ReemitCapturedSchemas: true,
 	}
 	msgs := collect(t, cap)
@@ -880,7 +880,7 @@ func TestResumeSchemaReemitFailsOnCatalogueError(t *testing.T) {
 			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
 			CapturedTables: []string{"db.t"},
 		},
-		DB: db, Stream: &memStream{}, Spill: OpenSpill(t.TempDir()),
+		DB: db, Stream: &memStream{}, Spill: openTestSpill(t, ""),
 		ReemitCapturedSchemas: true,
 	}
 	got := captureErr(t, cap)
@@ -903,7 +903,7 @@ func TestResumeSchemaReemitSkipsDroppedTable(t *testing.T) {
 			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
 			CapturedTables: []string{"db.gone", "db.t"},
 		},
-		DB: db, Stream: &memStream{}, Spill: OpenSpill(t.TempDir()),
+		DB: db, Stream: &memStream{}, Spill: openTestSpill(t, ""),
 		ReemitCapturedSchemas: true,
 		Warn:                  func(msg string, _ ...any) { warns = append(warns, msg) },
 	}
@@ -992,7 +992,7 @@ func TestNewlyAddedFalseBinlogFlagIgnoresDiffFollowsCreate(t *testing.T) {
 			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
 			CapturedTables: []string{"db.user"},
 		},
-		DB: db, Stream: stream, Spill: OpenSpill(t.TempDir()),
+		DB: db, Stream: stream, Spill: openTestSpill(t, ""),
 	}
 	msgs := collect(t, cap)
 	var orderSeen, crtDDL, crtRow bool
@@ -1044,7 +1044,7 @@ func TestNewlyAddedFalseSkipsTablesOutsideCheckpoint(t *testing.T) {
 			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
 			CapturedTables: []string{"db.user"},
 		},
-		DB: db, Stream: stream, Spill: OpenSpill(t.TempDir()),
+		DB: db, Stream: stream, Spill: openTestSpill(t, ""),
 	}
 	msgs := collect(t, cap)
 	for _, msg := range msgs {
@@ -1101,7 +1101,7 @@ func TestNewlyAddedSkipSnapshotFollowsBinlogOnly(t *testing.T) {
 			AckedOffset:    &checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
 			CapturedTables: []string{"db.user"},
 		},
-		DB: db, Stream: stream, Spill: OpenSpill(t.TempDir()),
+		DB: db, Stream: stream, Spill: openTestSpill(t, ""),
 		Warn: func(string, ...any) { warns++ },
 	}
 	msgs := collect(t, cap)
@@ -1132,7 +1132,7 @@ func TestNewlyAddedSkipSnapshotFollowsBinlogOnly(t *testing.T) {
 }
 
 func TestResumeDoesNotRewriteSpilledXID(t *testing.T) {
-	spill := OpenSpill(t.TempDir())
+	spill := openTestSpill(t, "")
 	xid500 := checkpoint.Position{File: "mysql-bin.000001", Pos: 500}
 	ev := event.Event{
 		Op: event.OpCreate, Database: "db", Table: "order",
