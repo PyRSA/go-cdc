@@ -24,6 +24,17 @@ def test_docs_only_is_ignored() -> None:
     assert planner.owner_of("docs/superpowers/spesc/CI-Workflow-v1.md") == "ignore"
     # A config that is not a sink's demo is not a reason to run anything.
     assert planner.owner_of("configs/notes.yaml") == "ignore"
+    # Project images (README logos, icons) are documentation assets.
+    for path in (
+        "logo.svg",
+        "logo.png",
+        "assets/logo.webp",
+        "docs/diagram.jpg",
+        "favicon.ico",
+        "packaging/app.icns",
+    ):
+        assert planner.owner_of(path) == "ignore", path
+    assert planner.plan(["README.md", "logo.svg", "logo.png"])["count"] == 0
 
 
 def test_sink_own_workflow_and_demo_config_are_sink_local() -> None:
