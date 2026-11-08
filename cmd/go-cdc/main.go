@@ -174,7 +174,14 @@ func run(args []string) (code int) {
 		return 1
 	}
 	spill := mysqlsrc.OpenSpill(spillDir)
-	defer func() { _ = spill.Close() }()
+	defer func() {
+		if err := spill.Close(); err != nil {
+			pipelineLog.Error("Failed to close spill", "path", spillDir, "error", err)
+			if code == 0 {
+				code = 1
+			}
+		}
+	}()
 	for _, id := range state.CapturedTables {
 		if state.HasSnapshot(id) {
 			continue

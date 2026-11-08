@@ -20,6 +20,8 @@ type runStats struct {
 	rows   int64
 	ddl    int64
 
+	// sinkRows is rows included in a batch that both Write and Flush succeeded for.
+	// It is not a count of rows accepted by Write alone.
 	sinkRows          int64
 	sinkFailedBatches int64
 
@@ -146,10 +148,12 @@ func (s *runStats) statusMessage(name string) string {
 		lastEventAge = formatDurationClock(now.Sub(s.lastEventAt))
 	}
 
+	// NONE = never attempted; SUCCESS = last save ok; FAILED = last save failed
+	// (including a first attempt that never succeeded).
 	saveStatus := "NONE"
 	saveTime := "n/a"
 	saveDur := "n/a"
-	if s.checkpointEverSave {
+	if s.checkpointEverSave || s.checkpointErrors > 0 {
 		if s.checkpointSaveOK {
 			saveStatus = "SUCCESS"
 		} else {
@@ -158,7 +162,9 @@ func (s *runStats) statusMessage(name string) string {
 		if !s.checkpointSavedAt.IsZero() {
 			saveTime = s.checkpointSavedAt.Format("15:04:05")
 		}
-		saveDur = s.checkpointSaveDur.String()
+		if s.checkpointEverSave {
+			saveDur = s.checkpointSaveDur.String()
+		}
 	}
 
 	flushDur := "n/a"
@@ -186,7 +192,8 @@ func (s *runStats) statusMessage(name string) string {
 	fmt.Fprintf(&b, "    Save status: %s\n", saveStatus)
 	b.WriteString("\n")
 	b.WriteString("  Sink:\n")
-	fmt.Fprintf(&b, "    Rows: total=%d delta=%d\n", s.sinkRows, deltaSink)
+	// sinkRows counts only after a successful Flush; Write-then-Flush-fail is excluded.
+	fmt.Fprintf(&b, "    Flushed rows: total=%d delta=%d\n", s.sinkRows, deltaSink)
 	fmt.Fprintf(&b, "    Failed batches: %d\n", s.sinkFailedBatches)
 	fmt.Fprintf(&b, "    Last flush duration: %s\n", flushDur)
 	b.WriteString("\n")

@@ -88,6 +88,8 @@ func Run(ctx context.Context, pipe *definition.Pipeline, msgs <-chan source.Mess
 			return err
 		}
 		stats.lastFlushDuration = time.Since(started)
+		// Count only after Flush succeeds. A Write that later fails in Flush is
+		// not durable yet, so it must not appear as a flushed row.
 		stats.sinkRows += int64(pendingRows)
 		return nil
 	}

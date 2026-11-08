@@ -56,8 +56,44 @@ func TestStatusIdleDeltaIsZero(t *testing.T) {
 	if !strings.Contains(msg, "Rows: total=8 delta=0 rate=0/s") {
 		t.Fatalf("rows line: %s", msg)
 	}
-	if !strings.Contains(msg, "Rows: total=8 delta=0\n") {
+	if !strings.Contains(msg, "Flushed rows: total=8 delta=0\n") {
 		t.Fatalf("sink rows line: %s", msg)
+	}
+}
+
+func TestCheckpointFirstFailureShowsFailed(t *testing.T) {
+	stats := &runStats{startedAt: time.Now(), prevAt: time.Now()}
+	stats.noteCheckpointFailure()
+	msg := stats.statusMessage("demo")
+	if !strings.Contains(msg, "Save status: FAILED\n") {
+		t.Fatalf("first failure must not stay NONE: %s", msg)
+	}
+	if !strings.Contains(msg, "Checkpoint errors: 1") {
+		t.Fatalf("errors line: %s", msg)
+	}
+	if strings.Contains(msg, "Last save duration: ") && !strings.Contains(msg, "Last save duration: n/a\n") {
+		t.Fatalf("no successful save yet, duration must stay n/a: %s", msg)
+	}
+}
+
+func TestCheckpointSuccessThenFailureShowsFailed(t *testing.T) {
+	stats := &runStats{startedAt: time.Now(), prevAt: time.Now()}
+	pos := &checkpoint.Position{File: "mysql-bin.000002", Pos: 200}
+	savedAt := time.Date(2026, 11, 8, 12, 0, 0, 0, time.Local)
+	stats.noteCheckpointSuccess(pos, savedAt, 3*time.Millisecond)
+	stats.noteCheckpointFailure()
+	msg := stats.statusMessage("demo")
+	if !strings.Contains(msg, "Save status: FAILED\n") {
+		t.Fatalf("want FAILED after later error: %s", msg)
+	}
+	if !strings.Contains(msg, "Position: mysql-bin.000002:200\n") {
+		t.Fatalf("must keep last success position: %s", msg)
+	}
+	if !strings.Contains(msg, "Last save time: 12:00:00\n") {
+		t.Fatalf("must keep last success time: %s", msg)
+	}
+	if !strings.Contains(msg, "Last save duration: 3ms\n") {
+		t.Fatalf("must keep last success duration: %s", msg)
 	}
 }
 
