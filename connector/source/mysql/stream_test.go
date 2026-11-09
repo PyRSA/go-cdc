@@ -246,6 +246,77 @@ func TestOnDDLUncapturedEmitsEndPositionOnly(t *testing.T) {
 	}
 }
 
+// TestOnDDLUnsupportedCapturedAlterFailsWithoutAdvancing covers unrecognized
+// ALTER TABLE on a captured table: advancing the checkpoint would hide a real
+// schema change and leave source/sink schemas divergent.
+func TestOnDDLUnsupportedCapturedAlterFailsWithoutAdvancing(t *testing.T) {
+	ch := make(chan Commit, 2)
+	h := &handler{
+		ch: ch, include: compilePatterns(`db\..*`), allow: map[string]struct{}{"db.orders": {}},
+	}
+	query := &replication.QueryEvent{
+		Schema: []byte("db"),
+		Query:  []byte("ALTER TABLE `db`.`orders` ALTER COLUMN `note` SET DEFAULT 'x'"),
+	}
+	err := h.OnDDL(nil, mysql.Position{Name: "mysql-bin.000001", Pos: 500}, query)
+	if err == nil || !strings.Contains(err.Error(), "unsupported DDL") {
+		t.Fatalf("err=%v", err)
+	}
+	if !strings.Contains(err.Error(), "db.orders") {
+		t.Fatalf("error must name the captured table: %v", err)
+	}
+	select {
+	case commit := <-ch:
+		t.Fatalf("must not emit event or position: %#v", commit)
+	default:
+	}
+}
+
+// TestOnDDLUnsupportedUncapturedAlterStillAdvances keeps the skip path for
+// tables outside the capture set: unknown DDL there is irrelevant.
+func TestOnDDLUnsupportedUncapturedAlterStillAdvances(t *testing.T) {
+	ch := make(chan Commit, 2)
+	h := &handler{ch: ch, include: compilePatterns(`other\..*`)}
+	query := &replication.QueryEvent{
+		Schema: []byte("db"),
+		Query:  []byte("ALTER TABLE `db`.`orders` ALTER COLUMN `note` SET DEFAULT 'x'"),
+	}
+	if err := h.OnDDL(nil, mysql.Position{Name: "mysql-bin.000001", Pos: 501}, query); err != nil {
+		t.Fatal(err)
+	}
+	commit := <-ch
+	if commit.Event != nil || commit.Position == nil || commit.Position.Pos != 501 {
+		t.Fatalf("commit %#v", commit)
+	}
+	select {
+	case extra := <-ch:
+		t.Fatalf("extra commit %#v", extra)
+	default:
+	}
+}
+
+// TestOnDDLNonDDLQueryStillAdvances ensures ordinary Query events that are not
+// table DDL do not fail the job just because Classify returns ActionOther.
+func TestOnDDLNonDDLQueryStillAdvances(t *testing.T) {
+	ch := make(chan Commit, 2)
+	h := &handler{
+		ch: ch, include: compilePatterns(`db\..*`), allow: map[string]struct{}{"db.orders": {}},
+	}
+	for _, sql := range []string{
+		"SET TIMESTAMP=1700000000 /* from binlog */",
+		"INSERT INTO db.orders (id) VALUES (1)",
+	} {
+		query := &replication.QueryEvent{Schema: []byte("db"), Query: []byte(sql)}
+		if err := h.OnDDL(nil, mysql.Position{Name: "mysql-bin.000001", Pos: 600}, query); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		commit := <-ch
+		if commit.Event != nil || commit.Position == nil || commit.Position.Pos != 600 {
+			t.Fatalf("%s: commit %#v", sql, commit)
+		}
+	}
+}
+
 func TestOnDDLCatalogErrorDoesNotEmitPosition(t *testing.T) {
 	ch := make(chan Commit, 2)
 	h := &handler{

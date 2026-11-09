@@ -143,11 +143,13 @@ const (
 
 // ApplySchema executes one rewritten DDL statement.
 //
-// ADD COLUMN, DROP COLUMN and TRUNCATE are replayed after a crash between the
-// statement and the checkpoint file.
+// ADD COLUMN, DROP COLUMN, DROP TABLE and TRUNCATE are replayed after a crash
+// between the statement and the checkpoint file.
 //
-// A replayed DROP COLUMN that finds the column already gone is done: the
-// statement is idempotent and no read is needed to prove it.
+// A replayed DROP COLUMN that returns 1091 is not proof on its own: the same
+// code covers a missing index or key. Only a single-clause DROP COLUMN whose
+// target column is confirmed absent is treated as done; a multi-clause ALTER
+// keeps the original error so a later DROP INDEX failure is not swallowed.
 //
 // A replayed ADD COLUMN that finds the column already there is not proof that
 // the statement is done. The column may have arrived from a different
@@ -156,9 +158,9 @@ const (
 // carries; only an equal definition is a completed replay, and anything else is
 // an error rather than a silent no-op.
 //
-// A TRUNCATE against a table that is gone is done as well: the table holds no
-// rows, which is what the statement asked for. Anything that is not a TRUNCATE
-// of a missing table keeps its error.
+// A TRUNCATE or DROP TABLE against a table that is gone is done as well: the
+// table is absent, which is what DROP asked for and which leaves TRUNCATE with
+// no rows. Permission refusals and other errors keep their original meaning.
 func (s *Sink) ApplySchema(change schema.Change) error {
 	if change.DDL == "" {
 		return nil
@@ -184,13 +186,18 @@ func (s *Sink) replayedColumnChange(change schema.Change, execErr error) (handle
 	switch change.Action {
 	case schema.ActionDropColumn:
 		if mysqlErr.Number == erCantDropFieldOrKey {
-			// The column is not there, which is the state the statement asked
-			// for. No read is needed: nothing else can make 1091 mean this.
-			return true, nil
+			return s.verifyReplayedDropColumn(change)
 		}
 	case schema.ActionAddColumn:
 		if mysqlErr.Number == erDupFieldName {
 			return true, s.verifyReplayedAddColumn(change)
+		}
+	case schema.ActionDropTable:
+		if mysqlErr.Number == erNoSuchTable || mysqlErr.Number == erBadDB {
+			// 1146 means the table is gone; 1049 means its database is gone, so
+			// the qualified target is absent too. Other codes (permission,
+			// locks, …) are not absence and keep their error.
+			return true, nil
 		}
 	case schema.ActionTruncate:
 		if mysqlErr.Number == erNoSuchTable || mysqlErr.Number == erBadDB {
@@ -202,6 +209,130 @@ func (s *Sink) replayedColumnChange(change schema.Change, execErr error) (handle
 		}
 	}
 	return false, nil
+}
+
+// verifyReplayedDropColumn proves a 1091 left the named column gone without
+// hiding another clause of the same ALTER. Multi-clause statements and changes
+// without a column name cannot be proven, so the caller keeps the original error.
+func (s *Sink) verifyReplayedDropColumn(change schema.Change) (handled bool, err error) {
+	if change.Column == "" || !singleClauseAlter(change.DDL) {
+		return false, nil
+	}
+	_, ok, lookupErr := s.liveColumn(change.Database, change.Table, change.Column)
+	if lookupErr != nil {
+		return true, fmt.Errorf("sink.mysql: %s: %w", change.DDL, lookupErr)
+	}
+	if ok {
+		// The column is still there, so 1091 came from something else (or the
+		// catalogue disagrees with the server error). Keep the original error.
+		return false, nil
+	}
+	return true, nil
+}
+
+// singleClauseAlter reports whether ddl is an ALTER TABLE with exactly one
+// top-level clause. A second clause (for example DROP INDEX) can also raise
+// 1091, and accepting the error would skip work that has not been applied.
+func singleClauseAlter(ddl string) bool {
+	text := strings.TrimSpace(ddl)
+	if !strings.HasPrefix(strings.ToUpper(text), "ALTER TABLE") {
+		return false
+	}
+	body := afterAlterTableRef(text)
+	if body == "" {
+		return false
+	}
+	return len(splitTopLevelClauses(body)) == 1
+}
+
+// afterAlterTableRef returns the ALTER clause list after the table reference.
+func afterAlterTableRef(sql string) string {
+	upper := strings.ToUpper(sql)
+	const keyword = "ALTER TABLE"
+	i := strings.Index(upper, keyword)
+	if i < 0 {
+		return ""
+	}
+	rest := strings.TrimSpace(sql[i+len(keyword):])
+	_, _, n := readQualifiedIdent(rest)
+	if n == 0 {
+		return ""
+	}
+	return strings.TrimSpace(rest[n:])
+}
+
+// splitTopLevelClauses splits on commas outside parentheses and quotes.
+func splitTopLevelClauses(s string) []string {
+	var out []string
+	depth, start := 0, 0
+	inSingle, inDouble, inBack := false, false, false
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\'':
+			if !inDouble && !inBack {
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle && !inBack {
+				inDouble = !inDouble
+			}
+		case '`':
+			if !inSingle && !inDouble {
+				inBack = !inBack
+			}
+		case '(':
+			if !inSingle && !inDouble && !inBack {
+				depth++
+			}
+		case ')':
+			if !inSingle && !inDouble && !inBack && depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 && !inSingle && !inDouble && !inBack {
+				out = append(out, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(out, s[start:])
+}
+
+// readQualifiedIdent reads db.table or table from the start of s.
+func readQualifiedIdent(s string) (db, table string, consumed int) {
+	first, n := readSQLIdent(s)
+	if n == 0 {
+		return "", "", 0
+	}
+	rest := s[n:]
+	if strings.HasPrefix(rest, ".") {
+		second, n2 := readSQLIdent(rest[1:])
+		return first, second, n + 1 + n2
+	}
+	return "", first, n
+}
+
+func readSQLIdent(s string) (string, int) {
+	if s == "" {
+		return "", 0
+	}
+	if s[0] == '`' {
+		end := strings.IndexByte(s[1:], '`')
+		if end < 0 {
+			return strings.Trim(s, "`"), len(s)
+		}
+		return strings.ReplaceAll(s[1:1+end], "``", "`"), end + 2
+	}
+	i := 0
+	for i < len(s) {
+		r := rune(s[i])
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || s[i] == '_' || s[i] == '$' {
+			i++
+			continue
+		}
+		break
+	}
+	return s[:i], i
 }
 
 // verifyReplayedAddColumn proves that an ADD COLUMN rejected with 1060 left a

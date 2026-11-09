@@ -311,13 +311,21 @@ func (h *handler) OnDDL(header *replication.EventHeader, next mysql.Position, qu
 	// position has to leave with this event, or the checkpoint stays on the
 	// previous transaction and a restart executes the statement again.
 	change := schema.Classify(text)
-	if change.Action == schema.ActionOther {
-		h.emitPosition(next)
-		return nil
-	}
 	database := change.Database
 	if database == "" {
 		database = string(query.Schema)
+	}
+	if change.Action == schema.ActionOther {
+		// Classify leaves ActionOther for unrecognized statements. An
+		// unrecognized ALTER TABLE still carries a table identity: skipping it
+		// for a captured table would advance the checkpoint past a real schema
+		// change. Plain Query events and DDL without a table stay skippable.
+		if change.Table != "" && h.captured(database, change.Table) {
+			return fmt.Errorf("source.mysql: unsupported DDL on captured table %s.%s: %s",
+				database, change.Table, text)
+		}
+		h.emitPosition(next)
+		return nil
 	}
 	accepted := h.captured(database, change.Table)
 	if !accepted && change.Action == schema.ActionCreate {

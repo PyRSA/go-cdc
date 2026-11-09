@@ -23,6 +23,10 @@ func TestClassify(t *testing.T) {
 		{"ALTER TABLE users ADD FULLTEXT INDEX ft_body (body)", ActionIndex, "", "users", "", ""},
 		{"ALTER TABLE users ADD SPATIAL INDEX sp_pt (pt)", ActionIndex, "", "users", "", ""},
 		{"RENAME TABLE tests.users TO tests.people", ActionRenameTable, "tests", "users", "", ""},
+		// Unrecognized ALTER keeps the table identity so callers can refuse to
+		// checkpoint past an unknown change on a captured table.
+		{"ALTER TABLE tests.users ALTER COLUMN age SET DEFAULT 1", ActionOther, "tests", "users", "", ""},
+		{"ALTER TABLE users CONVERT TO CHARACTER SET utf8mb4", ActionOther, "", "users", "", ""},
 	}
 	for _, tc := range cases {
 		got := Classify(tc.sql)

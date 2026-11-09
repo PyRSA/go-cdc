@@ -33,6 +33,9 @@ func Classify(sql string) Change {
 	case strings.HasPrefix(upper, "CREATE UNIQUE INDEX"), strings.HasPrefix(upper, "CREATE INDEX"), strings.HasPrefix(upper, "DROP INDEX"):
 		change.Action = ActionIndex
 	case strings.HasPrefix(upper, "ALTER TABLE"):
+		// Table identity is filled before classifyAlter so an unrecognized
+		// ALTER (ActionOther) still names the target. Callers can refuse to
+		// skip that statement for a captured table instead of checkpointing past it.
 		change.Database, change.Table = tableAfter(text, "ALTER TABLE")
 		classifyAlter(&change, text)
 	}

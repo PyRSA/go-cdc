@@ -153,6 +153,16 @@ func TestVerifyReplayedAddColumnRefusesWhenTheColumnIsAbsent(t *testing.T) {
 	}
 }
 
+func dropColumnChange(column string) schema.Change {
+	return schema.Change{
+		Action:   schema.ActionDropColumn,
+		Database: "shop",
+		Table:    "orders",
+		Column:   column,
+		DDL:      "ALTER TABLE shop.orders DROP COLUMN " + column,
+	}
+}
+
 func TestReplayedColumnChangeClassification(t *testing.T) {
 	dup := &mysqldriver.MySQLError{Number: erDupFieldName, Message: "Duplicate column name 'note'"}
 	missing := &mysqldriver.MySQLError{Number: erCantDropFieldOrKey, Message: "Can't DROP 'note'"}
@@ -169,17 +179,8 @@ func TestReplayedColumnChangeClassification(t *testing.T) {
 		t.Fatalf("duplicate ADD: handled=%v err=%v", handled, err)
 	}
 
-	// A missing column on DROP is done without any read.
-	before := equal.lookups
-	handled, err = sink.replayedColumnChange(schema.Change{Action: schema.ActionDropColumn}, missing)
-	if !handled || err != nil {
-		t.Fatalf("DROP COLUMN 1091: handled=%v err=%v", handled, err)
-	}
-	if equal.lookups != before {
-		t.Fatal("DROP COLUMN must not query the catalogue")
-	}
-
 	// A TRUNCATE of a table that is gone is done, and still no read.
+	before := equal.lookups
 	handled, err = sink.replayedColumnChange(schema.Change{Action: schema.ActionTruncate}, noTable)
 	if !handled || err != nil {
 		t.Fatalf("TRUNCATE 1146: handled=%v err=%v", handled, err)
@@ -195,7 +196,7 @@ func TestReplayedColumnChangeClassification(t *testing.T) {
 	}
 
 	// An unrelated error is not a replay for any action.
-	for _, action := range []schema.Action{schema.ActionAddColumn, schema.ActionDropColumn, schema.ActionTruncate} {
+	for _, action := range []schema.Action{schema.ActionAddColumn, schema.ActionDropColumn, schema.ActionTruncate, schema.ActionDropTable} {
 		if handled, _ := sink.replayedColumnChange(schema.Change{Action: action}, other); handled {
 			t.Fatalf("%s: an unrelated error was read as a replay", action)
 		}
@@ -204,6 +205,92 @@ func TestReplayedColumnChangeClassification(t *testing.T) {
 	// A client error (no server number) is never a replay.
 	if handled, _ := sink.replayedColumnChange(schema.Change{Action: schema.ActionAddColumn}, errors.New("dial tcp: connection refused")); handled {
 		t.Fatal("a client error was read as a replay")
+	}
+
+	// DROP COLUMN 1091 alone is not enough when the column is still present.
+	handled, err = sink.replayedColumnChange(dropColumnChange("note"), missing)
+	if handled {
+		t.Fatalf("DROP COLUMN must not succeed while the column is still present: err=%v", err)
+	}
+}
+
+func TestReplayedDropColumnSucceedsWhenColumnAlreadyGone(t *testing.T) {
+	missing := &mysqldriver.MySQLError{Number: erCantDropFieldOrKey, Message: "Can't DROP 'note'; check that column/key exists"}
+	db := &fakeDDLDB{} // no live column → already gone
+	sink := &Sink{columns: db}
+
+	handled, err := sink.replayedColumnChange(dropColumnChange("note"), missing)
+	if !handled || err != nil {
+		t.Fatalf("single DROP COLUMN with the column gone: handled=%v err=%v", handled, err)
+	}
+	if db.lookups != 1 {
+		t.Fatalf("lookups=%d, want a catalogue check that the column is gone", db.lookups)
+	}
+}
+
+func TestReplayedDropColumnKeepsErrorOnCompoundAlter(t *testing.T) {
+	// 1091 may come from DROP INDEX while DROP COLUMN already succeeded, or
+	// from DROP COLUMN while DROP INDEX still needs to run. Either way a
+	// multi-clause statement cannot be proven done from the column lookup alone.
+	missing := &mysqldriver.MySQLError{Number: erCantDropFieldOrKey, Message: "Can't DROP 'idx_note'; check that column/key exists"}
+	db := &fakeDDLDB{} // column note is already gone
+	sink := &Sink{columns: db}
+	change := schema.Change{
+		Action:   schema.ActionDropColumn,
+		Database: "shop",
+		Table:    "orders",
+		Column:   "note",
+		DDL:      "ALTER TABLE shop.orders DROP COLUMN note, DROP INDEX idx_note",
+	}
+
+	handled, err := sink.replayedColumnChange(change, missing)
+	if handled {
+		t.Fatalf("compound ALTER must keep the original 1091, got handled with err=%v", err)
+	}
+	if db.lookups != 0 {
+		t.Fatal("compound ALTER must not consult the catalogue just to swallow 1091")
+	}
+}
+
+func TestReplayedDropTableSucceedsWhenTableAlreadyGone(t *testing.T) {
+	noTable := &mysqldriver.MySQLError{Number: erNoSuchTable, Message: "Table 'shop.orders' doesn't exist"}
+	sink := &Sink{}
+
+	handled, err := sink.replayedColumnChange(schema.Change{
+		Action: schema.ActionDropTable, Database: "shop", Table: "orders",
+		DDL: "DROP TABLE shop.orders",
+	}, noTable)
+	if !handled || err != nil {
+		t.Fatalf("DROP TABLE 1146: handled=%v err=%v", handled, err)
+	}
+
+	noDB := &mysqldriver.MySQLError{Number: erBadDB, Message: "Unknown database 'shop'"}
+	handled, err = sink.replayedColumnChange(schema.Change{
+		Action: schema.ActionDropTable, Database: "shop", Table: "orders",
+		DDL: "DROP TABLE shop.orders",
+	}, noDB)
+	if !handled || err != nil {
+		t.Fatalf("DROP TABLE 1049: handled=%v err=%v", handled, err)
+	}
+}
+
+func TestReplayedDropTableKeepsPermissionAndOtherErrors(t *testing.T) {
+	sink := &Sink{}
+	change := schema.Change{
+		Action: schema.ActionDropTable, Database: "shop", Table: "orders",
+		DDL: "DROP TABLE shop.orders",
+	}
+
+	denied := &mysqldriver.MySQLError{Number: 1142, Message: "DROP command denied to user"}
+	handled, _ := sink.replayedColumnChange(change, denied)
+	if handled {
+		t.Fatal("a denied DROP TABLE must keep its error")
+	}
+
+	lockWait := &mysqldriver.MySQLError{Number: 1205, Message: "Lock wait timeout exceeded"}
+	handled, _ = sink.replayedColumnChange(change, lockWait)
+	if handled {
+		t.Fatal("a lock timeout on DROP TABLE must keep its error")
 	}
 }
 
