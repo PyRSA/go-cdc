@@ -138,6 +138,7 @@ const (
 	erDupFieldName       = 1060 // Duplicate column name
 	erCantDropFieldOrKey = 1091 // Can't DROP; check that column/key exists
 	erBadDB              = 1049 // Unknown database
+	erBadTable           = 1051 // Unknown table (DROP TABLE of a missing table)
 	erNoSuchTable        = 1146 // Table doesn't exist
 )
 
@@ -147,9 +148,10 @@ const (
 // between the statement and the checkpoint file.
 //
 // A replayed DROP COLUMN that returns 1091 is not proof on its own: the same
-// code covers a missing index or key. Only a single-clause DROP COLUMN whose
-// target column is confirmed absent is treated as done; a multi-clause ALTER
-// keeps the original error so a later DROP INDEX failure is not swallowed.
+// code covers a missing index or key. Every DROP target named by the ALTER
+// (COLUMN, INDEX/KEY, PRIMARY KEY) is checked on the target; only when each is
+// confirmed absent is the replay treated as done. Unrecognized clauses keep
+// the original error.
 //
 // A replayed ADD COLUMN that finds the column already there is not proof that
 // the statement is done. The column may have arrived from a different
@@ -193,9 +195,9 @@ func (s *Sink) replayedColumnChange(change schema.Change, execErr error) (handle
 			return true, s.verifyReplayedAddColumn(change)
 		}
 	case schema.ActionDropTable:
-		if mysqlErr.Number == erNoSuchTable || mysqlErr.Number == erBadDB {
-			// 1146 means the table is gone; 1049 means its database is gone, so
-			// the qualified target is absent too. Other codes (permission,
+		if mysqlErr.Number == erNoSuchTable || mysqlErr.Number == erBadTable || mysqlErr.Number == erBadDB {
+			// 1146/1051 mean the table is gone; 1049 means its database is gone,
+			// so the qualified target is absent too. Other codes (permission,
 			// locks, …) are not absence and keep their error.
 			return true, nil
 		}
@@ -211,38 +213,151 @@ func (s *Sink) replayedColumnChange(change schema.Change, execErr error) (handle
 	return false, nil
 }
 
-// verifyReplayedDropColumn proves a 1091 left the named column gone without
-// hiding another clause of the same ALTER. Multi-clause statements and changes
-// without a column name cannot be proven, so the caller keeps the original error.
+// verifyReplayedDropColumn proves a 1091 left every DROP target of the ALTER
+// absent. Supported clauses are DROP COLUMN, DROP INDEX/KEY and DROP PRIMARY
+// KEY. Any unrecognized clause cannot be proven, so the original error is kept.
 func (s *Sink) verifyReplayedDropColumn(change schema.Change) (handled bool, err error) {
-	if change.Column == "" || !singleClauseAlter(change.DDL) {
+	targets, ok := dropAlterTargets(change.DDL)
+	if !ok {
 		return false, nil
 	}
-	_, ok, lookupErr := s.liveColumn(change.Database, change.Table, change.Column)
-	if lookupErr != nil {
-		return true, fmt.Errorf("sink.mysql: %s: %w", change.DDL, lookupErr)
-	}
-	if ok {
-		// The column is still there, so 1091 came from something else (or the
-		// catalogue disagrees with the server error). Keep the original error.
-		return false, nil
+	for _, target := range targets {
+		absent, lookupErr := s.dropTargetAbsent(change.Database, change.Table, target)
+		if lookupErr != nil {
+			return true, fmt.Errorf("sink.mysql: %s: %w", change.DDL, lookupErr)
+		}
+		if !absent {
+			// Something the statement still names is present, so 1091 is not
+			// proof the whole ALTER finished. Keep the original error.
+			return false, nil
+		}
 	}
 	return true, nil
 }
 
-// singleClauseAlter reports whether ddl is an ALTER TABLE with exactly one
-// top-level clause. A second clause (for example DROP INDEX) can also raise
-// 1091, and accepting the error would skip work that has not been applied.
-func singleClauseAlter(ddl string) bool {
+type dropKind int
+
+const (
+	dropKindColumn dropKind = iota
+	dropKindIndex
+	dropKindPrimary
+)
+
+type dropTarget struct {
+	kind dropKind
+	name string
+}
+
+// dropAlterTargets lists every DROP target in an ALTER TABLE. ok is false when
+// the statement is not a pure DROP ALTER or a clause cannot be recognized.
+func dropAlterTargets(ddl string) ([]dropTarget, bool) {
 	text := strings.TrimSpace(ddl)
 	if !strings.HasPrefix(strings.ToUpper(text), "ALTER TABLE") {
-		return false
+		return nil, false
 	}
 	body := afterAlterTableRef(text)
 	if body == "" {
+		return nil, false
+	}
+	var out []dropTarget
+	for _, clause := range splitTopLevelClauses(body) {
+		target, ok := parseDropClause(strings.TrimSpace(clause))
+		if !ok {
+			return nil, false
+		}
+		out = append(out, target)
+	}
+	return out, len(out) > 0
+}
+
+func parseDropClause(clause string) (dropTarget, bool) {
+	if !startsWithSQLWord(clause, "DROP") {
+		return dropTarget{}, false
+	}
+	rest := strings.TrimSpace(clause[len("DROP"):])
+	switch {
+	case startsWithSQLWord(rest, "PRIMARY"):
+		afterPrimary := strings.TrimSpace(rest[len("PRIMARY"):])
+		if !startsWithSQLWord(afterPrimary, "KEY") {
+			return dropTarget{}, false
+		}
+		afterKey := strings.TrimSpace(afterPrimary[len("KEY"):])
+		if afterKey != "" {
+			return dropTarget{}, false
+		}
+		return dropTarget{kind: dropKindPrimary, name: "PRIMARY"}, true
+	case startsWithSQLWord(rest, "INDEX"), startsWithSQLWord(rest, "KEY"):
+		keyword := "INDEX"
+		if startsWithSQLWord(rest, "KEY") {
+			keyword = "KEY"
+		}
+		body := strings.TrimSpace(rest[len(keyword):])
+		name, n := readSQLIdent(body)
+		if name == "" || strings.TrimSpace(body[n:]) != "" {
+			return dropTarget{}, false
+		}
+		return dropTarget{kind: dropKindIndex, name: name}, true
+	case startsWithSQLWord(rest, "FOREIGN"), startsWithSQLWord(rest, "CHECK"), startsWithSQLWord(rest, "CONSTRAINT"):
+		return dropTarget{}, false
+	}
+	if startsWithSQLWord(rest, "COLUMN") {
+		rest = strings.TrimSpace(rest[len("COLUMN"):])
+	}
+	name, n := readSQLIdent(rest)
+	if name == "" || strings.TrimSpace(rest[n:]) != "" {
+		return dropTarget{}, false
+	}
+	return dropTarget{kind: dropKindColumn, name: name}, true
+}
+
+func startsWithSQLWord(s, word string) bool {
+	if len(s) < len(word) || !strings.EqualFold(s[:len(word)], word) {
 		return false
 	}
-	return len(splitTopLevelClauses(body)) == 1
+	if len(s) == len(word) {
+		return true
+	}
+	next := rune(s[len(word)])
+	return !unicode.IsLetter(next) && !unicode.IsDigit(next) && next != '_' && next != '$'
+}
+
+// dropTargetAbsent reports whether one DROP target is already gone on the sink.
+func (s *Sink) dropTargetAbsent(database, table string, target dropTarget) (bool, error) {
+	switch target.kind {
+	case dropKindColumn:
+		_, ok, err := s.liveColumn(database, table, target.name)
+		if err != nil {
+			return false, err
+		}
+		return !ok, nil
+	case dropKindIndex, dropKindPrimary:
+		ok, err := s.liveIndex(database, table, target.name)
+		if err != nil {
+			return false, err
+		}
+		return !ok, nil
+	default:
+		return false, fmt.Errorf("unsupported drop target kind %d", target.kind)
+	}
+}
+
+// liveIndex reports whether an index (or PRIMARY) exists on the target table.
+func (s *Sink) liveIndex(database, table, index string) (bool, error) {
+	const query = `SELECT INDEX_NAME FROM information_schema.statistics
+WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = ? LIMIT 1`
+	reader := s.columnReader()
+	if reader == nil {
+		return false, fmt.Errorf("read index %s.%s.%s: no target connection", database, table, index)
+	}
+	var name string
+	err := reader.QueryRow(query, database, table, index).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read index %s.%s.%s: %w", database, table, index, err)
+	}
+	return true, nil
 }
 
 // afterAlterTableRef returns the ALTER clause list after the table reference.
@@ -366,9 +481,10 @@ func (s *Sink) verifyReplayedAddColumn(change schema.Change) error {
 }
 
 // sameColumnDefinition reports whether the target column already holds what the
-// source column describes. Only the type and nullability are compared: they
-// decide whether the sink can store the source value, and they are what an ADD
-// COLUMN statement sets.
+// source column describes. Type, nullability, charset and collation are compared:
+// they decide whether the sink can store the source value the way the source
+// sends it, and they are what an ADD COLUMN statement sets. Charset and
+// collation compare case-insensitively; both empty (non-string columns) match.
 func sameColumnDefinition(want, live schema.Column) error {
 	if !sameColumnType(want.Type, live.Type) {
 		return fmt.Errorf("column %q already exists as %s on the target but the source defines it as %s; the replayed ADD COLUMN did not apply, so the target cannot store the source value — apply the difference by hand or drop the target column",
@@ -377,6 +493,14 @@ func sameColumnDefinition(want, live schema.Column) error {
 	if want.Nullable != live.Nullable {
 		return fmt.Errorf("column %q already exists %s on the target but the source defines it %s; the replayed ADD COLUMN did not apply",
 			want.Name, nullabilityWord(live.Nullable), nullabilityWord(want.Nullable))
+	}
+	if !sameColumnText(want.Charset, live.Charset) {
+		return fmt.Errorf("column %q already exists with charset %s on the target but the source defines charset %s; the replayed ADD COLUMN did not apply",
+			want.Name, charsetWord(live.Charset), charsetWord(want.Charset))
+	}
+	if !sameColumnText(want.Collation, live.Collation) {
+		return fmt.Errorf("column %q already exists with collation %s on the target but the source defines collation %s; the replayed ADD COLUMN did not apply",
+			want.Name, collationWord(live.Collation), collationWord(want.Collation))
 	}
 	return nil
 }
@@ -392,6 +516,12 @@ func normalizeColumnType(value string) string {
 	return strings.ToLower(strings.Join(strings.Fields(value), ""))
 }
 
+// sameColumnText compares charset or collation names case-insensitively.
+// Empty matches empty so numeric columns without a character set do not fail.
+func sameColumnText(want, live string) bool {
+	return strings.EqualFold(want, live)
+}
+
 func nullabilityWord(nullable bool) string {
 	if nullable {
 		return "NULL"
@@ -399,25 +529,47 @@ func nullabilityWord(nullable bool) string {
 	return "NOT NULL"
 }
 
+func charsetWord(charset string) string {
+	if charset == "" {
+		return "(none)"
+	}
+	return charset
+}
+
+func collationWord(collation string) string {
+	if collation == "" {
+		return "(none)"
+	}
+	return collation
+}
+
 // liveColumn reads one column of the target. A missing column is reported as ok
 // false, because a 1060 without the column is a contradiction the caller has to
 // see rather than treat as a completed replay.
 func (s *Sink) liveColumn(database, table, column string) (schema.Column, bool, error) {
-	const query = `SELECT COLUMN_TYPE, IS_NULLABLE FROM information_schema.columns
+	const query = `SELECT COLUMN_TYPE, IS_NULLABLE, CHARACTER_SET_NAME, COLLATION_NAME
+FROM information_schema.columns
 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?`
 	reader := s.columnReader()
 	if reader == nil {
 		return schema.Column{}, false, fmt.Errorf("read column %s.%s.%s: no target connection", database, table, column)
 	}
 	var columnType, nullable string
-	err := reader.QueryRow(query, database, table, column).Scan(&columnType, &nullable)
+	var charset, collation sql.NullString
+	err := reader.QueryRow(query, database, table, column).Scan(&columnType, &nullable, &charset, &collation)
 	if errors.Is(err, sql.ErrNoRows) {
 		return schema.Column{}, false, nil
 	}
 	if err != nil {
 		return schema.Column{}, false, fmt.Errorf("read column %s.%s.%s: %w", database, table, column, err)
 	}
-	return schema.Column{Name: column, Type: columnType, Nullable: strings.EqualFold(nullable, "YES")}, true, nil
+	return schema.Column{
+		Name:      column,
+		Type:      columnType,
+		Nullable:  strings.EqualFold(nullable, "YES"),
+		Charset:   charset.String,
+		Collation: collation.String,
+	}, true, nil
 }
 
 // Write applies a batch in one transaction, retrying when configured.
