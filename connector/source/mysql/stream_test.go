@@ -1,6 +1,7 @@
 package mysql
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -9,7 +10,11 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 
+	"github.com/PyRSA/go-cdc/common/event"
 	"github.com/PyRSA/go-cdc/common/schema"
+	"github.com/PyRSA/go-cdc/composer/definition"
+	"github.com/PyRSA/go-cdc/connector/source"
+	"github.com/PyRSA/go-cdc/runtime/checkpoint"
 )
 
 func TestBinlogReadTimeout(t *testing.T) {
@@ -156,10 +161,313 @@ func TestOnDDLAddColumnCarriesChangeMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	commit := <-ch
-	if commit.Event == nil || commit.Event.Change == nil {
+	if commit.Event == nil || commit.Event.Change == nil || commit.Position != nil {
 		t.Fatalf("missing change metadata: %#v", commit)
 	}
 	if commit.Event.Change.ColumnDef == nil || commit.Event.Change.ColumnDef.Name != "note" {
 		t.Fatalf("column definition %#v", commit.Event.Change.ColumnDef)
+	}
+	select {
+	case extra := <-ch:
+		t.Fatalf("empty position must not be emitted: %#v", extra)
+	default:
+	}
+}
+
+func TestOnDDLEmitsStatementEndPosition(t *testing.T) {
+	ch := make(chan Commit, 2)
+	h := &handler{
+		ch: ch, db: addColumnDB(),
+		include: compilePatterns(`db\..*`), allow: map[string]struct{}{"db.orders": {}},
+	}
+	query := &replication.QueryEvent{
+		Schema: []byte("db"),
+		Query:  []byte("ALTER TABLE `db`.`orders` ADD COLUMN `note` varchar(32) NULL"),
+	}
+	next := mysql.Position{Name: "mysql-bin.000001", Pos: 420}
+	if err := h.OnDDL(nil, next, query); err != nil {
+		t.Fatal(err)
+	}
+	eventCommit := <-ch
+	if eventCommit.Event == nil || eventCommit.Position != nil {
+		t.Fatalf("event commit %#v", eventCommit)
+	}
+	posCommit := <-ch
+	if posCommit.Event != nil || posCommit.Position == nil {
+		t.Fatalf("position commit %#v", posCommit)
+	}
+	if posCommit.Position.File != next.Name || posCommit.Position.Pos != next.Pos || posCommit.Position.GTID != "" {
+		t.Fatalf("position %#v", posCommit.Position)
+	}
+}
+
+func TestOnDDLPositionKeepsTrackedGTID(t *testing.T) {
+	ch := make(chan Commit, 2)
+	set, err := mysql.ParseGTIDSet("mysql", "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &handler{
+		ch: ch, db: addColumnDB(), trackGTID: true, gtid: set,
+		include: compilePatterns(`db\..*`), allow: map[string]struct{}{"db.orders": {}},
+	}
+	query := &replication.QueryEvent{
+		Schema: []byte("db"),
+		Query:  []byte("ALTER TABLE `db`.`orders` ADD COLUMN `note` varchar(32) NULL"),
+	}
+	if err := h.OnDDL(nil, mysql.Position{Name: "mysql-bin.000001", Pos: 420}, query); err != nil {
+		t.Fatal(err)
+	}
+	<-ch
+	posCommit := <-ch
+	if posCommit.Position == nil || posCommit.Position.GTID != set.String() {
+		t.Fatalf("position %#v", posCommit.Position)
+	}
+}
+
+func TestOnDDLUncapturedEmitsEndPositionOnly(t *testing.T) {
+	ch := make(chan Commit, 2)
+	h := &handler{ch: ch, include: compilePatterns(`other\..*`)}
+	query := &replication.QueryEvent{
+		Schema: []byte("db"),
+		Query:  []byte("ALTER TABLE `db`.`orders` ADD COLUMN `note` varchar(32) NULL"),
+	}
+	if err := h.OnDDL(nil, mysql.Position{Name: "mysql-bin.000001", Pos: 88}, query); err != nil {
+		t.Fatal(err)
+	}
+	commit := <-ch
+	if commit.Event != nil || commit.Position == nil || commit.Position.Pos != 88 {
+		t.Fatalf("commit %#v", commit)
+	}
+	select {
+	case extra := <-ch:
+		t.Fatalf("extra commit %#v", extra)
+	default:
+	}
+}
+
+// TestOnDDLUnsupportedCapturedAlterFailsWithoutAdvancing covers unrecognized
+// ALTER TABLE on a captured table: advancing the checkpoint would hide a real
+// schema change and leave source/sink schemas divergent.
+func TestOnDDLUnsupportedCapturedAlterFailsWithoutAdvancing(t *testing.T) {
+	ch := make(chan Commit, 2)
+	h := &handler{
+		ch: ch, include: compilePatterns(`db\..*`), allow: map[string]struct{}{"db.orders": {}},
+	}
+	query := &replication.QueryEvent{
+		Schema: []byte("db"),
+		Query:  []byte("ALTER TABLE `db`.`orders` ALTER COLUMN `note` SET DEFAULT 'x'"),
+	}
+	err := h.OnDDL(nil, mysql.Position{Name: "mysql-bin.000001", Pos: 500}, query)
+	if err == nil || !strings.Contains(err.Error(), "unsupported DDL") {
+		t.Fatalf("err=%v", err)
+	}
+	if !strings.Contains(err.Error(), "db.orders") {
+		t.Fatalf("error must name the captured table: %v", err)
+	}
+	select {
+	case commit := <-ch:
+		t.Fatalf("must not emit event or position: %#v", commit)
+	default:
+	}
+}
+
+// TestOnDDLUnsupportedUncapturedAlterStillAdvances keeps the skip path for
+// tables outside the capture set: unknown DDL there is irrelevant.
+func TestOnDDLUnsupportedUncapturedAlterStillAdvances(t *testing.T) {
+	ch := make(chan Commit, 2)
+	h := &handler{ch: ch, include: compilePatterns(`other\..*`)}
+	query := &replication.QueryEvent{
+		Schema: []byte("db"),
+		Query:  []byte("ALTER TABLE `db`.`orders` ALTER COLUMN `note` SET DEFAULT 'x'"),
+	}
+	if err := h.OnDDL(nil, mysql.Position{Name: "mysql-bin.000001", Pos: 501}, query); err != nil {
+		t.Fatal(err)
+	}
+	commit := <-ch
+	if commit.Event != nil || commit.Position == nil || commit.Position.Pos != 501 {
+		t.Fatalf("commit %#v", commit)
+	}
+	select {
+	case extra := <-ch:
+		t.Fatalf("extra commit %#v", extra)
+	default:
+	}
+}
+
+// TestOnDDLNonDDLQueryStillAdvances ensures ordinary Query events that are not
+// table DDL do not fail the job just because Classify returns ActionOther.
+func TestOnDDLNonDDLQueryStillAdvances(t *testing.T) {
+	ch := make(chan Commit, 2)
+	h := &handler{
+		ch: ch, include: compilePatterns(`db\..*`), allow: map[string]struct{}{"db.orders": {}},
+	}
+	for _, sql := range []string{
+		"SET TIMESTAMP=1700000000 /* from binlog */",
+		"INSERT INTO db.orders (id) VALUES (1)",
+	} {
+		query := &replication.QueryEvent{Schema: []byte("db"), Query: []byte(sql)}
+		if err := h.OnDDL(nil, mysql.Position{Name: "mysql-bin.000001", Pos: 600}, query); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		commit := <-ch
+		if commit.Event != nil || commit.Position == nil || commit.Position.Pos != 600 {
+			t.Fatalf("%s: commit %#v", sql, commit)
+		}
+	}
+}
+
+func TestOnDDLCatalogErrorDoesNotEmitPosition(t *testing.T) {
+	ch := make(chan Commit, 2)
+	h := &handler{
+		ch:      ch,
+		include: compilePatterns(`db\..*`), allow: map[string]struct{}{"db.orders": {}},
+	}
+	query := &replication.QueryEvent{
+		Schema: []byte("db"),
+		Query:  []byte("ALTER TABLE `db`.`orders` ADD COLUMN `note` varchar(32) NULL"),
+	}
+	err := h.OnDDL(nil, mysql.Position{Name: "mysql-bin.000001", Pos: 100}, query)
+	if err == nil || !strings.Contains(err.Error(), "no catalog connection") {
+		t.Fatalf("err=%v", err)
+	}
+	select {
+	case commit := <-ch:
+		t.Fatalf("emitted %#v", commit)
+	default:
+	}
+}
+
+// TestSkippedDDLAdvancesPosition covers source.scan.skip.events. The statement
+// is dropped on purpose, so no event is emitted; the position must still move,
+// because a skipped DDL has no following XID and the checkpoint would otherwise
+// stay on the previous transaction forever.
+func TestSkippedDDLAdvancesPosition(t *testing.T) {
+	ch := make(chan Commit, 2)
+	h := &handler{
+		ch: ch, db: addColumnDB(), skipEvents: 1,
+		include: compilePatterns(`db\..*`), allow: map[string]struct{}{"db.orders": {}},
+	}
+	query := &replication.QueryEvent{
+		Schema: []byte("db"),
+		Query:  []byte("ALTER TABLE `db`.`orders` ADD COLUMN `extra` int NULL"),
+	}
+	if err := h.OnDDL(nil, mysql.Position{Name: "mysql-bin.000001", Pos: 900}, query); err != nil {
+		t.Fatal(err)
+	}
+	commit := <-ch
+	if commit.Event != nil {
+		t.Fatalf("a skipped event must not be emitted: %#v", commit)
+	}
+	if commit.Position == nil || commit.Position.Pos != 900 {
+		t.Fatalf("the skipped statement must still advance the position: %#v", commit)
+	}
+	select {
+	case extra := <-ch:
+		t.Fatalf("extra commit %#v", extra)
+	default:
+	}
+}
+
+// TestSkippedDDLKeepsTheCheckpointMoving proves the position of a skipped
+// statement is the one a restart resumes from, so repeated restarts do not
+// re-read the same statement.
+func TestSkippedDDLKeepsTheCheckpointMoving(t *testing.T) {
+	ch := make(chan Commit, 4)
+	db := addColumnDB()
+	db.tables[0].Columns = append(db.tables[0].Columns, schema.Column{Name: "note2", Type: "varchar(8)", Nullable: true})
+	h := &handler{
+		ch: ch, db: db, skipEvents: 1,
+		include: compilePatterns(`db\..*`), allow: map[string]struct{}{"db.orders": {}},
+	}
+	skipped := &replication.QueryEvent{
+		Schema: []byte("db"),
+		Query:  []byte("ALTER TABLE `db`.`orders` ADD COLUMN `extra` int NULL"),
+	}
+	if err := h.OnDDL(nil, mysql.Position{Name: "mysql-bin.000001", Pos: 900}, skipped); err != nil {
+		t.Fatal(err)
+	}
+	first := <-ch
+	if first.Position == nil || first.Position.Pos != 900 {
+		t.Fatalf("skipped statement position %#v", first.Position)
+	}
+	// The next statement runs normally, so its event and position follow.
+	applied := &replication.QueryEvent{
+		Schema: []byte("db"),
+		Query:  []byte("ALTER TABLE `db`.`orders` ADD COLUMN `note2` varchar(8) NULL"),
+	}
+	if err := h.OnDDL(nil, mysql.Position{Name: "mysql-bin.000001", Pos: 1200}, applied); err != nil {
+		t.Fatal(err)
+	}
+	event := <-ch
+	if event.Event == nil {
+		t.Fatalf("the second statement must be emitted: %#v", event)
+	}
+	pos := <-ch
+	if pos.Position == nil || pos.Position.Pos != 1200 {
+		t.Fatalf("second position %#v", pos.Position)
+	}
+}
+
+// TestDDLPositionDoesNotFlushPendingRowsOfAnotherTable proves that a position
+// published after a DDL cannot publish rows of a different table that are still
+// buffered for a running snapshot. A DDL is implicitly committed, so no row of
+// the same transaction is buffered when it arrives; anything pending belongs to
+// a later statement and must wait for its own XID.
+func TestDDLPositionDoesNotFlushPendingRowsOfAnotherTable(t *testing.T) {
+	spill := openTestSpill(t, "")
+	defer spill.Close()
+	db := addColumnDB()
+	stream := &memStream{events: []Commit{
+		// A row for the table being snapshotted: the spill route buffers it.
+		{Event: &event.Event{Op: event.OpCreate, Database: "db", Table: "pending", SourceDatabase: "db", SourceTable: "pending", After: map[string]any{"id": "1"}}},
+		// A DDL on a captured table, carrying its own end position.
+		{Event: &event.Event{Op: event.OpDDL, Database: "db", Table: "orders", SourceDatabase: "db", SourceTable: "orders", DDL: "ALTER TABLE `db`.`orders` ADD COLUMN `note` int NULL"}},
+		{Position: &checkpoint.Position{File: "mysql-bin.000001", Pos: 1500}},
+	}}
+	cap := &Capture{Config: definition.Source{SchemaChange: true}, DB: db, Stream: stream, Spill: spill}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out := make(chan source.Message, 8)
+	done := make(chan error, 1)
+	go func() {
+		done <- cap.binlogFrom(ctx, out, checkpoint.Position{File: "mysql-bin.000001", Pos: 400},
+			map[string]bool{"db.pending": true, "db.orders": false})
+		close(out)
+	}()
+	var publishedPending, publishedOrders int
+	var lastPos uint32
+	for msg := range out {
+		if msg.Event != nil {
+			switch msg.Event.Table {
+			case "pending":
+				publishedPending++
+			case "orders":
+				publishedOrders++
+			}
+		}
+		if msg.Position != nil {
+			lastPos = msg.Position.Pos
+		}
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if publishedPending != 0 {
+		t.Fatalf("a buffered row was published before its own XID: %d", publishedPending)
+	}
+	if publishedOrders != 1 {
+		t.Fatalf("the captured DDL must still be emitted: %d", publishedOrders)
+	}
+	// The buffered row is durable in the spill, under the XID that carried it.
+	last, has, err := spill.LastPosition("db.pending")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !has || last.Pos != 1500 {
+		t.Fatalf("spilled position %#v (has=%v)", last, has)
+	}
+	if lastPos != 1500 {
+		t.Fatalf("last published position %d", lastPos)
 	}
 }

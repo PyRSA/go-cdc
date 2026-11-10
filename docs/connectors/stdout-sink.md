@@ -29,6 +29,10 @@ Full job: [QuickStart](../QuickStart.md) or [`configs/demo-stdout.yaml`](../../c
 
 No host, user, or password is needed. Other `sink.*` keys used by MySQL sink are not required for stdout.
 
+## Delivery semantics (at-least-once)
+
+Each event is one JSON line. The runner saves the checkpoint only after `Write` and `Flush` return. A crash in between prints those lines again on restart. There is no deduplication key. This is not exactly-once.
+
 ## Output Format
 
 One JSON object per line. The envelope is **shared with the Kafka sink**

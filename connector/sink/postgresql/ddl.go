@@ -34,7 +34,18 @@ func (s *Sink) CreateTable(table schema.Table) error {
 		return err
 	}
 	if exists {
-		return validateTargetTable(table, state)
+		// The table exists, so this is a replay of a CREATE TABLE the sink
+		// already ran, or an operator's own table. A replay arrives with the
+		// source definition as it stands now, which a later change that has not
+		// been replayed yet can put ahead of the target: the column the source
+		// added is not on the target until that ADD COLUMN is applied again.
+		// Refusing that would stop a job that is about to repair it, on every
+		// restart, so a target that is a strict subset of the source definition
+		// is accepted here. What must still fail is a target that cannot accept
+		// the rows: a column of another type, a target column that is NOT NULL
+		// where the source is nullable, or a target column outside the source
+		// definition that is NOT NULL without a default.
+		return validateExistingTarget(table, state)
 	}
 	if !s.cfg.AutoCreate {
 		return fmt.Errorf("sink.postgresql: table %s does not exist: sink.auto-create-table is false, so the target must be created by hand", target)
@@ -95,6 +106,9 @@ func (s *Sink) verifyCreated(ctx context.Context, target Target, table schema.Ta
 	if !exists {
 		return fmt.Errorf("sink.postgresql: table %s does not exist after CREATE TABLE", target)
 	}
+	// This table was just created from the definition at hand, so the target is
+	// expected to match it exactly; a concurrent creator may have made it another
+	// table entirely, which is the case validateTargetTable is for.
 	return validateTargetTable(table, state)
 }
 

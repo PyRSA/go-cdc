@@ -61,6 +61,16 @@ A PostgreSQL connection is bound to one database, so `database` is a required op
 
 Options that belong to other sinks are rejected: `brokers`, `topic`, `source-name`, `client-id`, `schema.change.emit.enabled`, `allow.auto.create.topics`, `producer-batch-max-bytes`, `flush-timeout` (Kafka), and `sql-port`, `request-timeout`, `buckets`, `replication-num`, `partial-update.enabled`, `delete.enabled`, `schema.change.wait-timeout` (Doris). `schema.change.wait-timeout` has no PostgreSQL equivalent because a PostgreSQL statement is finished when it returns.
 
+## Delivery semantics (at-least-once)
+
+`Write` applies one batch in one transaction. The runner then saves the checkpoint as a separate file. A crash after `COMMIT` and before that file is replaced replays the batch. This is not exactly-once.
+
+A row is written with `INSERT ... ON CONFLICT` against the conflict target, so a replay converges. A table with no primary key or unique constraint cannot supply that target; the sink refuses the table instead of duplicating rows on replay.
+
+`max-retries` repeats a batch whose statements failed with a transient SQLSTATE (`40001`, `40P01`, `57P01`, `57P03`, `08xxx`) and were rolled back. A failed `COMMIT` is not retried: the server may already have committed.
+
+The runner flushes the rows it still holds before any DDL runs. A DDL statement end position is published by the source once the statement is applied, so a restart resumes after it instead of replaying it; a statement the source was told to skip (`source.scan.skip.events`) also advances the position, because a skipped DDL has no following transaction to move it.
+
 ## Target Table Resolution
 
 | Situation | Target |
@@ -113,6 +123,8 @@ With `auto-create-table: true` a missing target is created from the source defin
 
 An existing table is validated the same way whether or not it was created by the sink, and the comparison is exact: a column you widened by hand (`text` where `varchar(64)` maps to `VARCHAR(64)`) is reported as a mismatch, because a target structure the sink did not choose is a target whose future writes it cannot reason about. To move past a mismatch, either bring the column to the mapped type (`ALTER TABLE ... TYPE VARCHAR(64)`), or `transform.projection` the column out so the source definition no longer requires it — a projected-out column still has to accept a row, so a `NOT NULL` column without a default refuses the projection. A column the target holds but the source definition does not project is accepted as long as it is nullable or has a default.
 
+One case is not a mismatch: a target that is **missing** a column the source definition announces. A `CREATE TABLE` is replayed whenever the crash landed between the `CREATE` and the checkpoint, and that replay carries the source definition as it stands now — a later `ADD COLUMN` that has not been replayed yet puts the source ahead of the target. Accepting the gap is what lets the job reach that `ADD COLUMN` and close it. Everything else is still refused: a column of another type, a column `NOT NULL` where the source is nullable, a target-only column that is `NOT NULL` without a default, and a missing conflict target.
+
 Upgrading a pipeline that ran before schema evolution: nothing about the mapping changes, but a target that was created by hand (or widened by hand while PR1 was running) is now held to that comparison. The comparison is not guaranteed to run on the first start after the upgrade: a pipeline that resumes from an existing checkpoint does not re-announce the tables the checkpoint already captured (see [Limits in This Release](#limits-in-this-release)). Until the source announces the table again — on a new snapshot or a `CREATE TABLE` — a mismatch goes undetected at start-up, and the job surfaces it the way PR1 always did: at the first write the target refuses. Compare the target against the [Column Type Mapping](#column-type-mapping) before switching over.
 
 After a `CREATE TABLE` the sink re-reads `pg_catalog` and validates the result, so the catalogue is the evidence and not the statement that ran. A `CREATE` that lost a race with another process (SQLSTATE `42P07`) is handled the same way.
@@ -129,12 +141,12 @@ A DDL statement is applied to the target only when the switches above allow it, 
 | Change | Config name | Behaviour |
 | --- | --- | --- |
 | `ADD COLUMN` (one or several columns) | `add.column` | Added with the source type and nullability. `NOT NULL` without a default is refused: MySQL fills the existing rows with an implicit value and PostgreSQL has none. A multi-column statement is applied in one transaction from the source catalogue, because the statement text carries no definition. A replayed statement whose column already exists is accepted when that column can store every source value, so a later widening it did not undo does not stop the replay |
-| `DROP COLUMN` | `drop.column` | Dropped after the target is read back. Refused when the column carries a primary key, a unique constraint, a foreign key, or a unique index, because that takes the conflict target with it. A plain index, a check constraint, and an exclusion constraint leave with the column. A replayed statement whose column is already gone is a no-op |
-| `RENAME COLUMN` | `rename.column` | Renamed only. The source catalogue is not consulted, because the statement restates nothing |
-| `CHANGE COLUMN` | `rename.column` | Renamed **and** restated: the new definition is read from the source catalogue and the type and nullability are adjusted in the same transaction. `CHANGE` that keeps the name is applied as a type change |
-| `MODIFY COLUMN` | `modify.column` | Type and nullability restated, name untouched |
+| `DROP COLUMN` | `drop.column` | Dropped after the target is read back. Refused when the column carries a primary key, a unique constraint, a foreign key, or a unique index, because that takes the conflict target with it. A plain index, a check constraint, and an exclusion constraint leave with the column. A replayed statement whose column is already gone is a no-op. A target table that is already gone is also a no-op, because a replay can arrive after a later `DROP TABLE` removed the table |
+| `RENAME COLUMN` | `rename.column` | Renamed only. The source catalogue is not consulted, because the statement restates nothing. A target table that is already gone is a no-op |
+| `CHANGE COLUMN` | `rename.column` | Renamed **and** restated: the new definition is read from the source catalogue and the type and nullability are adjusted in the same transaction. `CHANGE` that keeps the name is applied as a type change. A target table that is already gone is a no-op |
+| `MODIFY COLUMN` | `modify.column` | Type and nullability restated, name untouched. A target table that is already gone is a no-op |
 | `DROP TABLE` | `drop.table` | `DROP TABLE IF EXISTS`, and needs `schema.change.drop-truncate.enabled: true` |
-| `TRUNCATE TABLE` | `truncate` | `TRUNCATE TABLE`, and needs `schema.change.drop-truncate.enabled: true`. A missing target is an error, because `TRUNCATE` carries no `IF EXISTS` |
+| `TRUNCATE TABLE` | `truncate` | `TRUNCATE TABLE`, and needs `schema.change.drop-truncate.enabled: true`. A target that is already gone is a no-op, because a replay can arrive after a later `DROP TABLE` removed the table |
 
 A type change is applied only when it is a verified widening: integer to a wider integer, integer or numeric to a numeric that still holds every digit, a longer `char`/`varchar` limit or `text`, `real` to `double precision`, `date` to `timestamp`, and a larger fractional-seconds precision. Anything else — a narrowing, `varchar` to `char`, a cast between unrelated families — stops the job instead of being attempted, because PostgreSQL would either reject it or reinterpret the stored values.
 

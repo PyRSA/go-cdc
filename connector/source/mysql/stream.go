@@ -300,27 +300,47 @@ func (h *handler) OnRow(e *canal.RowsEvent) error {
 	return nil
 }
 
-func (h *handler) OnDDL(header *replication.EventHeader, _ mysql.Position, query *replication.QueryEvent) error {
+func (h *handler) OnDDL(header *replication.EventHeader, next mysql.Position, query *replication.QueryEvent) error {
 	text := string(query.Query)
 	if strings.EqualFold(text, "BEGIN") {
+		// BEGIN is not the end of a transaction. Checkpointing here would skip
+		// the rows that follow it.
 		return nil
 	}
+	// DDL is one binlog event and is not followed by an XID. The statement end
+	// position has to leave with this event, or the checkpoint stays on the
+	// previous transaction and a restart executes the statement again.
 	change := schema.Classify(text)
-	if change.Action == schema.ActionOther {
-		return nil
-	}
 	database := change.Database
 	if database == "" {
 		database = string(query.Schema)
+	}
+	if change.Action == schema.ActionOther {
+		// Classify leaves ActionOther for unrecognized statements. An
+		// unrecognized ALTER TABLE still carries a table identity: skipping it
+		// for a captured table would advance the checkpoint past a real schema
+		// change. Plain Query events and DDL without a table stay skippable.
+		if change.Table != "" && h.captured(database, change.Table) {
+			return fmt.Errorf("source.mysql: unsupported DDL on captured table %s.%s: %s",
+				database, change.Table, text)
+		}
+		h.emitPosition(next)
+		return nil
 	}
 	accepted := h.captured(database, change.Table)
 	if !accepted && change.Action == schema.ActionCreate {
 		accepted = h.admitCreate(database, change.Table)
 	}
 	if !accepted {
+		h.emitPosition(next)
 		return nil
 	}
 	if h.dropEvent() {
+		// source.scan.skip.events drops this statement on purpose, so nothing is
+		// applied for it. The position still has to move: a skipped DDL is not
+		// followed by an XID, and leaving the checkpoint on the previous
+		// transaction would replay the same statement on every restart.
+		h.emitPosition(next)
 		return nil
 	}
 	var sourceTSMs int64
@@ -353,7 +373,33 @@ func (h *handler) OnDDL(header *replication.EventHeader, _ mysql.Position, query
 		commit.Schema = &copied
 	}
 	h.ch <- commit
+	// A second commit, never the same value as the event. The runner applies
+	// the DDL first; if that fails it returns before reading this position, so
+	// AckedOffset stays on the previous event.
+	h.emitPosition(next)
 	return nil
+}
+
+// emitPosition publishes the position a restart should read from. An empty
+// position is the caller's way of saying the event has no binlog address yet
+// (tests); nothing is sent, because a zero offset would wipe a real one.
+func (h *handler) emitPosition(next mysql.Position) {
+	if next.Name == "" && next.Pos == 0 {
+		return
+	}
+	h.ch <- Commit{Position: h.checkpointPosition(next)}
+}
+
+// checkpointPosition is the file position plus the GTID set, when this stream
+// was itself started from a GTID. A file-position start does not invent a set
+// from the GTIDs seen so far: that set is missing history, and the next resume
+// would prefer it over the file position.
+func (h *handler) checkpointPosition(next mysql.Position) *checkpoint.Position {
+	gtid := ""
+	if h.trackGTID && h.gtid != nil {
+		gtid = h.gtid.String()
+	}
+	return &checkpoint.Position{File: next.Name, Pos: next.Pos, GTID: gtid}
 }
 
 // fillAddColumn attaches catalog-backed ColumnDef for a single-column ADD.
@@ -435,11 +481,7 @@ func tableFromCanal(table *canalschema.Table) schema.Table {
 }
 
 func (h *handler) OnXID(_ *replication.EventHeader, next mysql.Position) error {
-	gtid := ""
-	if h.trackGTID && h.gtid != nil {
-		gtid = h.gtid.String()
-	}
-	h.ch <- Commit{Position: &checkpoint.Position{File: next.Name, Pos: next.Pos, GTID: gtid}}
+	h.ch <- Commit{Position: h.checkpointPosition(next)}
 	return nil
 }
 

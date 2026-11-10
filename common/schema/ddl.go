@@ -33,46 +33,167 @@ func Classify(sql string) Change {
 	case strings.HasPrefix(upper, "CREATE UNIQUE INDEX"), strings.HasPrefix(upper, "CREATE INDEX"), strings.HasPrefix(upper, "DROP INDEX"):
 		change.Action = ActionIndex
 	case strings.HasPrefix(upper, "ALTER TABLE"):
+		// Table identity is filled before classifyAlter so an unrecognized
+		// ALTER (ActionOther) still names the target. Callers can refuse to
+		// skip that statement for a captured table instead of checkpointing past it.
 		change.Database, change.Table = tableAfter(text, "ALTER TABLE")
 		classifyAlter(&change, text)
 	}
 	return change
 }
 
+// alterKind is one top-level ALTER TABLE clause category the classifier knows.
+type alterKind int
+
+const (
+	alterNone alterKind = iota
+	alterAddColumn
+	alterDropColumn
+	alterRenameColumn
+	alterModifyColumn
+	alterIndex
+	alterRenameTable
+	alterUnsupported
+)
+
+// classifyAlter classifies one ALTER TABLE by its top-level clauses. Mixed
+// supported kinds, or any unsupported clause beside a supported one, become
+// ActionOther so callers refuse the statement instead of applying only half.
 func classifyAlter(change *Change, text string) {
 	rest := afterTableRef(text, "ALTER TABLE")
-	upper := strings.ToUpper(rest)
-	switch {
-	case hasWord(upper, "ADD COLUMN"), hasWord(upper, "ADD "):
-		if hasWord(upper, "ADD INDEX") || hasWord(upper, "ADD KEY") || hasWord(upper, "ADD PRIMARY") || hasWord(upper, "ADD UNIQUE") || hasWord(upper, "ADD FULLTEXT") || hasWord(upper, "ADD SPATIAL") {
-			change.Action = ActionIndex
-			return
+	var kinds []alterKind
+	var firstAdd, firstRename, firstModify, firstDrop string
+	var firstRenameNew string
+	for _, raw := range splitClauses(rest) {
+		clause := strings.TrimSpace(raw)
+		if clause == "" || isAlterOptionClause(clause) {
+			continue
 		}
+		kind := classifyAlterClause(clause)
+		switch kind {
+		case alterNone:
+			continue
+		case alterUnsupported:
+			change.Action = ActionOther
+			return
+		case alterAddColumn:
+			if firstAdd == "" {
+				firstAdd = identAfter(clause, "ADD COLUMN", "ADD")
+			}
+		case alterDropColumn:
+			if firstDrop == "" {
+				firstDrop = identAfter(clause, "DROP COLUMN")
+			}
+		case alterRenameColumn:
+			if firstRename == "" {
+				firstRename, firstRenameNew = twoIdentsAfter(clause, "RENAME COLUMN", "CHANGE COLUMN", "CHANGE")
+			}
+		case alterModifyColumn:
+			if firstModify == "" {
+				firstModify = identAfter(clause, "MODIFY COLUMN", "MODIFY")
+			}
+		}
+		if !containsAlterKind(kinds, kind) {
+			kinds = append(kinds, kind)
+		}
+	}
+	if len(kinds) != 1 {
+		change.Action = ActionOther
+		return
+	}
+	switch kinds[0] {
+	case alterAddColumn:
 		change.Action = ActionAddColumn
-		change.Column = identAfter(rest, "ADD COLUMN", "ADD")
-	case hasWord(upper, "DROP COLUMN"):
+		change.Column = firstAdd
+	case alterDropColumn:
 		change.Action = ActionDropColumn
-		change.Column = identAfter(rest, "DROP COLUMN")
-	case hasWord(upper, "DROP INDEX"), hasWord(upper, "DROP KEY"), hasWord(upper, "DROP PRIMARY"):
-		change.Action = ActionIndex
-	case hasWord(upper, "RENAME COLUMN"):
+		change.Column = firstDrop
+	case alterRenameColumn:
 		change.Action = ActionRenameColumn
-		change.Column, change.NewName = twoIdentsAfter(rest, "RENAME COLUMN")
-	case hasWord(upper, "CHANGE COLUMN"), hasWord(upper, "CHANGE "):
-		change.Action = ActionRenameColumn
-		change.Column, change.NewName = twoIdentsAfter(rest, "CHANGE COLUMN", "CHANGE")
-	case hasWord(upper, "MODIFY COLUMN"), hasWord(upper, "MODIFY "):
+		change.Column, change.NewName = firstRename, firstRenameNew
+	case alterModifyColumn:
 		change.Action = ActionModifyColumn
-		change.Column = identAfter(rest, "MODIFY COLUMN", "MODIFY")
-	case hasWord(upper, "RENAME TO"), hasWord(upper, "RENAME AS"):
+		change.Column = firstModify
+	case alterIndex:
+		change.Action = ActionIndex
+	case alterRenameTable:
 		change.Action = ActionRenameTable
 	default:
 		change.Action = ActionOther
 	}
 }
 
-func hasWord(upper, phrase string) bool {
-	return strings.Contains(upper, phrase)
+func containsAlterKind(kinds []alterKind, want alterKind) bool {
+	for _, kind := range kinds {
+		if kind == want {
+			return true
+		}
+	}
+	return false
+}
+
+// isAlterOptionClause reports ALGORITHM=/LOCK= execution options, which do not
+// change schema shape and must not force ActionOther on an otherwise pure ALTER.
+func isAlterOptionClause(clause string) bool {
+	return startsWithWord(clause, "ALGORITHM") || startsWithWord(clause, "LOCK")
+}
+
+func classifyAlterClause(clause string) alterKind {
+	switch {
+	case startsWithWord(clause, "ADD"):
+		body := strings.TrimSpace(clause[len("ADD"):])
+		if startsWithWord(body, "COLUMN") {
+			return alterAddColumn
+		}
+		switch addClauseKind(body) {
+		case alterIndex:
+			return alterIndex
+		case alterUnsupported:
+			return alterUnsupported
+		default:
+			return alterAddColumn
+		}
+	case startsWithWord(clause, "DROP"):
+		body := strings.TrimSpace(clause[len("DROP"):])
+		if startsWithWord(body, "COLUMN") {
+			return alterDropColumn
+		}
+		if startsWithWord(body, "INDEX") || startsWithWord(body, "KEY") || startsWithWord(body, "PRIMARY") {
+			return alterIndex
+		}
+		return alterUnsupported
+	case startsWithWord(clause, "RENAME"):
+		body := strings.TrimSpace(clause[len("RENAME"):])
+		if startsWithWord(body, "COLUMN") {
+			return alterRenameColumn
+		}
+		if startsWithWord(body, "TO") || startsWithWord(body, "AS") {
+			return alterRenameTable
+		}
+		return alterUnsupported
+	case startsWithWord(clause, "CHANGE"):
+		return alterRenameColumn
+	case startsWithWord(clause, "MODIFY"):
+		return alterModifyColumn
+	default:
+		return alterUnsupported
+	}
+}
+
+// addClauseKind distinguishes index-like ADD clauses from column ADD and from
+// unsupported ADD CONSTRAINT / FOREIGN / CHECK / PARTITION forms.
+func addClauseKind(body string) alterKind {
+	for _, keyword := range []string{"INDEX", "KEY", "PRIMARY", "UNIQUE", "FULLTEXT", "SPATIAL"} {
+		if startsWithWord(body, keyword) {
+			return alterIndex
+		}
+	}
+	for _, keyword := range []string{"CONSTRAINT", "FOREIGN", "CHECK", "PARTITION"} {
+		if startsWithWord(body, keyword) {
+			return alterUnsupported
+		}
+	}
+	return alterAddColumn
 }
 
 func stripComments(sql string) string {
@@ -253,36 +374,73 @@ func startsWithWord(s, word string) bool {
 }
 
 // splitClauses splits on commas outside parentheses, strings, and identifiers.
+//
+// Inside '…' / "…" it follows default MySQL string rules: a backslash escapes
+// the next byte (so \' and \" do not end the literal), and a doubled quote
+// (”, "") is one embedded quote. sql_mode=NO_BACKSLASH_ESCAPES is not detected
+// here; that mode writes embedded quotes as ”, which this path still handles.
+// Backslash is ignored outside quotes and inside backtick identifiers.
 func splitClauses(s string) []string {
 	var out []string
 	depth, start := 0, 0
 	inSingle, inDouble, inBack := false, false, false
 	for i := 0; i < len(s); i++ {
-		switch s[i] {
-		case '\'':
-			if !inDouble && !inBack {
-				inSingle = !inSingle
+		c := s[i]
+		switch {
+		case inSingle:
+			switch c {
+			case '\\':
+				if i+1 < len(s) {
+					i++ // default MySQL: backslash escapes the next byte
+				}
+			case '\'':
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++ // '' embedded quote
+					break
+				}
+				inSingle = false
 			}
-		case '"':
-			if !inSingle && !inBack {
-				inDouble = !inDouble
+		case inDouble:
+			switch c {
+			case '\\':
+				if i+1 < len(s) {
+					i++
+				}
+			case '"':
+				if i+1 < len(s) && s[i+1] == '"' {
+					i++
+					break
+				}
+				inDouble = false
 			}
-		case '`':
-			if !inSingle && !inDouble {
-				inBack = !inBack
+		case inBack:
+			if c == '`' {
+				// MySQL identifiers escape a backtick by doubling it (``).
+				if i+1 < len(s) && s[i+1] == '`' {
+					i++
+					break
+				}
+				inBack = false
 			}
-		case '(':
-			if !inSingle && !inDouble && !inBack {
+		default:
+			switch c {
+			case '\'':
+				inSingle = true
+			case '"':
+				inDouble = true
+			case '`':
+				inBack = true
+			case '(':
 				depth++
-			}
-		case ')':
-			if !inSingle && !inDouble && !inBack && depth > 0 {
-				depth--
-			}
-		case ',':
-			if depth == 0 && !inSingle && !inDouble && !inBack {
-				out = append(out, s[start:i])
-				start = i + 1
+			case ')':
+				if depth > 0 {
+					depth--
+				}
+			case ',':
+				if depth == 0 {
+					out = append(out, s[start:i])
+					start = i + 1
+				}
 			}
 		}
 	}
