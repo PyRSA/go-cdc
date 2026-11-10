@@ -145,6 +145,12 @@ func TestAddColumns(t *testing.T) {
 		{"ALTER TABLE db.t ADD CONSTRAINT fk FOREIGN KEY (id) REFERENCES p(id)", nil},
 		{"CREATE TABLE db.t (id int)", nil},
 		{"ALTER TABLE db.t DROP COLUMN note", nil},
+		// Escaped quotes must not end the literal before an embedded comma.
+		{`ALTER TABLE db.t ADD COLUMN note VARCHAR(64) DEFAULT 'it\'s,a value', ADD COLUMN age INT`, []string{"note", "age"}},
+		{`ALTER TABLE db.t ADD COLUMN note VARCHAR(64) DEFAULT "it\"s,a value", ADD COLUMN age INT`, []string{"note", "age"}},
+		{`ALTER TABLE db.t ADD COLUMN note VARCHAR(64) DEFAULT 'it''s,a value', ADD COLUMN age INT`, []string{"note", "age"}},
+		{`ALTER TABLE db.t ADD COLUMN path VARCHAR(64) DEFAULT 'C:\\a,b\\c', ADD COLUMN age INT`, []string{"path", "age"}},
+		{`ALTER TABLE db.t ADD COLUMN note VARCHAR(64) DEFAULT 'a\\\'b,c', ADD COLUMN age INT`, []string{"note", "age"}},
 	}
 	for _, tc := range cases {
 		got := AddColumns(tc.sql)
@@ -154,6 +160,67 @@ func TestAddColumns(t *testing.T) {
 		for i := range tc.want {
 			if got[i] != tc.want[i] {
 				t.Fatalf("%s: got %#v want %#v", tc.sql, got, tc.want)
+			}
+		}
+	}
+}
+
+func TestSplitClausesEscapedQuotes(t *testing.T) {
+	cases := []struct {
+		body string
+		want []string
+	}{
+		{
+			`ADD COLUMN note VARCHAR(64) DEFAULT 'it\'s,a value', ADD COLUMN age INT`,
+			[]string{
+				`ADD COLUMN note VARCHAR(64) DEFAULT 'it\'s,a value'`,
+				` ADD COLUMN age INT`,
+			},
+		},
+		{
+			`ADD COLUMN note VARCHAR(64) DEFAULT 'a\\\'b,c', ADD COLUMN age INT`,
+			[]string{
+				`ADD COLUMN note VARCHAR(64) DEFAULT 'a\\\'b,c'`,
+				` ADD COLUMN age INT`,
+			},
+		},
+		{
+			`ADD COLUMN amount decimal(10,2), ADD COLUMN age INT`,
+			[]string{
+				`ADD COLUMN amount decimal(10,2)`,
+				` ADD COLUMN age INT`,
+			},
+		},
+		{
+			"ADD COLUMN `odd,name` INT, ADD KEY idx_odd (`odd,name`)",
+			[]string{
+				"ADD COLUMN `odd,name` INT",
+				" ADD KEY idx_odd (`odd,name`)",
+			},
+		},
+		{
+			"ADD COLUMN `a``b,c` INT, ADD COLUMN age INT",
+			[]string{
+				"ADD COLUMN `a``b,c` INT",
+				" ADD COLUMN age INT",
+			},
+		},
+		{
+			"ADD COLUMN `weird``,name` INT, ADD KEY idx_w (`weird``,name`)",
+			[]string{
+				"ADD COLUMN `weird``,name` INT",
+				" ADD KEY idx_w (`weird``,name`)",
+			},
+		},
+	}
+	for _, tc := range cases {
+		got := splitClauses(tc.body)
+		if len(got) != len(tc.want) {
+			t.Fatalf("%s: got %#v want %#v", tc.body, got, tc.want)
+		}
+		for i := range tc.want {
+			if got[i] != tc.want[i] {
+				t.Fatalf("%s: [%d] got %q want %q", tc.body, i, got[i], tc.want[i])
 			}
 		}
 	}

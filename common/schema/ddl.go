@@ -374,36 +374,73 @@ func startsWithWord(s, word string) bool {
 }
 
 // splitClauses splits on commas outside parentheses, strings, and identifiers.
+//
+// Inside '…' / "…" it follows default MySQL string rules: a backslash escapes
+// the next byte (so \' and \" do not end the literal), and a doubled quote
+// (”, "") is one embedded quote. sql_mode=NO_BACKSLASH_ESCAPES is not detected
+// here; that mode writes embedded quotes as ”, which this path still handles.
+// Backslash is ignored outside quotes and inside backtick identifiers.
 func splitClauses(s string) []string {
 	var out []string
 	depth, start := 0, 0
 	inSingle, inDouble, inBack := false, false, false
 	for i := 0; i < len(s); i++ {
-		switch s[i] {
-		case '\'':
-			if !inDouble && !inBack {
-				inSingle = !inSingle
+		c := s[i]
+		switch {
+		case inSingle:
+			switch c {
+			case '\\':
+				if i+1 < len(s) {
+					i++ // default MySQL: backslash escapes the next byte
+				}
+			case '\'':
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++ // '' embedded quote
+					break
+				}
+				inSingle = false
 			}
-		case '"':
-			if !inSingle && !inBack {
-				inDouble = !inDouble
+		case inDouble:
+			switch c {
+			case '\\':
+				if i+1 < len(s) {
+					i++
+				}
+			case '"':
+				if i+1 < len(s) && s[i+1] == '"' {
+					i++
+					break
+				}
+				inDouble = false
 			}
-		case '`':
-			if !inSingle && !inDouble {
-				inBack = !inBack
+		case inBack:
+			if c == '`' {
+				// MySQL identifiers escape a backtick by doubling it (``).
+				if i+1 < len(s) && s[i+1] == '`' {
+					i++
+					break
+				}
+				inBack = false
 			}
-		case '(':
-			if !inSingle && !inDouble && !inBack {
+		default:
+			switch c {
+			case '\'':
+				inSingle = true
+			case '"':
+				inDouble = true
+			case '`':
+				inBack = true
+			case '(':
 				depth++
-			}
-		case ')':
-			if !inSingle && !inDouble && !inBack && depth > 0 {
-				depth--
-			}
-		case ',':
-			if depth == 0 && !inSingle && !inDouble && !inBack {
-				out = append(out, s[start:i])
-				start = i + 1
+			case ')':
+				if depth > 0 {
+					depth--
+				}
+			case ',':
+				if depth == 0 {
+					out = append(out, s[start:i])
+					start = i + 1
+				}
 			}
 		}
 	}
