@@ -58,11 +58,12 @@ func TestClassifyIndexAddDoesNotLookLikeColumn(t *testing.T) {
 	}
 }
 
-func TestClassifyMixedIndexAndColumnAlterIsOther(t *testing.T) {
+func TestClassifyMixedAlterIsOther(t *testing.T) {
 	cases := []struct {
 		sql    string
 		action Action
 	}{
+		// Index + column mixes.
 		{"ALTER TABLE users ADD COLUMN age int, ADD INDEX idx_age (age)", ActionOther},
 		{"ALTER TABLE users ADD INDEX idx_age (age), ADD COLUMN age int", ActionOther},
 		{"ALTER TABLE users ADD COLUMN age int, ADD KEY idx_age (age)", ActionOther},
@@ -72,18 +73,49 @@ func TestClassifyMixedIndexAndColumnAlterIsOther(t *testing.T) {
 		{"ALTER TABLE users DROP COLUMN age, DROP INDEX idx_age", ActionOther},
 		{"ALTER TABLE users ADD COLUMN age int, DROP INDEX idx_name", ActionOther},
 		{"ALTER TABLE users MODIFY COLUMN age bigint, ADD INDEX idx_age (age)", ActionOther},
+		// Constraint / FK / CHECK mixes with column changes.
+		{"ALTER TABLE users ADD COLUMN age int, ADD CONSTRAINT chk CHECK (age > 0)", ActionOther},
+		{"ALTER TABLE users ADD COLUMN owner_id int, ADD FOREIGN KEY (owner_id) REFERENCES owners(id)", ActionOther},
+		{"ALTER TABLE users ADD COLUMN owner_id int, ADD CONSTRAINT fk FOREIGN KEY (owner_id) REFERENCES owners(id)", ActionOther},
+		{"ALTER TABLE users DROP COLUMN age, ADD CHECK (id > 0)", ActionOther},
+		{"ALTER TABLE users RENAME COLUMN name TO full_name, ADD CONSTRAINT chk CHECK (id > 0)", ActionOther},
+		{"ALTER TABLE users CHANGE COLUMN name full_name varchar(32), ADD INDEX idx_name (full_name)", ActionOther},
+		{"ALTER TABLE users MODIFY age bigint, DROP FOREIGN KEY fk_owner", ActionOther},
+		// Distinct column kinds mixed together.
+		{"ALTER TABLE users ADD COLUMN age int, DROP COLUMN note", ActionOther},
+		{"ALTER TABLE users ADD COLUMN age int, MODIFY COLUMN name varchar(64)", ActionOther},
+		{"ALTER TABLE users DROP COLUMN age, RENAME COLUMN name TO full_name", ActionOther},
+		// Multi-clause, case, and commas inside parentheses / strings.
+		{"alter table users add column age int, add index idx_age (age)", ActionOther},
+		{"ALTER TABLE users ADD COLUMN amount decimal(10,2), ADD INDEX idx_amount (amount)", ActionOther},
+		{"ALTER TABLE users ADD COLUMN note varchar(32) DEFAULT 'a,b', ADD INDEX idx_note (note)", ActionOther},
+		{"ALTER TABLE users ADD COLUMN `odd,name` int, ADD KEY idx_odd (`odd,name`)", ActionOther},
 		// Pure forms stay classified as before.
 		{"ALTER TABLE users ADD COLUMN age int", ActionAddColumn},
 		{"ALTER TABLE users ADD age int", ActionAddColumn},
+		{"ALTER TABLE users ADD COLUMN a int, ADD COLUMN b varchar(8)", ActionAddColumn},
+		{"ALTER TABLE users ADD COLUMN amount decimal(10,2) NOT NULL DEFAULT 0", ActionAddColumn},
+		{"ALTER TABLE users ADD COLUMN note varchar(32) DEFAULT 'a,b'", ActionAddColumn},
+		{"ALTER TABLE users ADD COLUMN age int, ALGORITHM=INPLACE, LOCK=NONE", ActionAddColumn},
 		{"ALTER TABLE users ADD INDEX idx_name (name)", ActionIndex},
 		{"ALTER TABLE users ADD KEY idx_name (name)", ActionIndex},
 		{"ALTER TABLE users ADD UNIQUE KEY uk_name (name)", ActionIndex},
 		{"ALTER TABLE users ADD FULLTEXT INDEX ft_body (body)", ActionIndex},
 		{"ALTER TABLE users ADD SPATIAL INDEX sp_pt (pt)", ActionIndex},
+		{"ALTER TABLE users ADD INDEX idx_a (a), ADD KEY idx_b (b)", ActionIndex},
 		{"ALTER TABLE users DROP INDEX idx_name", ActionIndex},
 		{"ALTER TABLE users DROP KEY idx_name", ActionIndex},
 		{"ALTER TABLE users DROP PRIMARY KEY", ActionIndex},
 		{"ALTER TABLE users DROP COLUMN age", ActionDropColumn},
+		{"ALTER TABLE users DROP COLUMN a, DROP COLUMN b", ActionDropColumn},
+		{"ALTER TABLE users RENAME COLUMN name TO full_name", ActionRenameColumn},
+		{"ALTER TABLE users CHANGE COLUMN name full_name varchar(32)", ActionRenameColumn},
+		{"ALTER TABLE users MODIFY COLUMN age bigint", ActionModifyColumn},
+		{"ALTER TABLE users RENAME TO people", ActionRenameTable},
+		// Unsupported-only statements stay Other.
+		{"ALTER TABLE users ADD CONSTRAINT chk CHECK (age > 0)", ActionOther},
+		{"ALTER TABLE users ADD FOREIGN KEY (owner_id) REFERENCES owners(id)", ActionOther},
+		{"ALTER TABLE users CONVERT TO CHARACTER SET utf8mb4", ActionOther},
 	}
 	for _, tc := range cases {
 		got := Classify(tc.sql)

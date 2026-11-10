@@ -42,65 +42,158 @@ func Classify(sql string) Change {
 	return change
 }
 
+// alterKind is one top-level ALTER TABLE clause category the classifier knows.
+type alterKind int
+
+const (
+	alterNone alterKind = iota
+	alterAddColumn
+	alterDropColumn
+	alterRenameColumn
+	alterModifyColumn
+	alterIndex
+	alterRenameTable
+	alterUnsupported
+)
+
+// classifyAlter classifies one ALTER TABLE by its top-level clauses. Mixed
+// supported kinds, or any unsupported clause beside a supported one, become
+// ActionOther so callers refuse the statement instead of applying only half.
 func classifyAlter(change *Change, text string) {
 	rest := afterTableRef(text, "ALTER TABLE")
-	upper := strings.ToUpper(rest)
-	// A single ALTER that mixes index work with column-structure changes cannot
-	// be executed safely as either ActionIndex (which skips columns) or a
-	// column action (which ignores indexes). Leave it as ActionOther so callers
-	// refuse the statement instead of silently dropping half of it.
-	if hasIndexAlter(upper) && hasColumnAlter(text, upper) {
+	var kinds []alterKind
+	var firstAdd, firstRename, firstModify, firstDrop string
+	var firstRenameNew string
+	for _, raw := range splitClauses(rest) {
+		clause := strings.TrimSpace(raw)
+		if clause == "" || isAlterOptionClause(clause) {
+			continue
+		}
+		kind := classifyAlterClause(clause)
+		switch kind {
+		case alterNone:
+			continue
+		case alterUnsupported:
+			change.Action = ActionOther
+			return
+		case alterAddColumn:
+			if firstAdd == "" {
+				firstAdd = identAfter(clause, "ADD COLUMN", "ADD")
+			}
+		case alterDropColumn:
+			if firstDrop == "" {
+				firstDrop = identAfter(clause, "DROP COLUMN")
+			}
+		case alterRenameColumn:
+			if firstRename == "" {
+				firstRename, firstRenameNew = twoIdentsAfter(clause, "RENAME COLUMN", "CHANGE COLUMN", "CHANGE")
+			}
+		case alterModifyColumn:
+			if firstModify == "" {
+				firstModify = identAfter(clause, "MODIFY COLUMN", "MODIFY")
+			}
+		}
+		if !containsAlterKind(kinds, kind) {
+			kinds = append(kinds, kind)
+		}
+	}
+	if len(kinds) != 1 {
 		change.Action = ActionOther
 		return
 	}
-	switch {
-	case hasWord(upper, "ADD COLUMN"), hasWord(upper, "ADD "):
-		if hasIndexAlter(upper) {
-			change.Action = ActionIndex
-			return
-		}
+	switch kinds[0] {
+	case alterAddColumn:
 		change.Action = ActionAddColumn
-		change.Column = identAfter(rest, "ADD COLUMN", "ADD")
-	case hasWord(upper, "DROP COLUMN"):
+		change.Column = firstAdd
+	case alterDropColumn:
 		change.Action = ActionDropColumn
-		change.Column = identAfter(rest, "DROP COLUMN")
-	case hasWord(upper, "DROP INDEX"), hasWord(upper, "DROP KEY"), hasWord(upper, "DROP PRIMARY"):
-		change.Action = ActionIndex
-	case hasWord(upper, "RENAME COLUMN"):
+		change.Column = firstDrop
+	case alterRenameColumn:
 		change.Action = ActionRenameColumn
-		change.Column, change.NewName = twoIdentsAfter(rest, "RENAME COLUMN")
-	case hasWord(upper, "CHANGE COLUMN"), hasWord(upper, "CHANGE "):
-		change.Action = ActionRenameColumn
-		change.Column, change.NewName = twoIdentsAfter(rest, "CHANGE COLUMN", "CHANGE")
-	case hasWord(upper, "MODIFY COLUMN"), hasWord(upper, "MODIFY "):
+		change.Column, change.NewName = firstRename, firstRenameNew
+	case alterModifyColumn:
 		change.Action = ActionModifyColumn
-		change.Column = identAfter(rest, "MODIFY COLUMN", "MODIFY")
-	case hasWord(upper, "RENAME TO"), hasWord(upper, "RENAME AS"):
+		change.Column = firstModify
+	case alterIndex:
+		change.Action = ActionIndex
+	case alterRenameTable:
 		change.Action = ActionRenameTable
 	default:
 		change.Action = ActionOther
 	}
 }
 
-func hasIndexAlter(upper string) bool {
-	return hasWord(upper, "ADD INDEX") || hasWord(upper, "ADD KEY") ||
-		hasWord(upper, "ADD PRIMARY") || hasWord(upper, "ADD UNIQUE") ||
-		hasWord(upper, "ADD FULLTEXT") || hasWord(upper, "ADD SPATIAL") ||
-		hasWord(upper, "DROP INDEX") || hasWord(upper, "DROP KEY") ||
-		hasWord(upper, "DROP PRIMARY")
-}
-
-func hasColumnAlter(text, upper string) bool {
-	if len(AddColumns(text)) > 0 {
-		return true
+func containsAlterKind(kinds []alterKind, want alterKind) bool {
+	for _, kind := range kinds {
+		if kind == want {
+			return true
+		}
 	}
-	return hasWord(upper, "DROP COLUMN") || hasWord(upper, "RENAME COLUMN") ||
-		hasWord(upper, "CHANGE COLUMN") || hasWord(upper, "CHANGE ") ||
-		hasWord(upper, "MODIFY COLUMN") || hasWord(upper, "MODIFY ")
+	return false
 }
 
-func hasWord(upper, phrase string) bool {
-	return strings.Contains(upper, phrase)
+// isAlterOptionClause reports ALGORITHM=/LOCK= execution options, which do not
+// change schema shape and must not force ActionOther on an otherwise pure ALTER.
+func isAlterOptionClause(clause string) bool {
+	return startsWithWord(clause, "ALGORITHM") || startsWithWord(clause, "LOCK")
+}
+
+func classifyAlterClause(clause string) alterKind {
+	switch {
+	case startsWithWord(clause, "ADD"):
+		body := strings.TrimSpace(clause[len("ADD"):])
+		if startsWithWord(body, "COLUMN") {
+			return alterAddColumn
+		}
+		switch addClauseKind(body) {
+		case alterIndex:
+			return alterIndex
+		case alterUnsupported:
+			return alterUnsupported
+		default:
+			return alterAddColumn
+		}
+	case startsWithWord(clause, "DROP"):
+		body := strings.TrimSpace(clause[len("DROP"):])
+		if startsWithWord(body, "COLUMN") {
+			return alterDropColumn
+		}
+		if startsWithWord(body, "INDEX") || startsWithWord(body, "KEY") || startsWithWord(body, "PRIMARY") {
+			return alterIndex
+		}
+		return alterUnsupported
+	case startsWithWord(clause, "RENAME"):
+		body := strings.TrimSpace(clause[len("RENAME"):])
+		if startsWithWord(body, "COLUMN") {
+			return alterRenameColumn
+		}
+		if startsWithWord(body, "TO") || startsWithWord(body, "AS") {
+			return alterRenameTable
+		}
+		return alterUnsupported
+	case startsWithWord(clause, "CHANGE"):
+		return alterRenameColumn
+	case startsWithWord(clause, "MODIFY"):
+		return alterModifyColumn
+	default:
+		return alterUnsupported
+	}
+}
+
+// addClauseKind distinguishes index-like ADD clauses from column ADD and from
+// unsupported ADD CONSTRAINT / FOREIGN / CHECK / PARTITION forms.
+func addClauseKind(body string) alterKind {
+	for _, keyword := range []string{"INDEX", "KEY", "PRIMARY", "UNIQUE", "FULLTEXT", "SPATIAL"} {
+		if startsWithWord(body, keyword) {
+			return alterIndex
+		}
+	}
+	for _, keyword := range []string{"CONSTRAINT", "FOREIGN", "CHECK", "PARTITION"} {
+		if startsWithWord(body, keyword) {
+			return alterUnsupported
+		}
+	}
+	return alterAddColumn
 }
 
 func stripComments(sql string) string {
