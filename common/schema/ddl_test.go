@@ -58,6 +58,44 @@ func TestClassifyIndexAddDoesNotLookLikeColumn(t *testing.T) {
 	}
 }
 
+func TestClassifyMixedIndexAndColumnAlterIsOther(t *testing.T) {
+	cases := []struct {
+		sql    string
+		action Action
+	}{
+		{"ALTER TABLE users ADD COLUMN age int, ADD INDEX idx_age (age)", ActionOther},
+		{"ALTER TABLE users ADD INDEX idx_age (age), ADD COLUMN age int", ActionOther},
+		{"ALTER TABLE users ADD COLUMN age int, ADD KEY idx_age (age)", ActionOther},
+		{"ALTER TABLE users ADD COLUMN age int, ADD UNIQUE KEY uk_age (age)", ActionOther},
+		{"ALTER TABLE users ADD COLUMN body text, ADD FULLTEXT INDEX ft_body (body)", ActionOther},
+		{"ALTER TABLE users ADD COLUMN pt point, ADD SPATIAL INDEX sp_pt (pt)", ActionOther},
+		{"ALTER TABLE users DROP COLUMN age, DROP INDEX idx_age", ActionOther},
+		{"ALTER TABLE users ADD COLUMN age int, DROP INDEX idx_name", ActionOther},
+		{"ALTER TABLE users MODIFY COLUMN age bigint, ADD INDEX idx_age (age)", ActionOther},
+		// Pure forms stay classified as before.
+		{"ALTER TABLE users ADD COLUMN age int", ActionAddColumn},
+		{"ALTER TABLE users ADD age int", ActionAddColumn},
+		{"ALTER TABLE users ADD INDEX idx_name (name)", ActionIndex},
+		{"ALTER TABLE users ADD KEY idx_name (name)", ActionIndex},
+		{"ALTER TABLE users ADD UNIQUE KEY uk_name (name)", ActionIndex},
+		{"ALTER TABLE users ADD FULLTEXT INDEX ft_body (body)", ActionIndex},
+		{"ALTER TABLE users ADD SPATIAL INDEX sp_pt (pt)", ActionIndex},
+		{"ALTER TABLE users DROP INDEX idx_name", ActionIndex},
+		{"ALTER TABLE users DROP KEY idx_name", ActionIndex},
+		{"ALTER TABLE users DROP PRIMARY KEY", ActionIndex},
+		{"ALTER TABLE users DROP COLUMN age", ActionDropColumn},
+	}
+	for _, tc := range cases {
+		got := Classify(tc.sql)
+		if got.Action != tc.action {
+			t.Fatalf("%s: action %s, want %s", tc.sql, got.Action, tc.action)
+		}
+		if got.Table != "users" {
+			t.Fatalf("%s: table %q", tc.sql, got.Table)
+		}
+	}
+}
+
 func TestAddColumns(t *testing.T) {
 	cases := []struct {
 		sql  string

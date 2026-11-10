@@ -45,9 +45,17 @@ func Classify(sql string) Change {
 func classifyAlter(change *Change, text string) {
 	rest := afterTableRef(text, "ALTER TABLE")
 	upper := strings.ToUpper(rest)
+	// A single ALTER that mixes index work with column-structure changes cannot
+	// be executed safely as either ActionIndex (which skips columns) or a
+	// column action (which ignores indexes). Leave it as ActionOther so callers
+	// refuse the statement instead of silently dropping half of it.
+	if hasIndexAlter(upper) && hasColumnAlter(text, upper) {
+		change.Action = ActionOther
+		return
+	}
 	switch {
 	case hasWord(upper, "ADD COLUMN"), hasWord(upper, "ADD "):
-		if hasWord(upper, "ADD INDEX") || hasWord(upper, "ADD KEY") || hasWord(upper, "ADD PRIMARY") || hasWord(upper, "ADD UNIQUE") || hasWord(upper, "ADD FULLTEXT") || hasWord(upper, "ADD SPATIAL") {
+		if hasIndexAlter(upper) {
 			change.Action = ActionIndex
 			return
 		}
@@ -72,6 +80,23 @@ func classifyAlter(change *Change, text string) {
 	default:
 		change.Action = ActionOther
 	}
+}
+
+func hasIndexAlter(upper string) bool {
+	return hasWord(upper, "ADD INDEX") || hasWord(upper, "ADD KEY") ||
+		hasWord(upper, "ADD PRIMARY") || hasWord(upper, "ADD UNIQUE") ||
+		hasWord(upper, "ADD FULLTEXT") || hasWord(upper, "ADD SPATIAL") ||
+		hasWord(upper, "DROP INDEX") || hasWord(upper, "DROP KEY") ||
+		hasWord(upper, "DROP PRIMARY")
+}
+
+func hasColumnAlter(text, upper string) bool {
+	if len(AddColumns(text)) > 0 {
+		return true
+	}
+	return hasWord(upper, "DROP COLUMN") || hasWord(upper, "RENAME COLUMN") ||
+		hasWord(upper, "CHANGE COLUMN") || hasWord(upper, "CHANGE ") ||
+		hasWord(upper, "MODIFY COLUMN") || hasWord(upper, "MODIFY ")
 }
 
 func hasWord(upper, phrase string) bool {
