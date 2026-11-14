@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/PyRSA/go-cdc/common/logfmt"
+	"github.com/PyRSA/go-cdc/common/logging"
 	"github.com/PyRSA/go-cdc/composer"
 	"github.com/PyRSA/go-cdc/composer/definition"
 	"github.com/PyRSA/go-cdc/connector/sink"
@@ -33,12 +34,8 @@ func main() {
 }
 
 func run(args []string) (code int) {
+	// Bootstrap logger so YAML load failures are visible before logging: applies.
 	slog.SetDefault(slog.New(logfmt.NewHandler(os.Stderr, slog.LevelInfo)))
-	configLog := logfmt.Module("config")
-	pipelineLog := logfmt.Module("pipeline")
-	sourceLog := logfmt.Module("source")
-	sinkLog := logfmt.Module("sink")
-	checkpointLog := logfmt.Module("checkpoint")
 
 	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
 		fmt.Fprintln(os.Stderr, "usage: go-cdc <pipeline.yaml>")
@@ -48,19 +45,39 @@ func run(args []string) (code int) {
 		return 0
 	}
 	if len(args) != 1 {
-		configLog.Error("Invalid usage: expected go-cdc <pipeline.yaml>")
+		logfmt.Module("config").Error("Invalid usage: expected go-cdc <pipeline.yaml>")
 		return 2
 	}
 	body, err := os.ReadFile(args[0])
 	if err != nil {
-		configLog.Error("Failed to read pipeline file", "path", args[0], "error", err)
+		logfmt.Module("config").Error("Failed to read pipeline file", "path", args[0], "error", err)
 		return 1
 	}
 	pipe, err := definition.Parse(body)
 	if err != nil {
-		configLog.Error("Failed to parse pipeline", "error", err)
+		logfmt.Module("config").Error("Failed to parse pipeline", "error", err)
 		return 1
 	}
+	logCloser, err := logging.Setup(pipe.Logging)
+	if err != nil {
+		logfmt.Module("config").Error("Failed to configure logging", "error", err)
+		return 1
+	}
+	defer func() {
+		if err := logCloser.Close(); err != nil {
+			logfmt.Module("config").Error("Failed to close logging", "error", err)
+			if code == 0 {
+				code = 1
+			}
+		}
+	}()
+
+	configLog := logfmt.Module("config")
+	pipelineLog := logfmt.Module("pipeline")
+	sourceLog := logfmt.Module("source")
+	sinkLog := logfmt.Module("sink")
+	checkpointLog := logfmt.Module("checkpoint")
+
 	configLog.Info("Configuration loaded successfully",
 		"name", pipe.Runtime.Name, "sink", pipe.Sink.Type, "startup", pipe.Source.StartupMode)
 

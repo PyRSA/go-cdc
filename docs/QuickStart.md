@@ -41,7 +41,7 @@ Libraries linked into the binary (no separate connector packages to install):
 | Elasticsearch | Sink | [connectors/elasticsearch-sink.md](connectors/elasticsearch-sink.md) |
 | PostgreSQL | Sink | [connectors/postgresql-sink.md](connectors/postgresql-sink.md) |
 
-Pipeline concepts (transform, projection, route, schema evolution): [pipeline.md](pipeline.md).
+Pipeline concepts (transform, projection, route, schema evolution): [pipeline.md](pipeline.md). Optional logging (`console` / `file`): [logging.md](logging.md).
 
 ## How to Use
 

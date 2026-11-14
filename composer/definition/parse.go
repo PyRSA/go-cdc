@@ -257,7 +257,7 @@ func Parse(data []byte) (*Pipeline, error) {
 	}
 	for key := range root {
 		switch key {
-		case "source", "sink", "route", "transform", "pipeline", "checkpoint":
+		case "source", "sink", "route", "transform", "pipeline", "checkpoint", "logging":
 		default:
 			return nil, configErr(key, "unknown field")
 		}
@@ -286,6 +286,13 @@ func Parse(data []byte) (*Pipeline, error) {
 	if err != nil {
 		return nil, err
 	}
+	var logging Logging
+	if _, ok := root["logging"]; ok {
+		logging, err = parseLogging(asMap(root["logging"]))
+		if err != nil {
+			return nil, err
+		}
+	}
 	base := ckpt.FilePath
 	if base == "" {
 		base = defaultCheckpointDir
@@ -293,7 +300,7 @@ func Parse(data []byte) (*Pipeline, error) {
 	ckpt.FilePath = checkpointFilePath(base, runtime.Name)
 	return &Pipeline{
 		Source: source, Sink: sink, Routes: routes, Transforms: transforms,
-		Runtime: runtime, Checkpoint: ckpt,
+		Runtime: runtime, Checkpoint: ckpt, Logging: logging,
 	}, nil
 }
 
