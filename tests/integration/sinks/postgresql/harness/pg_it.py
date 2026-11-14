@@ -14,6 +14,7 @@ vocabulary live in `docs/test/POSTGRESQL.md`.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -420,16 +421,27 @@ def log_tail(lines: int = 12) -> str:
     return " | ".join(body[-lines:])
 
 
+# Current go-cdc logfmt: ``2006-01-02 15:04:05.000 [LEVEL] [module] ...``
+# (see common/logfmt). Level is taken only from that prefix, never from the
+# message body, so text like `` [ERROR] [`` inside an INFO line is ignored.
+_LOGFMT_LEVEL = re.compile(
+    r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} \[([A-Z]+)\] \["
+)
+# Legacy slog text used a ``level=`` field before the message.
+_LEGACY_LEVEL_ERROR = re.compile(r"(?:^|\s)level=ERROR(?:\s|$)")
+
+
 def _is_error_log_line(line: str) -> bool:
     """True for a go-cdc ERROR record in current or legacy slog text form.
 
-    Current logfmt writes ``... [ERROR] [module] ...``. Legacy slog text used
+    Current logfmt puts the level in the record prefix
+    (``YYYY-MM-DD HH:MM:SS.mmm [LEVEL] [module]``). Legacy slog text used
     ``level=ERROR``. Free-text ``ERROR`` in a message body must not match.
     """
-    if "level=ERROR" in line:
+    if _LEGACY_LEVEL_ERROR.search(line):
         return True
-    # logfmt places the level between the timestamp and the module bracket.
-    return " [ERROR] [" in line
+    match = _LOGFMT_LEVEL.match(line)
+    return match is not None and match.group(1) == "ERROR"
 
 
 def log_errors(limit: int = 4, stack: int = 8) -> str:
