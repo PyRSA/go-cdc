@@ -241,6 +241,16 @@ func (r *RollingFile) closeActive() error {
 }
 
 func (r *RollingFile) rotateLocked(now time.Time) error {
+	// Time-based rotate of an empty active file would create a useless archive
+	// and consume retention. Advance the schedule, keep the open handle, and
+	// still prune so retainAge/count run on the due tick.
+	if r.file != nil && r.size == 0 {
+		timeDue := !r.nextRotateAt.IsZero() && !now.Before(r.nextRotateAt)
+		if timeDue {
+			r.nextRotateAt = r.computeNextRotate(now)
+			return r.pruneLocked(now)
+		}
+	}
 	var archived string
 	if r.file != nil {
 		name := r.file.Name()
@@ -372,10 +382,11 @@ func (r *RollingFile) archiveNoReplace(src, dst string) error {
 	}
 	_, copyErr := r.copy(tmp, in)
 	closeInErr := in.Close()
+	modeErr := copyPermFrom(src, tmp)
 	syncErr := r.syncFile(tmp)
 	closeTmpErr := tmp.Close()
-	if copyErr != nil || closeInErr != nil || syncErr != nil || closeTmpErr != nil {
-		primary := firstError(copyErr, closeInErr, syncErr, closeTmpErr)
+	if copyErr != nil || closeInErr != nil || modeErr != nil || syncErr != nil || closeTmpErr != nil {
+		primary := firstError(copyErr, closeInErr, modeErr, syncErr, closeTmpErr)
 		return cleanupTemp(primary)
 	}
 
@@ -414,6 +425,16 @@ func firstError(errs ...error) error {
 		}
 	}
 	return nil
+}
+
+// copyPermFrom sets dst's permission bits to match srcPath so published
+// archives stay readable by the same collectors that can read the active log.
+func copyPermFrom(srcPath string, dst *os.File) error {
+	info, err := os.Stat(srcPath)
+	if err != nil {
+		return err
+	}
+	return dst.Chmod(info.Mode().Perm())
 }
 
 func isTargetConflict(err error) bool {
@@ -693,10 +714,11 @@ func (r *RollingFile) gzipToArchive(path string) error {
 	} else {
 		closeGzErr = gz.Close()
 	}
+	modeErr := copyPermFrom(path, tmp)
 	syncErr := r.syncFile(tmp)
 	closeTmpErr := tmp.Close()
-	if copyErr != nil || closeInErr != nil || closeGzErr != nil || syncErr != nil || closeTmpErr != nil {
-		primary := firstError(copyErr, closeInErr, closeGzErr, syncErr, closeTmpErr)
+	if copyErr != nil || closeInErr != nil || closeGzErr != nil || modeErr != nil || syncErr != nil || closeTmpErr != nil {
+		primary := firstError(copyErr, closeInErr, closeGzErr, modeErr, syncErr, closeTmpErr)
 		return cleanupTemp(primary)
 	}
 

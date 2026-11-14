@@ -41,3 +41,40 @@ func TestPublishNoReplaceUsesHardLinkOnUnix(t *testing.T) {
 		t.Fatalf("expected nlink>=2 after Link, got %d", tempStat.Nlink)
 	}
 }
+
+func TestPublishNoReplaceConflictLeavesNoEmptyClaim(t *testing.T) {
+	dir := t.TempDir()
+	final := filepath.Join(dir, "app-2026-01-01T00-00-00.000-1.log")
+	const marker = "existing\n"
+	if err := os.WriteFile(final, []byte(marker), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	temp := filepath.Join(dir, ".link-temp")
+	if err := os.WriteFile(temp, []byte("new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publishNoReplace(temp, final); err == nil {
+		t.Fatal("expected conflict")
+	}
+	got, err := os.ReadFile(final)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != marker {
+		t.Fatalf("final overwritten: %q", got)
+	}
+	after, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("publish must not create extra claim files: before=%d after=%d", len(before), len(after))
+	}
+	if _, err := os.Stat(temp); err != nil {
+		t.Fatalf("temp must remain for caller cleanup: %v", err)
+	}
+}

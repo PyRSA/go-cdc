@@ -97,6 +97,169 @@ func TestRollingFileTimeRotation(t *testing.T) {
 	}
 }
 
+func TestTimeRotateSkipsEmptyActive(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	r, err := OpenRollingFile(RollingOptions{Path: path, Every: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	base := time.Date(2026, 11, 14, 10, 0, 0, 0, time.Local)
+	r.now = func() time.Time { return base }
+	r.nextRotateAt = base.Add(time.Hour)
+
+	due := base.Add(time.Hour + time.Second)
+	r.now = func() time.Time { return due }
+	r.mu.Lock()
+	err = r.rotateLocked(due)
+	alive := r.file != nil
+	size := r.size
+	next := r.nextRotateAt
+	r.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !alive || size != 0 {
+		t.Fatalf("empty active must stay open size=0, alive=%v size=%d", alive, size)
+	}
+	wantNext := due.Add(time.Hour)
+	if !next.Equal(wantNext) {
+		t.Fatalf("nextRotateAt=%s want %s", next, wantNext)
+	}
+	archives, err := r.listArchived()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archives) != 0 {
+		t.Fatalf("empty rotate must not create archives: %+v", archives)
+	}
+
+	// First write after the skipped due time lands on the same active file.
+	if _, err := io.WriteString(r, "after-skip\n"); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "after-skip\n" {
+		t.Fatalf("active content=%q", body)
+	}
+	archives, err = r.listArchived()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archives) != 0 {
+		t.Fatalf("first write after empty due must not archive: %+v", archives)
+	}
+}
+
+func TestEmptyTimeRotateStillPrunesByAge(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	r, err := OpenRollingFile(RollingOptions{
+		Path:      path,
+		Every:     time.Hour,
+		RetainAge: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	base := time.Date(2026, 11, 14, 10, 0, 0, 0, time.Local)
+	r.now = func() time.Time { return base }
+	r.nextRotateAt = base.Add(time.Hour)
+
+	expired := filepath.Join(dir, "app-2026-11-14T07-00-00.000-1.log")
+	fresh := filepath.Join(dir, "app-2026-11-14T09-45-00.000-2.log")
+	if err := os.WriteFile(expired, []byte("expired\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fresh, []byte("fresh\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	due := base.Add(time.Hour + time.Second)
+	if err := os.Chtimes(expired, due.Add(-2*time.Hour), due.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(fresh, due.Add(-30*time.Minute), due.Add(-30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	r.now = func() time.Time { return due }
+	r.mu.Lock()
+	err = r.rotateLocked(due)
+	alive := r.file != nil
+	size := r.size
+	next := r.nextRotateAt
+	r.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !alive || size != 0 {
+		t.Fatalf("empty active must stay open size=0, alive=%v size=%d", alive, size)
+	}
+	wantNext := due.Add(time.Hour)
+	if !next.Equal(wantNext) {
+		t.Fatalf("nextRotateAt=%s want %s", next, wantNext)
+	}
+	if _, err := os.Stat(expired); !os.IsNotExist(err) {
+		t.Fatalf("expired archive should be pruned: %v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Fatalf("fresh archive must remain: %v", err)
+	}
+	archives, err := r.listArchived()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archives) != 1 {
+		t.Fatalf("want only fresh archive, got %+v", archives)
+	}
+	if archives[0].paths[0] != fresh {
+		t.Fatalf("kept archive=%s want %s", archives[0].paths[0], fresh)
+	}
+}
+
+func TestTimeRotateArchivesNonEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	r, err := OpenRollingFile(RollingOptions{Path: path, Every: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	base := time.Date(2026, 11, 14, 10, 0, 0, 0, time.Local)
+	r.now = func() time.Time { return base }
+	r.nextRotateAt = base.Add(time.Hour)
+	if _, err := io.WriteString(r, "payload\n"); err != nil {
+		t.Fatal(err)
+	}
+	r.now = func() time.Time { return base.Add(time.Hour + time.Second) }
+	r.mu.Lock()
+	err = r.rotateLocked(r.now())
+	r.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	archives, err := r.listArchived()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archives) != 1 {
+		t.Fatalf("non-empty due rotate must archive, got %d", len(archives))
+	}
+	body := readMaybeGzip(t, archives[0].paths[0])
+	if !strings.Contains(body, "payload") {
+		t.Fatalf("archive missing payload: %q", body)
+	}
+}
+
 func TestRollingFileRetentionByCount(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "app.log")

@@ -28,7 +28,7 @@ Exactly one style per value:
 | Duration | `1 day`, `12 hours`, `30m`, `24h` | Rotate when the interval elapses since the file was opened or last rotated |
 | Daily clock | `00:00`, `9:30` | Rotate at that local time each calendar day |
 
-**Duration rotation** is an interval timer from process open / last rotate, not from the file's mtime and not a wall-clock schedule. Restarting the process resets the timer. Prefer `HH:MM` when you need a fixed local time of day.
+**Duration rotation** is an interval timer from process open / last rotate, not from the file's mtime and not a wall-clock schedule. Restarting the process resets the timer. Prefer `HH:MM` when you need a fixed local time of day. A due time rotate is skipped when the active file is still empty; the next deadline advances so empty archives are not created.
 
 A single log record larger than the size limit is still written in full into a fresh file; that file is then archived so the next record starts another file. Archive names include a monotonic sequence. If the chosen name is already present (including after a process restart), rotation claims a new name instead of replacing the existing file.
 
