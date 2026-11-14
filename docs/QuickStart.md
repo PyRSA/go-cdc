@@ -6,7 +6,7 @@ What you get today:
 
 - End-to-end YAML jobs (source → transform / route → sink)
 - MySQL source: snapshot + binlog
-- Sinks: stdout (JSON lines), MySQL, Kafka (at-least-once), Doris (UNIQUE KEY + Stream Load, at-least-once), Elasticsearch 7/8/9, and PostgreSQL (current-state DML; target tables must already exist)
+- Sinks: stdout (JSON lines), MySQL, Kafka (at-least-once), Doris (UNIQUE KEY + Stream Load, at-least-once), Elasticsearch 7/8/9, and PostgreSQL (current-state DML; by default `auto-create-table: false` so target tables must already exist, or set `auto-create-table: true` to create them)
 - Column projection, row filter, table route, schema-change policy, file checkpoints
 
 ## Requirements

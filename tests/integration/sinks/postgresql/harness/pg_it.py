@@ -420,14 +420,28 @@ def log_tail(lines: int = 12) -> str:
     return " | ".join(body[-lines:])
 
 
+def _is_error_log_line(line: str) -> bool:
+    """True for a go-cdc ERROR record in current or legacy slog text form.
+
+    Current logfmt writes ``... [ERROR] [module] ...``. Legacy slog text used
+    ``level=ERROR``. Free-text ``ERROR`` in a message body must not match.
+    """
+    if "level=ERROR" in line:
+        return True
+    # logfmt places the level between the timestamp and the module bracket.
+    return " [ERROR] [" in line
+
+
 def log_errors(limit: int = 4, stack: int = 8) -> str:
     """Return the pipeline's own fatal records, not the last lines written.
 
-    On a failure the process logs `pipeline failed` at level=ERROR and only then
-    closes the source, which appends three INFO shutdown lines (`closing canal`,
-    `syncer is closing...`, `syncer is closed`). A plain tail therefore hides the
-    one line that says why the job died, so every failure report quotes the
-    ERROR record instead and only falls back to the tail when there is none.
+    On a failure the process logs ``Pipeline failed`` at ERROR (logfmt
+    ``[ERROR]``, or legacy ``level=ERROR``) and only then closes the source,
+    which appends three INFO shutdown lines (``closing canal``,
+    ``syncer is closing...``, ``syncer is closed``). A plain tail therefore
+    hides the one line that says why the job died, so every failure report
+    quotes the ERROR record instead and only falls back to the tail when
+    there is none.
 
     A Go crash is quoted together with the goroutine stack that follows it: the
     `panic:` line names the value but never the frame, so dropping the frames
@@ -439,10 +453,10 @@ def log_errors(limit: int = 4, stack: int = 8) -> str:
     for i, line in enumerate(body):
         if "panic:" in line or line.startswith("fatal error:"):
             return " | ".join(body[i:i + stack])
-    fatal = [ln for ln in body if "level=ERROR" in ln]
+    fatal = [ln for ln in body if _is_error_log_line(ln)]
     if fatal:
         return " | ".join(fatal[-limit:])
-    return " | ".join(["no level=ERROR line", *body[-limit:]])
+    return " | ".join(["no ERROR log line", *body[-limit:]])
 
 
 # ---------------------------------------------------------------- pipeline YAML
