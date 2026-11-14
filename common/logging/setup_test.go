@@ -14,6 +14,9 @@ import (
 )
 
 func TestSetupUnconfiguredLeavesDefault(t *testing.T) {
+	orig := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
 	dir := t.TempDir()
 	path := filepath.Join(dir, "probe.log")
 	f, err := os.Create(path)

@@ -97,7 +97,11 @@ func parseLoggingFile(raw map[string]any) (LoggingFile, error) {
 	for key, value := range raw {
 		switch key {
 		case "path":
-			out.Path = strings.TrimSpace(fmt.Sprint(value))
+			path, pathErr := requireNonEmptyString("logging.file.path", value)
+			if pathErr != nil {
+				return LoggingFile{}, pathErr
+			}
+			out.Path = path
 			hasPath = true
 		case "rotation":
 			rotationRaw = strings.TrimSpace(fmt.Sprint(value))
@@ -395,4 +399,18 @@ func isAllDigits(s string) bool {
 		}
 	}
 	return true
+}
+
+// requireNonEmptyString rejects nil and non-string YAML values instead of
+// fmt.Sprint coercion (which turns null into the literal "<nil>").
+func requireNonEmptyString(field string, value any) (string, error) {
+	s, ok := value.(string)
+	if !ok {
+		return "", configErr(field, "must be a non-empty string")
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", configErr(field, "must be a non-empty string")
+	}
+	return s, nil
 }

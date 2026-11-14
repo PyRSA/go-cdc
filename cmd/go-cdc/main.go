@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -63,13 +64,10 @@ func run(args []string) (code int) {
 		logfmt.Module("config").Error("Failed to configure logging", "error", err)
 		return 1
 	}
+	// Close errors go to stderr directly: after Close the configured slog
+	// handlers (including a file-only RollingFile) may already be unusable.
 	defer func() {
-		if err := logCloser.Close(); err != nil {
-			logfmt.Module("config").Error("Failed to close logging", "error", err)
-			if code == 0 {
-				code = 1
-			}
-		}
+		code = closeLogging(logCloser, os.Stderr, code)
 	}()
 
 	configLog := logfmt.Module("config")
@@ -248,6 +246,21 @@ func run(args []string) (code int) {
 	}
 	pipelineLog.Info("Pipeline stopped", "name", pipe.Runtime.Name)
 	return 0
+}
+
+// closeLogging closes the logging closer and reports failures on stderrWriter
+// so diagnostics remain visible after file-only handlers are shut down.
+func closeLogging(closer io.Closer, stderrWriter io.Writer, code int) int {
+	if closer == nil {
+		return code
+	}
+	if err := closer.Close(); err != nil {
+		fmt.Fprintf(stderrWriter, "go-cdc: failed to close logging: %v\n", err)
+		if code == 0 {
+			return 1
+		}
+	}
+	return code
 }
 
 // checkpointHasProgress reports snapshot or capture progress saved before any binlog offset.

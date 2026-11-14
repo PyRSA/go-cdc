@@ -131,6 +131,16 @@ func TestParseLoggingRejectsIllegal(t *testing.T) {
 		{"rotation", "logging:\n  file:\n    path: a.log\n    rotation: weeklyly\n", "logging.file.rotation"},
 		{"compression", "logging:\n  file:\n    path: a.log\n    compression: zip\n", "logging.file.compression"},
 		{"unknown", "logging:\n  sink: x\n", "logging.sink"},
+		{"logging-bool", "logging: true\n", "logging"},
+		{"logging-string", "logging: nope\n", "logging"},
+		{"logging-number", "logging: 1\n", "logging"},
+		{"logging-list", "logging:\n  - a\n", "logging"},
+		{"logging-null", "logging: null\n", "logging"},
+		{"path-null", "logging:\n  file:\n    path: null\n", "logging.file.path"},
+		{"path-number", "logging:\n  file:\n    path: 1\n", "logging.file.path"},
+		{"path-bool", "logging:\n  file:\n    path: true\n", "logging.file.path"},
+		{"path-empty", "logging:\n  file:\n    path: \"\"\n", "logging.file.path"},
+		{"path-blank", "logging:\n  file:\n    path: \"   \"\n", "logging.file.path"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -148,6 +148,232 @@ func TestRollingFileRetentionByAge(t *testing.T) {
 	}
 }
 
+func TestRetentionIgnoresNonArchiveNeighbors(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	neighbors := map[string]string{
+		"app-backup.log": "backup\n",
+		"app-notes.txt":  "notes\n",
+		"app.log.bak":    "bak\n",
+		"readme.txt":     "readme\n",
+		"app-notats.log": "notats\n",
+	}
+	for name, body := range neighbors {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Real archives (sequenced + historical + gzip) must still be recognized.
+	realPlain := filepath.Join(dir, "app-2000-01-01T00-00-00.000-1.log")
+	realHist := filepath.Join(dir, "app-2000-01-02T00-00-00.000.log")
+	realGz := filepath.Join(dir, "app-2000-01-03T00-00-00.000-2.log.gz")
+	for _, p := range []string{realPlain, realHist} {
+		if err := os.WriteFile(p, []byte("archive\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		past := time.Now().Add(-time.Minute)
+		_ = os.Chtimes(p, past, past)
+	}
+	if err := os.WriteFile(realGz, []byte("not-real-gzip-but-named"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chtimes(realGz, time.Now().Add(-time.Minute), time.Now().Add(-time.Minute))
+
+	r, err := OpenRollingFile(RollingOptions{
+		Path:        path,
+		SizeLimit:   16,
+		RetainCount: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	for name, want := range neighbors {
+		got, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("neighbor %s removed: %v", name, err)
+		}
+		if string(got) != want {
+			t.Fatalf("neighbor %s mutated: %q", name, got)
+		}
+	}
+	archives, err := r.listArchived()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archives) != 1 {
+		t.Fatalf("retain=1 should keep one logical archive, got %d (%v)", len(archives), archiveKeys(archives))
+	}
+	if _, err := io.WriteString(r, strings.Repeat("x", 20)+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	for name := range neighbors {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("neighbor %s deleted during rotate/prune: %v", name, err)
+		}
+	}
+}
+
+func TestIsArchivedFileName(t *testing.T) {
+	cases := []struct {
+		fname, name, ext string
+		want             bool
+	}{
+		{"app-2026-11-14T12-00-00.000-1.log", "app", ".log", true},
+		{"app-2026-11-14T12-00-00.000-1.log.gz", "app", ".log", true},
+		{"app-2026-11-14T12-00-00.000.log", "app", ".log", true},
+		{"app-backup.log", "app", ".log", false},
+		{"app-notes.txt", "app", ".log", false},
+		{"app.log", "app", ".log", false},
+		{"app-2026-11-14T12-00-00.000-x.log", "app", ".log", false},
+		{"other-2026-11-14T12-00-00.000-1.log", "app", ".log", false},
+		// Extension-less active paths normalize to .log for generation/recognition.
+		{"app-2026-11-14T12-00-00.000-1.log", "app", ".log", true},
+		{"app-2026-11-14T12-00-00.000-1", "app", ".log", false},
+		// Active path already ends with .gz: plain vs compressed (.gz.gz).
+		{"app-2026-11-14T12-00-00.000-1.gz", "app", ".gz", true},
+		{"app-2026-11-14T12-00-00.000-1.gz.gz", "app", ".gz", true},
+		{"app-2026-11-14T12-00-00.000.gz", "app", ".gz", true},
+		{"app-backup.gz", "app", ".gz", false},
+	}
+	for _, tc := range cases {
+		if got := isArchivedFileName(tc.fname, tc.name, tc.ext); got != tc.want {
+			t.Fatalf("%s name=%q ext=%q: got %v want %v", tc.fname, tc.name, tc.ext, got, tc.want)
+		}
+	}
+}
+
+func TestArchiveBasePartsEmptyExtUsesLog(t *testing.T) {
+	name, ext := archiveBaseParts(filepath.Join("logs", "app"))
+	if name != "app" || ext != ".log" {
+		t.Fatalf("got name=%q ext=%q", name, ext)
+	}
+	name, ext = archiveBaseParts(filepath.Join("logs", "app.gz"))
+	if name != "app" || ext != ".gz" {
+		t.Fatalf("got name=%q ext=%q", name, ext)
+	}
+}
+
+func TestRetentionPathWithoutExtGeneratesDotLog(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app") // no extension → archives use .log
+	r, err := OpenRollingFile(RollingOptions{Path: path, SizeLimit: 16, RetainCount: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	frozen := time.Date(2026, 11, 14, 12, 0, 0, 0, time.Local)
+	r.now = func() time.Time { return frozen }
+	if _, err := io.WriteString(r, strings.Repeat("n", 20)+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	archives, err := r.listArchived()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archives) == 0 {
+		t.Fatal("archive not listed")
+	}
+	found := false
+	for _, arch := range archives {
+		for _, p := range arch.paths {
+			base := filepath.Base(p)
+			if strings.Contains(base, frozen.Format(archivedTimeLayout)) && strings.HasSuffix(strings.TrimSuffix(base, ".gz"), ".log") {
+				found = true
+			}
+			if isArchivedFileName(base, "app", "") {
+				t.Fatalf("must not recognize with empty ext: %s", base)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected .log archive for extension-less path, got %+v", archives)
+	}
+}
+
+func TestRetentionGzExtensionActivePath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.gz")
+	plain := filepath.Join(dir, "app-2000-01-01T00-00-00.000-1.gz")
+	compressed := filepath.Join(dir, "app-2000-01-02T00-00-00.000-2.gz.gz")
+	neighbor := filepath.Join(dir, "app-backup.gz")
+	if err := os.WriteFile(plain, []byte("plain\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(compressed, []byte("comp\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(neighbor, []byte("keep\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Minute)
+	_ = os.Chtimes(plain, past, past)
+	_ = os.Chtimes(compressed, past, past)
+
+	r, err := OpenRollingFile(RollingOptions{
+		Path:        path,
+		SizeLimit:   16,
+		RetainCount: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	if _, err := os.Stat(neighbor); err != nil {
+		t.Fatalf("neighbor removed: %v", err)
+	}
+	archives, err := r.listArchived()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archives) != 1 {
+		t.Fatalf("want 1 logical archive for .gz active path, got %d (%v)", len(archives), archiveKeys(archives))
+	}
+	key := archives[0].key
+	if !strings.HasSuffix(key, ".gz") || strings.HasSuffix(key, ".gz.gz") {
+		t.Fatalf("group key should be plain archive ending in .gz, got %q", key)
+	}
+}
+
+func TestPathWithoutExtGzipUsesDotLogGz(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app")
+	r, err := OpenRollingFile(RollingOptions{
+		Path:         path,
+		SizeLimit:    16,
+		CompressGzip: true,
+		RetainCount:  5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, err := io.WriteString(r, strings.Repeat("z", 20)+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	archives, err := r.listArchived()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archives) == 0 {
+		t.Fatal("gzip archive not listed")
+	}
+	var sawLogGz bool
+	for _, arch := range archives {
+		for _, p := range arch.paths {
+			base := filepath.Base(p)
+			if strings.HasSuffix(base, ".log.gz") {
+				sawLogGz = true
+			}
+		}
+	}
+	if !sawLogGz {
+		t.Fatalf("extension-less path should archive as *.log.gz, got %+v", archives)
+	}
+}
+
 func TestRollingFileCreatesParentDir(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nested", "deep", "app.log")

@@ -287,8 +287,12 @@ func Parse(data []byte) (*Pipeline, error) {
 		return nil, err
 	}
 	var logging Logging
-	if _, ok := root["logging"]; ok {
-		logging, err = parseLogging(asMap(root["logging"]))
+	if raw, ok := root["logging"]; ok {
+		m := asMap(raw)
+		if m == nil {
+			return nil, configErr("logging", "must be a mapping")
+		}
+		logging, err = parseLogging(m)
 		if err != nil {
 			return nil, err
 		}

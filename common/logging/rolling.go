@@ -456,13 +456,21 @@ func (r *RollingFile) openActiveDefault() error {
 func (r *RollingFile) nextArchiveName(now time.Time) string {
 	r.archiveSeq++
 	dir := filepath.Dir(r.path)
-	base := filepath.Base(r.path)
-	ext := filepath.Ext(base)
-	name := strings.TrimSuffix(base, ext)
+	name, ext := archiveBaseParts(r.path)
+	return filepath.Join(dir, fmt.Sprintf("%s-%s-%d%s", name, now.Format(archivedTimeLayout), r.archiveSeq, ext))
+}
+
+// archiveBaseParts returns the archive name stem and extension used by both
+// generation and recognition. Paths without an extension use ".log", matching
+// historical RollingFile naming (never emit extension-less archives).
+func archiveBaseParts(path string) (name, ext string) {
+	base := filepath.Base(path)
+	ext = filepath.Ext(base)
+	name = strings.TrimSuffix(base, ext)
 	if ext == "" {
 		ext = ".log"
 	}
-	return filepath.Join(dir, fmt.Sprintf("%s-%s-%d%s", name, now.Format(archivedTimeLayout), r.archiveSeq, ext))
+	return name, ext
 }
 
 func (r *RollingFile) computeNextRotate(now time.Time) time.Time {
@@ -491,9 +499,7 @@ type archivedFile struct {
 func (r *RollingFile) listArchived() ([]archivedFile, error) {
 	dir := filepath.Dir(r.path)
 	base := filepath.Base(r.path)
-	ext := filepath.Ext(base)
-	name := strings.TrimSuffix(base, ext)
-	prefix := name + "-"
+	name, ext := archiveBaseParts(r.path)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -508,8 +514,8 @@ func (r *RollingFile) listArchived() ([]archivedFile, error) {
 		if fname == base {
 			continue
 		}
-		// Temp publish files use a leading dot and never match this prefix.
-		if !strings.HasPrefix(fname, prefix) {
+		plainName, ok := archivePlainName(fname, name, ext)
+		if !ok {
 			continue
 		}
 		info, err := entry.Info()
@@ -517,7 +523,7 @@ func (r *RollingFile) listArchived() ([]archivedFile, error) {
 			continue
 		}
 		full := filepath.Join(dir, fname)
-		key := strings.TrimSuffix(full, ".gz")
+		key := filepath.Join(dir, plainName)
 		if existing, ok := grouped[key]; ok {
 			existing.paths = append(existing.paths, full)
 			if info.ModTime().After(existing.modTime) {
@@ -540,6 +546,71 @@ func (r *RollingFile) listArchived() ([]archivedFile, error) {
 		return out[i].modTime.After(out[j].modTime)
 	})
 	return out, nil
+}
+
+// archivePlainName reports whether fname is an archive for name+ext and returns
+// the plain (uncompressed) archive filename.
+//
+// Forms: {name}-{timestamp}[-{seq}]{ext} and the same plus a trailing
+// compression ".gz". When ext is already ".gz", plain archives end with ".gz"
+// and compressed archives end with ".gz.gz"; a bare TrimSuffix(..., ".gz")
+// would wrongly treat the original extension as compression.
+func archivePlainName(fname, name, ext string) (string, bool) {
+	if strings.HasSuffix(fname, ext+".gz") {
+		plain := strings.TrimSuffix(fname, ".gz")
+		if matchArchivePlain(plain, name, ext) {
+			return plain, true
+		}
+		return "", false
+	}
+	if matchArchivePlain(fname, name, ext) {
+		return fname, true
+	}
+	return "", false
+}
+
+func isArchivedFileName(fname, name, ext string) bool {
+	_, ok := archivePlainName(fname, name, ext)
+	return ok
+}
+
+func matchArchivePlain(plain, name, ext string) bool {
+	if !strings.HasSuffix(plain, ext) {
+		return false
+	}
+	return matchArchiveStem(strings.TrimSuffix(plain, ext), name)
+}
+
+func matchArchiveStem(stem, name string) bool {
+	prefix := name + "-"
+	if !strings.HasPrefix(stem, prefix) {
+		return false
+	}
+	rest := stem[len(prefix):]
+	const tsLen = len("2006-01-02T15-04-05.000")
+	if len(rest) < tsLen {
+		return false
+	}
+	if _, err := time.Parse(archivedTimeLayout, rest[:tsLen]); err != nil {
+		return false
+	}
+	suffix := rest[tsLen:]
+	if suffix == "" {
+		return true // historical name without sequence
+	}
+	if !strings.HasPrefix(suffix, "-") {
+		return false
+	}
+	seq := suffix[1:]
+	if seq == "" {
+		return false
+	}
+	for _, r := range seq {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *RollingFile) pruneLocked(now time.Time) error {
