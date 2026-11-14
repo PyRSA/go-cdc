@@ -11,7 +11,9 @@ flowchart LR
   E --> C[Checkpoint]
 ```
 
-Allowed top-level keys: `source`, `sink`, `route`, `transform`, `pipeline`, `checkpoint`. Unknown keys fail startup.
+Allowed top-level keys: `source`, `sink`, `route`, `transform`, `pipeline`, `checkpoint`, `logging`. Unknown keys fail startup.
+
+Logging (`level` / `format` / `console` / `file`): [logging.md](logging.md).
 
 ---
 

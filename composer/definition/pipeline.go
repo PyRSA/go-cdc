@@ -23,6 +23,7 @@ type Pipeline struct {
 	Transforms []Transform
 	Runtime    Runtime
 	Checkpoint Checkpoint
+	Logging    Logging
 }
 
 // Source is the MySQL capture configuration.

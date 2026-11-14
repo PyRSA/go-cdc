@@ -10,6 +10,7 @@ YAML-driven MySQL CDC. Binary: `go-cdc`.
 
 - `docs/QuickStart.md`
 - `docs/pipeline.md`
+- `docs/logging.md` — optional `logging:` (level / format / console / file)
 - `docs/connectors/mysql-source.md`
 - `docs/connectors/mysql-sink.md`
 - `docs/connectors/stdout-sink.md` — stdout + shared CDC JSON

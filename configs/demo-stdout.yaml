@@ -23,3 +23,15 @@ checkpoint:
   storage: file
   interval: 10s
   file-path: ./checkpoints
+
+# Optional. Omit logging: to keep INFO text on stderr (historical default).
+# logging:
+#   level: INFO
+#   format: text
+#   console:
+#     stream: stderr
+#   file:
+#     path: ./logs/go-cdc.log
+#     rotation: 100 MB
+#     retention: 30 days
+#     compression: gz
