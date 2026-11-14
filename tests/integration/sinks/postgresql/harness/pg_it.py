@@ -14,6 +14,7 @@ vocabulary live in `docs/test/POSTGRESQL.md`.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -420,14 +421,39 @@ def log_tail(lines: int = 12) -> str:
     return " | ".join(body[-lines:])
 
 
+# Current go-cdc logfmt: ``2006-01-02 15:04:05.000 [LEVEL] [module] ...``
+# (see common/logfmt). Level is taken only from that prefix, never from the
+# message body, so text like `` [ERROR] [`` inside an INFO line is ignored.
+_LOGFMT_LEVEL = re.compile(
+    r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} \[([A-Z]+)\] \["
+)
+# Legacy slog text used a ``level=`` field before the message.
+_LEGACY_LEVEL_ERROR = re.compile(r"(?:^|\s)level=ERROR(?:\s|$)")
+
+
+def _is_error_log_line(line: str) -> bool:
+    """True for a go-cdc ERROR record in current or legacy slog text form.
+
+    Current logfmt puts the level in the record prefix
+    (``YYYY-MM-DD HH:MM:SS.mmm [LEVEL] [module]``). Legacy slog text used
+    ``level=ERROR``. Free-text ``ERROR`` in a message body must not match.
+    """
+    if _LEGACY_LEVEL_ERROR.search(line):
+        return True
+    match = _LOGFMT_LEVEL.match(line)
+    return match is not None and match.group(1) == "ERROR"
+
+
 def log_errors(limit: int = 4, stack: int = 8) -> str:
     """Return the pipeline's own fatal records, not the last lines written.
 
-    On a failure the process logs `pipeline failed` at level=ERROR and only then
-    closes the source, which appends three INFO shutdown lines (`closing canal`,
-    `syncer is closing...`, `syncer is closed`). A plain tail therefore hides the
-    one line that says why the job died, so every failure report quotes the
-    ERROR record instead and only falls back to the tail when there is none.
+    On a failure the process logs ``Pipeline failed`` at ERROR (logfmt
+    ``[ERROR]``, or legacy ``level=ERROR``) and only then closes the source,
+    which appends three INFO shutdown lines (``closing canal``,
+    ``syncer is closing...``, ``syncer is closed``). A plain tail therefore
+    hides the one line that says why the job died, so every failure report
+    quotes the ERROR record instead and only falls back to the tail when
+    there is none.
 
     A Go crash is quoted together with the goroutine stack that follows it: the
     `panic:` line names the value but never the frame, so dropping the frames
@@ -439,10 +465,10 @@ def log_errors(limit: int = 4, stack: int = 8) -> str:
     for i, line in enumerate(body):
         if "panic:" in line or line.startswith("fatal error:"):
             return " | ".join(body[i:i + stack])
-    fatal = [ln for ln in body if "level=ERROR" in ln]
+    fatal = [ln for ln in body if _is_error_log_line(ln)]
     if fatal:
         return " | ".join(fatal[-limit:])
-    return " | ".join(["no level=ERROR line", *body[-limit:]])
+    return " | ".join(["no ERROR log line", *body[-limit:]])
 
 
 # ---------------------------------------------------------------- pipeline YAML
